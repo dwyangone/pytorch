@@ -142,6 +142,7 @@ _NCCL_AVAILABLE = True
 _GLOO_AVAILABLE = True
 _UCC_AVAILABLE = True
 _XCCL_AVAILABLE = True
+_NCCLFT_AVAILABLE = True
 
 try:
     try:
@@ -215,6 +216,15 @@ try:
 except ImportError:
     _NCCL_AVAILABLE = False
 
+
+try:
+    from torch._C._distributed_c10d import ProcessGroupNCCLFT
+
+    ProcessGroupNCCL.__module__ = "torch.distributed.distributed_c10d"
+    __all__ += ["ProcessGroupNCCLFT"]
+except ImportError:
+    _NCCLFT_AVAILABLE = False
+
 try:
     from torch._C._distributed_c10d import _ProcessGroupWrapper, ProcessGroupGloo
 
@@ -287,6 +297,7 @@ class Backend(str):  # noqa: SLOT000
     UNDEFINED = "undefined"
     GLOO = "gloo"
     NCCL = "nccl"
+    NCCLFT = "nccl_ft"
     UCC = "ucc"
     MPI = "mpi"
     XCCL = "xccl"
@@ -296,7 +307,7 @@ class Backend(str):  # noqa: SLOT000
 
     _plugins: dict[str, _BackendPlugin] = {}
 
-    backend_list = [UNDEFINED, GLOO, NCCL, XCCL, UCC, MPI, FAKE]
+    backend_list = [UNDEFINED, GLOO, NCCL, XCCL, UCC, MPI, FAKE, NCCLFT]
 
     # 3rd-party devices can register the default backend support here
     default_device_backend_map: dict[str, str] = {
@@ -313,6 +324,7 @@ class Backend(str):  # noqa: SLOT000
         UCC: ["cpu", "cuda"],
         MPI: ["cpu", "cuda"],
         FAKE: ["cpu", "cuda", "hpu", "xpu"],
+        NCCLFT: ["cuda"],
     }
 
     backend_type_map: dict[str, ProcessGroup.BackendType] = {
@@ -323,6 +335,7 @@ class Backend(str):  # noqa: SLOT000
         UCC: ProcessGroup.BackendType.UCC,
         MPI: ProcessGroup.BackendType.MPI,
         FAKE: ProcessGroup.BackendType.CUSTOM,
+        NCCLFT: ProcessGroup.BackendType.CUSTOM,
     }
 
     def __new__(cls, name: str):
@@ -833,7 +846,7 @@ class GroupMember(metaclass=_WorldMeta):
 
 def _get_default_timeout(backend: Backend) -> timedelta:
     # see note on nccl vs other backend timeout (constants.py)
-    if backend == Backend.NCCL:
+    if backend == Backend.NCCL or backend == Backend.NCCLFT:
         if not isinstance(default_pg_nccl_timeout, timedelta):
             # TODO moco benchmark on CPU initializes pgnccl backend today, triggered this assert in CI before it was
             # changed to be a warning.  We should fix the moco model.
@@ -1336,6 +1349,9 @@ def is_nccl_available() -> bool:
     """Check if the NCCL backend is available."""
     return _NCCL_AVAILABLE
 
+def is_nccl_ft_available() -> bool:
+    """Check if the NCCL_FT backend is available."""
+    return _NCCLFT_AVAILABLE
 
 def is_gloo_available() -> bool:
     """Check if the Gloo backend is available."""
@@ -2206,6 +2222,39 @@ def _new_process_group_helper(
                 backend_prefix_store, group_rank, group_size, backend_options
             )
             backend_type = ProcessGroup.BackendType.NCCL
+
+        elif backend_str == Backend.NCCLFT:
+            if not is_nccl_ft_available():
+                raise RuntimeError("Distributed package doesn't have NCCLFT built in")
+            if backend_options is not None:
+                if not isinstance(backend_options, ProcessGroupNCCLFT.Options):
+                    raise AssertionError(
+                        "Expected backend_options argument to be of type ProcessGroupNCCLFT.Options"
+                    )
+                if backend_options._timeout != timeout:
+                    warnings.warn(
+                        "backend_options._timeout was specified, "
+                        "but timeout kwarg has a default value that will always override it. ",
+                        stacklevel=2,
+                    )
+            else:
+                # default backend_options for NCCL
+                backend_options = ProcessGroupNCCLFT.Options()
+                backend_options.is_high_priority_stream = False
+            # pyrefly: ignore [bad-argument-type]
+            backend_options._timeout = timeout
+
+            if split_from:
+                backend_options.split_from = split_from
+                backend_options.split_color = _process_group_color(
+                    global_ranks_in_group
+                )
+            backend_options.global_ranks_in_group = global_ranks_in_group
+            backend_options.group_name = group_name
+            backend_class = ProcessGroupNCCLFT(
+                backend_prefix_store, group_rank, group_size, backend_options
+            )
+            backend_type = ProcessGroup.BackendType.CUSTOM
         elif backend_str == Backend.UCC and is_ucc_available():
             # TODO: once UCC plugin is fully deprecated, remove
             # is_ucc_available() from above elif-condition and raise
@@ -2270,6 +2319,12 @@ def _new_process_group_helper(
                 )
             backend_class._set_sequence_number_for_group()
 
+        elif backend_str == Backend.NCCLFT:
+            if not isinstance(backend_class, ProcessGroupNCCLFT):
+                raise AssertionError(
+                    f"Expected ProcessGroupNCCLFT, got {type(backend_class)}"
+                )
+            backend_class._set_sequence_number_for_group()
         # If the type is a subclass of ProcessGroup then return this process group immediately
         # TODO: This defaults to the old behavior for PythonProcessGroups which overwrites the
         # ProcessGroup instance
@@ -2279,7 +2334,7 @@ def _new_process_group_helper(
 
         # Process group wrapper initialization for supported PGs when TORCH_DISTRIBUTED_DEBUG is set
         if (
-            backend_str in [Backend.GLOO, Backend.NCCL, Backend.XCCL, Backend.UCC]
+            backend_str in [Backend.GLOO, Backend.NCCL, Backend.XCCL, Backend.UCC, , Backend.NCCLFT]
             or backend_str.upper() in Backend._plugins
         ):
             # In debug mode and if GLOO is available, wrap in a wrapper PG that

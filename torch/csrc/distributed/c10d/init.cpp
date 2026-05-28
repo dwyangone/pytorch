@@ -32,8 +32,10 @@
 
 #ifdef USE_C10D_NCCL
 #include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
+#include <torch/csrc/distributed/c10d/NCCLFTUtils.hpp>
 #include <torch/csrc/distributed/c10d/NCCLXStub.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroupNCCLFT.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/intra_node_comm.hpp>
 #endif
 
@@ -3641,6 +3643,271 @@ Example::
           [](const ::c10d::ProcessGroupNCCL::Options& self,
              const py::dict& memo) {
             return ::c10d::ProcessGroupNCCL::Options(self);
+          },
+          py::arg("memo"));
+
+      
+  auto processGroupNCCLFT =
+      intrusive_ptr_no_gil_destructor_class_<::c10d::ProcessGroupNCCLFT>(
+          module, "ProcessGroupNCCLFT", backend)
+          .def(
+              py::init([](const c10::intrusive_ptr<::c10d::Store>& store,
+                          int rank,
+                          int size,
+                          c10::intrusive_ptr<::c10d::ProcessGroupNCCLFT::Options>
+                              options) {
+                // gil_scoped_release is not safe as a call_guard in init.
+                // https://github.com/pybind/pybind11/issues/5473
+                py::gil_scoped_release nogil{};
+
+                return c10::make_intrusive<::c10d::ProcessGroupNCCLFT>(
+                    store, rank, size, std::move(options));
+              }),
+              py::arg("store"),
+              py::arg("rank"),
+              py::arg("size"),
+              py::arg("options"),
+              R"(Create a new ProcessGroupNCCLFT instance.)")
+          .def(
+              py::init([](const c10::intrusive_ptr<::c10d::Store>& store,
+                          int rank,
+                          int size,
+                          const std::chrono::milliseconds& timeout) {
+                // gil_scoped_release is not safe as a call_guard in init.
+                // https://github.com/pybind/pybind11/issues/5473
+                py::gil_scoped_release nogil{};
+
+                auto options = ::c10d::ProcessGroupNCCLFT::Options::create();
+                options->is_high_priority_stream = false;
+                options->timeout = timeout;
+                return c10::make_intrusive<::c10d::ProcessGroupNCCLFT>(
+                    store, rank, size, options);
+              }),
+              py::arg("store"),
+              py::arg("rank"),
+              py::arg("size"),
+              py::arg("timeout") = ::c10d::kProcessGroupNCCLFTDefaultTimeout,
+              R"(Create a new ProcessGroupNCCLFT instance.)")
+          .def(
+              "_comm_ptr",
+              &::c10d::ProcessGroupNCCLFT::getCommPtr,
+              R"(
+            Get the communicator of the current device.
+
+            .. warning ::
+                Unsafe to use. The collectives launched into the communicator
+                externally outside ProcessGroupNCCLFT are not monitored by the
+                watchdog. Please do not modify or free the communicator as the
+                communicator is managed by the ProcessGroupNCCLFT. Please also
+                check the readiness of the communicator before launching any
+                collectives into the communicator.
+            )")
+          .def("_group_start", &::c10d::ProcessGroupNCCLFT::groupStart)
+          .def("_group_end", &::c10d::ProcessGroupNCCLFT::groupEnd)
+          .def(
+              "_start_time_estimate",
+              &::c10d::ProcessGroupNCCLFT::startTimeEstimate)
+          .def("_end_time_estimate", &::c10d::ProcessGroupNCCLFT::endTimeEstimate)
+          .def(
+              "comm_split_count",
+              &::c10d::ProcessGroupNCCLFT::getCommSplitCounter)
+          .def(
+              "_set_default_timeout",
+              &::c10d::ProcessGroupNCCLFT::setTimeout,
+              py::arg("timeout"),
+              py::call_guard<py::gil_scoped_release>())
+          .def(
+              "_add_ephemeral_timeout",
+              [](const c10::intrusive_ptr<::c10d::ProcessGroupNCCLFT>& self,
+                 const std::chrono::milliseconds& timeout) {
+                self->addEphemeralTimeout(timeout);
+              },
+              py::arg("timeout"))
+          .def(
+              "_verify_work_timeout",
+              [](const c10::intrusive_ptr<::c10d::ProcessGroupNCCLFT>& self,
+                 const c10::intrusive_ptr<::c10d::Work>& work,
+                 const std::chrono::milliseconds& timeout) {
+                return self->verifyWorkTimeoutForTest(work, timeout);
+              },
+              py::arg("work"),
+              py::arg("timeout"))
+          .def_property_readonly(
+              "options",
+              &::c10d::ProcessGroupNCCLFT::getOptions,
+              R"(Return the options used to create this ProcessGroupNCCLFT instance.)")
+          .def_property_readonly(
+              "uid", &::c10d::ProcessGroupNCCLFT::getUid, R"(Return the uid.)")
+          .def_property(
+              "bound_device_id",
+              &::c10d::ProcessGroupNCCLFT::getBoundDeviceId,
+              &::c10d::ProcessGroupNCCLFT::setBoundDeviceId,
+              R"(Return the bound device id.)")
+          .def(
+              "perform_nocolor_split",
+              &::c10d::ProcessGroupNCCLFT::performNocolorSplit)
+          .def(
+              "register_mem_pool",
+              &::c10d::ProcessGroupNCCLFT::registerMemPool,
+              py::arg("pool"),
+              py::arg("symm") = false)
+          .def(
+              "deregister_mem_pool",
+              &::c10d::ProcessGroupNCCLFT::deregisterMemPool)
+          .def(
+              "_is_initialized",
+              &::c10d::ProcessGroupNCCLFT::isInitialized,
+              py::call_guard<py::gil_scoped_release>())
+          .def(
+              "get_error",
+              &::c10d::ProcessGroupNCCLFT::getError,
+              py::call_guard<py::gil_scoped_release>())
+          .def(
+              "_set_enable_nan_check",
+              [](const c10::intrusive_ptr<::c10d::ProcessGroupNCCLFT>& self,
+                 bool enable_nan_check) {
+                self->setEnableNanCheck(enable_nan_check);
+              },
+              py::arg("enable_nan_check"),
+              py::call_guard<py::gil_scoped_release>())
+          .def_static(
+              "get_build_nccl_version",
+              [] {
+                return std::make_tuple(NCCL_MAJOR, NCCL_MINOR, NCCL_PATCH);
+              })
+          .def_static("get_runtime_nccl_version", [] {
+            return ::c10d::getNcclVersionTuple();
+          });
+
+#ifdef NCCL_HAS_CTA_POLICY
+  processGroupNCCLFT.def_property_readonly_static(
+      "NCCL_CTA_POLICY_DEFAULT",
+      [](const py::object&) { return NCCL_CTA_POLICY_DEFAULT; });
+  processGroupNCCLFT.def_property_readonly_static(
+      "NCCL_CTA_POLICY_EFFICIENCY",
+      [](const py::object&) { return NCCL_CTA_POLICY_EFFICIENCY; });
+#ifdef NCCL_CTA_POLICY_ZERO // requires NCCL version >= 2.28
+  processGroupNCCLFT.def_property_readonly_static(
+      "NCCL_CTA_POLICY_ZERO",
+      [](const py::object&) { return NCCL_CTA_POLICY_ZERO; });
+#endif // NCCL_CTA_POLICY_ZERO
+#endif // NCCL_HAS_CTA_POLICY
+
+  module.def(
+      "_get_intra_node_comm_usage_counter",
+      &::c10d::intra_node_comm::getIntraNodeCommUsageCounter);
+
+//#ifdef NCCL_HAS_CONFIG
+//  py::class_<ncclConfig_t>(
+//      processGroupNCCLFT,
+//      "NCCLConfig",
+//      R"(
+//ncclConfig_t data type for configuring NCCL communicators.
+//See https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/types.html#ncclconfig-t
+//for details.
+//)")
+//      .def(py::init([]() {
+//        ncclConfig_t defaultCfg = NCCL_CONFIG_INITIALIZER;
+//        return std::make_unique<ncclConfig_t>(defaultCfg);
+//      }))
+//      .def_readwrite("blocking", &ncclConfig_t::blocking)
+//      .def_readwrite("cga_cluster_size", &ncclConfig_t::cgaClusterSize)
+//      .def_readwrite("min_ctas", &ncclConfig_t::minCTAs)
+//      .def_readwrite("max_ctas", &ncclConfig_t::maxCTAs)
+//#ifdef NCCL_HAS_COMM_SPLIT
+//      .def_readwrite("split_share", &ncclConfig_t::splitShare)
+//#endif
+//#ifdef NCCL_HAS_QOS
+//      .def_readwrite("traffic_class", &ncclConfig_t::trafficClass)
+//#endif
+//#ifdef NCCL_HAS_COLLNET
+//      .def_readwrite("collnet_enable", &ncclConfig_t::collnetEnable)
+//#endif
+//#ifdef NCCL_HAS_CTA_POLICY
+//      .def_readwrite("cta_policy", &ncclConfig_t::CTAPolicy)
+//#endif
+//#ifdef NCCL_HAS_NVLS_CTAS
+//      .def_readwrite("nvls_ctas", &ncclConfig_t::nvlsCTAs)
+//#endif
+//      .def(
+//          "unsafe_get_ptr",
+//          [](const ncclConfig_t& self) {
+//            return reinterpret_cast<uintptr_t>(&self);
+//          })
+//      .def_property(
+//          "net_name",
+//          [](const ncclConfig_t& self) { return self.netName; },
+//          // Note: NCCL calls free on the netName pointer
+//          // when destroying the communicator. So memory
+//          // shouldn't leak because of allocation in strdup.
+//          [](ncclConfig_t& self, const char* tmp) {
+//            self.netName = strdup(tmp);
+//          })
+//      .def(
+//          "__copy__",
+//          [](const ncclConfig_t& self) { return ncclConfig_t(self); })
+//      .def(
+//          "__deepcopy__",
+//          [](const ncclConfig_t& self, const py::dict& memo) {
+//            return ncclConfig_t(self);
+//          },
+//          py::arg("memo"));
+//#endif // NCCL_HAS_CONFIG
+
+  intrusive_ptr_class_<::c10d::ProcessGroupNCCLFT::Options>(
+      processGroupNCCLFT,
+      "Options",
+      backendOptions,
+      R"(
+ProcessGroup options for the NCCL_FT backend
+
+Arguments:
+    is_high_priority_stream (bool, optional): flag to enable/disable process
+            group to pick up high priority cuda streams. It lets CUDA driver
+            to prioritize NCCL kernels when there are compute kernels waiting.
+            Default is False.
+
+Attributes:
+    config (NCCLConfig): configures NCCL communicators (only available for
+            builds using NCCL 2.17+). This can be used to improve
+            communication-computation overlap for NCCL kernels by tuning
+            available parameters in the config. See
+            https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/types.html#ncclconfig-t
+            for details.
+
+Example::
+    >>> import torch.distributed as dist
+    >>>
+    >>> nccl_options = dist.ProcessGroupNCCL.Options(is_high_priority_stream=True)
+    >>> # For builds using NCCL 2.17+, configure communicators
+    >>> nccl_options.config.cga_cluster_size = 2
+    >>> nccl_options.config.max_ctas = 4
+    >>> nccl_options.config.min_ctas = 2
+    >>> nccl_options.config.split_share = 1
+    >>> # initialize a nccl process group with the options just created
+    >>> dist.init_process_group("nccl", pg_options=nccl_options)
+      )")
+      .def(py::init<bool>(), py::arg("is_high_priority_stream") = false)
+#ifdef NCCL_HAS_CONFIG
+      .def_readwrite("config", &::c10d::ProcessGroupNCCLFT::Options::config)
+#endif
+      .def_readwrite(
+          "is_high_priority_stream",
+          &::c10d::ProcessGroupNCCLFT::Options::is_high_priority_stream)
+      .def_readwrite(
+          "split_from", &::c10d::ProcessGroupNCCLFT::Options::split_from)
+      .def_readwrite(
+          "split_color", &::c10d::ProcessGroupNCCLFT::Options::split_color)
+      .def(
+          "__copy__",
+          [](const ::c10d::ProcessGroupNCCLFT::Options& self) {
+            return ::c10d::ProcessGroupNCCLFT::Options(self);
+          })
+      .def(
+          "__deepcopy__",
+          [](const ::c10d::ProcessGroupNCCLFT::Options& self,
+             const py::dict& memo) {
+            return ::c10d::ProcessGroupNCCLFT::Options(self);
           },
           py::arg("memo"));
 
