@@ -1301,8 +1301,10 @@ c10::intrusive_ptr<Backend> ProcessGroupNCCLFT::split(
   ncclOpts->split_from =
       c10::intrusive_ptr<ProcessGroupNCCLFT>::unsafe_reclaim_from_nonowning(this);
   ncclOpts->global_ranks_in_group = std::move(globalRanksInGroup);
-  auto color = genNcclSplitColor(ranks);
-  ncclOpts->split_color = color;
+  // We use the lowest rank in the group as the split_color as each rank can
+  // only participate in one group.
+  // This value must be non-negative int32 and all ranks are.
+  ncclOpts->split_color = *std::min_element(ranks.cbegin(), ranks.cend());
   auto pg = c10::make_intrusive<ProcessGroupNCCLFT>(
       store->clone(), groupRank, ranks.size(), ncclOpts);
 #ifdef NCCL_COMM_DESCRIPTION
@@ -3721,8 +3723,9 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   }
 
   if (nanCheck) {
+    at::cuda::CUDAStreamGuard guard(ncclStream);
     for (const auto& input : inputs) {
-      checkForNan(input, ncclStream);
+      checkForNan(input);
     }
   }
 
@@ -4199,7 +4202,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::pointToPoint(
   // Only check for NaN for send ops, for recv ops `tensor` can be a random
   // placeholder
   if (enableNanCheck_ && opType == OpType::SEND) {
-    checkForNan(tensor, ncclStream);
+    at::cuda::CUDAStreamGuard guard(ncclStream);
+    checkForNan(tensor);
   }
 
   if (!coalescing_state_) {
@@ -5851,11 +5855,10 @@ at::Tensor ProcessGroupNCCLFT::allocateTensor(
   // Create memory pool
   if (!memPool_) {
     // Needs a CUDAAllocator
-    auto allocator =
-        reinterpret_cast<c10::cuda::CUDACachingAllocator::CUDAAllocator*>(
-            getMemAllocator().get());
+    auto allocator = std::static_pointer_cast<
+        c10::cuda::CUDACachingAllocator::CUDAAllocator>(getMemAllocator());
     // Pool is created
-    memPool_ = std::make_unique<at::cuda::MemPool>(allocator);
+    memPool_ = std::make_unique<at::cuda::MemPool>(std::move(allocator));
     // Register so that we call ncclCommRegister on all new allocations
     registerMemPool(memPool_.get(), /*symmetric*/ false);
     LOG(INFO) << logPrefix() << "Created memory pool";
