@@ -5,15 +5,16 @@
 #include <sched.h>
 #include <cstdio>
 #include <cstdlib>
+
 #include <memory>
 #include <mutex>
-#include <optional>
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAEvent.h>
 #include <c10/util/Exception.h>
 #include <nccl.h>
 #include <torch/csrc/cuda/nccl.h>
+#include <optional>
 
 // 引入原始的 NCCLUtils
 // 藉此繼承所有 NCCL_HAS_XXX 版本巨集、輔助函式 (getNcclVersion等) 及 C10D_SCHED_SLEEP 定義
@@ -103,9 +104,22 @@ get_cpp_trace_dumper();
     }                                                                         \
   } while (0)
 
+  // Sleep for kCommInitBusyWaitMillis milliseconds.
+#define C10D_SCHED_SLEEP()     \
+  std::this_thread::sleep_for( \
+      std::chrono::milliseconds(kCommInitBusyWaitMillis))
+
+// Macro to throw exception on a non-successful NCCL return value or timeout.
+// This macro uses sched_yield() to yield the CPU.
+// Thus suitable for NCCL calls that would quickly turn ncclSuccess, e.g.
+// collectives.
 #define C10D_NCCL_FT_CHECK_TIMEOUT(cmd, commWrapper, failureReason) \
   C10D_NCCL_FT_CHECK_TIMEOUT_BASE(cmd, commWrapper, failureReason, sched_yield())
 
+  // Macro to throw exception on a non-successful NCCL return value or timeout.
+// This macro uses sleep to yield the CPU.
+// Thus suitable for NCCL calls that would take longer to turn ncclSuccess, e.g.
+// ncclCommInitRankConfig, ncclCommFinalize, etc.
 #define C10D_NCCL_FT_CHECK_TIMEOUT_SLEEP(cmd, commWrapper, failureReason) \
   C10D_NCCL_FT_CHECK_TIMEOUT_BASE(                                        \
       cmd, commWrapper, failureReason, C10D_SCHED_SLEEP())
@@ -227,12 +241,24 @@ class NCCLFTComm {
 
   ncclComm_t getNcclComm();
 
+  // Wait for the communicator to be ready. This is a blocking function.
+  // Useful in nonblocking mode: NCCL requires the communicator to be ready
+  // before issuing a second command.
+  // Arguments:
+  //   longInterval: if true, wait with sleep of an interval; otherwise, wait
+  //   with `sched_yield` which is faster (but acquires CPU more frequently).
+  //   Use `longInterval=true` when waiting for initialization or finalize to
+  //   complete. Use `longInterval=false` when waiting collective call to return
+  //   ncclSuccess.
   void waitReady(bool longInterval);
 
   std::optional<std::string> getNcclCommFailureReason() const;
 
   void abort(std::optional<std::string> commFailureReason = std::nullopt);
 
+  // Finalize a communicator -- asking it to flush its operations. When the
+  // communicator is marked as nonblocking, this is a nonblocking function;
+  // otherwise, it will block till all operations complete.
   void finalize();
 
   void destroy();
@@ -256,6 +282,13 @@ class NCCLFTComm {
   ncclResult_t deregisterSegment(void* ptr, bool window = false);
 
   std::string repr() const;
+  
+ // APIs related to memory offload (require NCCL 2.29.7+ at runtime)
+  void suspend();
+
+  void resume();
+
+  std::unordered_map<std::string, uint64_t> getMemoryStats();
 
   friend class ProcessGroupNCCLFT;
  

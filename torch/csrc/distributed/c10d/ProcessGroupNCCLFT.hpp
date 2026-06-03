@@ -39,7 +39,6 @@
 
 #include <torch/custom_class.h>
 
-
 namespace c10d {
 
 // Control broadcasting of NCCL uniqueId
@@ -196,14 +195,10 @@ static std::vector<std::string> TORCH_NCCLFT_USE_TENSOR_REGISTER_ALLOCATOR_HOOK 
 
 #if defined(__linux__)
 struct DumpPipeFT {
-  DumpPipeFT(int rank) {
-    std::string fileStem =
-        getCvarString({"TORCH_NCCLFT_DEBUG_INFO_PIPE_FILE"}, "");
-    if (fileStem.empty() ||
-        getCvarInt({"TORCH_NCCLFT_TRACE_BUFFER_SIZE"}, 0) <= 0) {
+ DumpPipe(int rank, const std::string& fileStem, int traceBufferSize) {
+    if (fileStem.empty() || traceBufferSize <= 0) {
       return;
     }
-    TORCH_CHECK(!fileStem.empty(), "TORCH_NCCLFT_DEBUG_INFO_PIPE_FILE is empty");
     std::string filename = c10::str(fileStem, rank, ".pipe");
     TORCH_CHECK(
         unlink(filename.c_str()) != -1 || errno == ENOENT,
@@ -1056,6 +1051,13 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
 
   void setEnableNanCheck(bool enableNanCheck);
 
+  // APIs related to memory offload (require NCCL 2.29.7+ at runtime)
+  void suspend() override;
+
+  void resume() override;
+
+  std::unordered_map<std::string, uint64_t> getMemoryStats() override;
+
  protected:
   uint64_t getWatchdogHeartbt() const;
 
@@ -1356,6 +1358,9 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // Size of ring buffer where we store NCCL Traces for debugging.
   int traceBufferSize_;
 
+  // Stores TORCH_NCCL_DEBUG_INFO_PIPE_FILE
+  std::string debugInfoPipeFile_;
+
   // We gate the cudaEventCache so that we can roll it out gradually.
   std::atomic<bool> cudaEventCacheEnabled_;
 
@@ -1532,7 +1537,6 @@ get_cpp_trace_dumper();
 typedef bool (*gil_checker_t)();
 
 TORCH_API gil_checker_t& get_gil_checker();
-
 } // namespace c10d
 
 #endif // USE_C10D_NCCL
