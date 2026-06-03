@@ -2432,7 +2432,7 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(
             pg_->heartbeatMonitor_->getDumpTimeout() * 4));
 
-        if (SHOULD_CLEAN_UP(pg_->asyncErrorHandling_)) {
+        if (SHOULD_CLEAN_UP_FT(pg_->asyncErrorHandling_)) {
           // Abort work and corresponding communicators
           work.abort();
           // PG level abort, which would abort all other communicators on this

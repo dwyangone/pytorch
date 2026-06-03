@@ -195,7 +195,7 @@ static std::vector<std::string> TORCH_NCCLFT_USE_TENSOR_REGISTER_ALLOCATOR_HOOK 
 
 #if defined(__linux__)
 struct DumpPipeFT {
- DumpPipe(int rank, const std::string& fileStem, int traceBufferSize) {
+ DumpPipeFT(int rank, const std::string& fileStem, int traceBufferSize) {
     if (fileStem.empty() || traceBufferSize <= 0) {
       return;
     }
