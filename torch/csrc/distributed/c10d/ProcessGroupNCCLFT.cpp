@@ -42,6 +42,14 @@ namespace c10d {
 constexpr const char* const kNCCLAbortedCommStoreKey_FT = "NCCLFTABORTEDCOMM";
 using FlightRecorderCUDA = FlightRecorder<at::cuda::CUDAEvent>;
 
+/* ========================================================================= */
+/* --- [NCCL-FT: 強制宣告底層 C API (繞過 Header 路徑衝突)] --- */
+extern "C" {
+    typedef void (*ncclFaultCallback_t)(int dev_idx);
+    ncclResult_t ncclCommRegisterFaultCallback(ncclComm_t comm, ncclFaultCallback_t cb);
+}
+/* ========================================================================= */
+
 namespace {
 
 #if defined(NCCL_MAJOR) && \
@@ -3821,9 +3829,13 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                 std::string event_str(vec.begin(), vec.end());
 
                 if (event_str.rfind("PROPOSE:", 0) == 0) {
-                    // 解析 target_op 與 dev_idx... (省略字串解析細節)
-                    uint64_t target_op = ...;
-                    int dev_idx = ...;
+                    // 解析字串 "PROPOSE:8050:2"
+                    size_t first_colon = event_str.find(':');
+                    size_t second_colon = event_str.find(':', first_colon + 1);
+                    
+                    // 真正的字串解析邏輯 (取代了之前的 ...)
+                    uint64_t target_op = std::stoull(event_str.substr(first_colon + 1, second_colon - first_colon - 1));
+                    int dev_idx = std::stoi(event_str.substr(second_colon + 1));
 
                     this->do_not_cross_op_.store(target_op, std::memory_order_release);
                     this->failed_dev_index_.store(dev_idx, std::memory_order_release);
@@ -3969,11 +3981,11 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
       LOG(INFO) << logPrefix() << "[NCCL-FT] 抵達警戒線 OP: " << current_op << "，準備煞車對齊！";
       
       // 等待最終決議
-      while (this->final_commit_op_.load(std::order_relaxed) == 0) {
+      while (this->final_commit_op_.load(std::memory_order_relaxed) == 0) {
           std::this_thread::yield();
       }
 
-      if (this->final_commit_op_.load(std::order_relaxed) == current_op) {
+      if (this->final_commit_op_.load(std::memory_order_relaxed) == current_op) {
           LOG(INFO) << logPrefix() << "[NCCL-FT] 節點對齊成功！進入降級模式。";
           
           // TODO: 建立 7-NIC 備用句柄

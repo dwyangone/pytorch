@@ -312,6 +312,11 @@ class TensorShelfFT {
 //   // Now continue on other work in the current stream.
 class TORCH_API ProcessGroupNCCLFT : public Backend {
  public:
+  /* NCCL_FT ======================================================= */
+  // 讓全域 C-Callback 可以呼叫
+  void trigger_fault_proposal(int dev_idx);
+  /* ======================================================= */
+
   class WorkNCCLFT : public Work, public std::enable_shared_from_this<WorkNCCLFT> {
    public:
     friend struct WorkInfo;
@@ -400,10 +405,6 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
     std::string getTraceback() const;
 
     std::vector<at::Tensor> result() override;
-
-    // NCCLFT
-    // 讓 C-Callback 可以呼叫
-    void trigger_fault_proposal(int dev_idx);
 
    protected:
     // The process group unique id
@@ -1083,8 +1084,13 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   std::atomic<bool> ft_negotiator_running_{true};
 
   void start_ft_negotiator_thread();
+  uint64_t calculate_safe_buffer();
+  void rebuild_shadow_ping_pong_topology();
   //void execute_shadow_ping_pong(at::Tensor& input, at::Tensor& output, at::cuda::CUDAStream& stream);
   /* ===================================================================== */
+
+
+
 
   // Helper that broadcasts nccl unique ID to all ranks through the store
   void broadcastUniqueNCCLID(
