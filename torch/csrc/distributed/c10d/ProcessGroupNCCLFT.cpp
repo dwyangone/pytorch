@@ -316,6 +316,19 @@ bool shouldAllCommunicatorsRegisterAllTensors() {
 #endif // NCCL_HAS_COMM_REGISTER
 }
 
+/* ========================================================================= */
+/* --- [NCCL-FT: C API 到 C++ 實體的全域橋樑] --- */
+std::mutex g_ft_pg_mutex;
+std::unordered_set<ProcessGroupNCCLFT*> g_ft_pg_instances;
+
+extern "C" void nccl_ft_global_fault_callback(int dev_idx) {
+    std::lock_guard<std::mutex> lock(g_ft_pg_mutex);
+    for (auto* pg : g_ft_pg_instances) {
+        pg->trigger_fault_proposal(dev_idx);
+    }
+}
+/* ========================================================================= */
+
 } // namespace
 
 // Map each communicator to the memory pools registered with it.
@@ -1042,6 +1055,14 @@ ProcessGroupNCCLFT::ProcessGroupNCCLFT(
   heartbeatMonitor_ = std::make_unique<HeartbeatMonitor>(this);
   watchdog_ = std::make_unique<Watchdog>(this);
 
+  /* --- [NCCL-FT: 註冊並啟動協商側車] --- */
+  {
+      std::lock_guard<std::mutex> lock(g_ft_pg_mutex);
+      g_ft_pg_instances.insert(this);
+  }
+  start_ft_negotiator_thread();
+  /* ------------------------------------ */
+
 #ifdef ENABLE_NCCL_ERROR_CHECKING
   // in blockingWait mode, we don't need to enable the watchdog thread to check
   // the timeout or nccl error because the main thread would throw an exception
@@ -1637,6 +1658,17 @@ void ProcessGroupNCCLFT::shutdown() {
 // NOLINTNEXTLINE(bugprone-exception-escape)
 ProcessGroupNCCLFT::~ProcessGroupNCCLFT() {
   LOG(INFO) << logPrefix() << "ProcessGroupNCCLFT destructor entered.";
+
+  /* --- [NCCL-FT: 退出協商側車] --- */
+  {
+      std::lock_guard<std::mutex> lock(g_ft_pg_mutex);
+      g_ft_pg_instances.erase(this);
+  }
+  ft_negotiator_running_.store(false);
+  if (ft_negotiator_thread_.joinable()) {
+      ft_negotiator_thread_.join();
+  }
+  /* ------------------------------- */
 
   // `shutdown()` or `abort` already called. Skip the favor of disposing
   // communicators.
@@ -3259,6 +3291,13 @@ std::shared_ptr<NCCLFTComm> ProcessGroupNCCLFT::initNCCLComm(
     }
   }
 
+  /* ===================================================================== */
+  /* --- [NCCL-FT: 綁定原生句柄硬體中斷] --- */
+  if (ncclComm && ncclComm->getNcclComm() != nullptr) {
+      ncclCommRegisterFaultCallback(ncclComm->getNcclComm(), nccl_ft_global_fault_callback);
+  }
+  /* ===================================================================== */
+
   // Creates the NCCL streams
   bool force_high = getCvarBool(TORCH_NCCLFT_HIGH_PRIORITY, false);
   auto streamVal = at::cuda::getStreamFromPool(
@@ -3759,6 +3798,46 @@ float ProcessGroupNCCLFT::endTimeEstimate() {
 #endif
 }
 
+//NCCLFT new add function for Negotiator OP number to switch
+void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
+    // 預約在未來 50 個 OP 後對齊切換
+    uint64_t target_op = this->seqCollective_ + 50; 
+    std::string proposal = "PROPOSE:" + std::to_string(target_op) + ":" + std::to_string(dev_idx);
+    try {
+        std::vector<uint8_t> vec(proposal.begin(), proposal.end());
+        this->globalStore_->set("NCCL_FT_EVENT", vec);
+    } catch (...) {}
+}
+
+void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
+    ft_negotiator_thread_ = std::thread([this]() {
+        c10::setThreadName("pt_nccl_ft_side"); // 側車執行緒
+        while (ft_negotiator_running_.load()) {
+            try {
+                // 阻塞等待，超時 500ms 方便退出
+                this->globalStore_->wait({"NCCL_FT_EVENT"}, std::chrono::milliseconds(500));
+                
+                auto vec = this->globalStore_->get("NCCL_FT_EVENT");
+                std::string event_str(vec.begin(), vec.end());
+
+                if (event_str.rfind("PROPOSE:", 0) == 0) {
+                    // 解析 target_op 與 dev_idx... (省略字串解析細節)
+                    uint64_t target_op = ...;
+                    int dev_idx = ...;
+
+                    this->do_not_cross_op_.store(target_op, std::memory_order_release);
+                    this->failed_dev_index_.store(dev_idx, std::memory_order_release);
+                    this->final_commit_op_.store(target_op, std::memory_order_release);
+
+                    LOG(INFO) << logPrefix() << "[NCCL-FT] 收到提案，警戒線 OP: " << target_op;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200)); // 防抖
+                }
+            } catch (...) {}
+        }
+    });
+}
+//New add functions
+
 template <typename Fn, typename PreProcess, typename PostProcess>
 c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
     std::vector<at::Tensor>& inputs,
@@ -3881,6 +3960,34 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 
   pre(ncclStream, work);
 
+  /* ===================================================================== */
+  /* --- [NCCL-FT: 條件式防死結煞車與拓撲切換] --- */
+  uint64_t current_op = this->seqCollective_; // 目前的 OP 時鐘
+  uint64_t boundary = this->do_not_cross_op_.load(std::memory_order_relaxed);
+
+  if (C10_UNLIKELY(boundary > 0 && current_op == boundary)) {
+      LOG(INFO) << logPrefix() << "[NCCL-FT] 抵達警戒線 OP: " << current_op << "，準備煞車對齊！";
+      
+      // 等待最終決議
+      while (this->final_commit_op_.load(std::order_relaxed) == 0) {
+          std::this_thread::yield();
+      }
+
+      if (this->final_commit_op_.load(std::order_relaxed) == current_op) {
+          LOG(INFO) << logPrefix() << "[NCCL-FT] 節點對齊成功！進入降級模式。";
+          
+          // TODO: 建立 7-NIC 備用句柄
+          this->is_degraded_ = true;
+          
+          this->do_not_cross_op_.store(0);
+          this->final_commit_op_.store(0);
+          if (this->rank_ == 0) {
+              try { this->globalStore_->deleteKey("NCCL_FT_EVENT"); } catch(...) {}
+          }
+      }
+  }
+  /* ===================================================================== */
+
   ncclComm_t comm = ncclComm->getNcclComm();
 
   // Both `inputs' and `outputs' are created on a worker stream and used in
@@ -3899,16 +4006,43 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 // the vector and pass it to fn.
 // TODO: we should clean up this in future (by either entirely removing lambda's
 // or removing input and output from lambda's signature).
+
+// 這裡就是「完美偽裝」的關鍵：分流執行，但共用同一個 Work 物件！
+  if (C10_UNLIKELY(this->is_degraded_)) {
+      /* --- [NCCL-FT: Shadow Ping-Pong 執行路徑] --- */
+      // 這裡呼叫我們自定義的代傳邏輯 (包含 Local P2P 與 ATen 拼接)
+      // 這段邏輯的指令也會被推入 `ncclStream` 中
+
+      //for logging
+      LOG(INFO) << "NCCL is_degraded_ , now switch to shadow ping pong , rank" << this->rank_ ;
+      /* --- [原生 NCCL 執行路徑] --- */
 #ifndef NCCL_HAS_COMM_NONBLOCKING
-  C10D_NCCL_FT_CHECK(
-      fn(inputs[0], outputs[0], comm, ncclStream),
-      ncclComm->getNcclCommFailureReason());
+    C10D_NCCL_FT_CHECK(
+        fn(inputs[0], outputs[0], comm, ncclStream),
+        ncclComm->getNcclCommFailureReason());
 #else
-  C10D_NCCL_FT_CHECK_TIMEOUT(
-      fn(inputs[0], outputs[0], comm, ncclStream),
-      ncclComm,
-      ncclComm->getNcclCommFailureReason());
+    C10D_NCCL_FT_CHECK_TIMEOUT(
+        fn(inputs[0], outputs[0], comm, ncclStream),
+        ncclComm,
+        ncclComm->getNcclCommFailureReason());
 #endif // NCCL_HAS_COMM_NONBLOCKING
+
+
+      //this->execute_shadow_ping_pong(inputs[0], outputs[0], ncclStream);
+      /* ------------------------------------------ */
+  } else {
+      /* --- [原生 NCCL 執行路徑] --- */
+#ifndef NCCL_HAS_COMM_NONBLOCKING
+    C10D_NCCL_FT_CHECK(
+        fn(inputs[0], outputs[0], comm, ncclStream),
+        ncclComm->getNcclCommFailureReason());
+#else
+    C10D_NCCL_FT_CHECK_TIMEOUT(
+        fn(inputs[0], outputs[0], comm, ncclStream),
+        ncclComm,
+        ncclComm->getNcclCommFailureReason());
+#endif // NCCL_HAS_COMM_NONBLOCKING
+  }
 
   post(ncclStream, work);
 

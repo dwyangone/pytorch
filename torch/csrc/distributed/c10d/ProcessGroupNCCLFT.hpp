@@ -401,6 +401,10 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
 
     std::vector<at::Tensor> result() override;
 
+    // NCCLFT
+    // 讓 C-Callback 可以呼叫
+    void trigger_fault_proposal(int dev_idx);
+
    protected:
     // The process group unique id
     std::string pgUID_;
@@ -1066,6 +1070,21 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
 
   // Instance of the watchdog thread.
   std::unique_ptr<Watchdog> watchdog_;
+
+  /* ===================================================================== */
+  /* --- [NCCL-FT: 零開銷容錯控制面變數] --- */
+  std::atomic<uint64_t> do_not_cross_op_{0}; 
+  std::atomic<uint64_t> final_commit_op_{0}; 
+  std::atomic<int> failed_dev_index_{-1};
+  bool is_degraded_ = false;
+
+  // 獨立的側車執行緒，專門負責 2PC 協商，絕對不干擾原生 Watchdog
+  std::thread ft_negotiator_thread_;
+  std::atomic<bool> ft_negotiator_running_{true};
+
+  void start_ft_negotiator_thread();
+  //void execute_shadow_ping_pong(at::Tensor& input, at::Tensor& output, at::cuda::CUDAStream& stream);
+  /* ===================================================================== */
 
   // Helper that broadcasts nccl unique ID to all ranks through the store
   void broadcastUniqueNCCLID(
