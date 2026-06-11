@@ -3822,31 +3822,42 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
 void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
     ft_negotiator_thread_ = std::thread([this]() {
         c10::setThreadName("pt_nccl_ft_side"); // 側車執行緒
+        
         while (ft_negotiator_running_.load()) {
             try {
-                // 阻塞等待，超時 500ms 方便退出
-                this->globalStore_->wait({"NCCL_FT_EVENT"}, std::chrono::milliseconds(500));
-                
-                auto vec = this->globalStore_->get("NCCL_FT_EVENT");
-                std::string event_str(vec.begin(), vec.end());
-
-                if (event_str.rfind("PROPOSE:", 0) == 0) {
-                    // 解析字串 "PROPOSE:8050:2"
-                    size_t first_colon = event_str.find(':');
-                    size_t second_colon = event_str.find(':', first_colon + 1);
+                // 關鍵修正：改用 check() 進行非阻塞檢查，避免 Exception 轟炸與 TCPStore 鎖死
+                if (this->globalStore_->check({"NCCL_FT_EVENT"})) {
                     
-                    // 真正的字串解析邏輯 (取代了之前的 ...)
-                    uint64_t target_op = std::stoull(event_str.substr(first_colon + 1, second_colon - first_colon - 1));
-                    int dev_idx = std::stoi(event_str.substr(second_colon + 1));
+                    auto vec = this->globalStore_->get("NCCL_FT_EVENT");
+                    std::string event_str(vec.begin(), vec.end());
 
-                    this->do_not_cross_op_.store(target_op, std::memory_order_release);
-                    this->failed_dev_index_.store(dev_idx, std::memory_order_release);
-                    this->final_commit_op_.store(target_op, std::memory_order_release);
+                    if (event_str.rfind("PROPOSE:", 0) == 0) {
+                        size_t first_colon = event_str.find(':');
+                        size_t second_colon = event_str.find(':', first_colon + 1);
+                        
+                        uint64_t target_op = std::stoull(event_str.substr(first_colon + 1, second_colon - first_colon - 1));
+                        int dev_idx = std::stoi(event_str.substr(second_colon + 1));
 
-                    LOG(INFO) << logPrefix() << "[NCCL-FT] 收到提案，警戒線 OP: " << target_op;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200)); // 防抖
+                        this->do_not_cross_op_.store(target_op, std::memory_order_release);
+                        this->failed_dev_index_.store(dev_idx, std::memory_order_release);
+                        this->final_commit_op_.store(target_op, std::memory_order_release);
+
+                        LOG(INFO) << logPrefix() << "[NCCL-FT] 收到提案，警戒線 OP: " << target_op;
+                        
+                        // 收到信號後休眠防抖，避免重複讀取
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200)); 
+                    }
+                } else {
+                    // 沒事做就乖乖睡覺，把 CPU 與 TCPStore 的控制權還給主執行緒
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
-            } catch (...) {}
+            } catch (const std::exception& e) {
+                // 只在 TCPStore 真正發生連線錯誤時紀錄
+                LOG(WARNING) << logPrefix() << "[NCCL-FT] 側車執行緒網路例外: " << e.what();
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            } catch (...) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
         }
     });
 }
