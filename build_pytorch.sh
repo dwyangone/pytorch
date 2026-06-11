@@ -32,10 +32,10 @@ export USE_SYSTEM_NCCL=1
 #export NCCL_ROOT=$CONDA_PREFIX
 #export NCCL_INCLUDE_DIR=$CONDA_PREFIX/include
 # 注意：有些版本的 NCCL 也會跑去 targets 裡，我們兩邊都設比較保險
-export NCCL_LIB_DIR=$CONDA_PREFIX/lib
-export NCCL_ROOT_DIR=/home/twyang/nccl/build
+export NCCL_ROOT=/home/twyang/nccl/build
 export NCCL_INCLUDE_DIR=/home/twyang/nccl/build/include
-export NCCL_LIBRARY=/home/twyang/nccl/build/lib/libnccl.so
+export NCCL_LIB_DIR=/home/twyang/nccl/build/lib
+#export NCCL_LIBRARY=/home/twyang/nccl/build/lib/libnccl.so
 
 # === 5. 功能開關 (A100 優化) ===
 export USE_ROCM=0
