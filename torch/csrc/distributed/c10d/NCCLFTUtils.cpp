@@ -369,7 +369,19 @@ void NCCLFTComm::abort(std::optional<std::string> commFailureReason) {
 #ifdef NCCL_HAS_COMM_REGISTER
   // Deregister all registered segments before aborting.
   for (auto& it : registeredSegmentHandles_) {
-    void* handle = it.second;
+    void* handle = it.second.first;
+    bool is_window = it.second.second;
+    if (is_window) {
+#ifdef NCCL_HAS_COMM_WINDOW_REGISTER
+      C10D_NCCL_CHECK(
+          ::ncclCommWindowDeregister(ncclComm_, (ncclWindow_t)handle),
+          c10::str(
+              "Failed to window deregister segment handle ",
+              handle,
+              " on ncclComm_ ",
+              ncclComm_));
+#endif
+    } else {
     C10D_NCCL_FT_CHECK(
         ::ncclCommDeregister(ncclComm_, handle),
         c10::str(
@@ -377,6 +389,7 @@ void NCCLFTComm::abort(std::optional<std::string> commFailureReason) {
             handle,
             " on ncclComm_ ",
             ncclComm_));
+    }
   }
   registeredSegmentHandles_.clear();
 #endif
@@ -583,6 +596,54 @@ ncclResult_t NCCLFTComm::deregisterSegment(void* ptr, bool window /*false*/) {
 
 std::string NCCLFTComm::repr() const {
   return c10::str((void*)ncclComm_);
+}
+
+void NCCLFTComm::suspend() {
+#ifdef NCCL_HAS_COMM_OFFLOAD
+  LockType lock(mutex_);
+  at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex_);
+  auto comm = getNcclComm();
+  C10D_NCCL_CHECK(ncclCommSuspend(comm, NCCL_SUSPEND_MEM), std::nullopt);
+#else
+  TORCH_CHECK(false, "suspend() requires NCCL 2.29.7 or later");
+#endif
+}
+
+void NCCLFTComm::resume() {
+#ifdef NCCL_HAS_COMM_OFFLOAD
+  LockType lock(mutex_);
+  at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex_);
+  auto comm = getNcclComm();
+  C10D_NCCL_CHECK(ncclCommResume(comm), std::nullopt);
+#else
+  TORCH_CHECK(false, "resume() requires NCCL 2.29.7 or later");
+#endif
+}
+
+std::unordered_map<std::string, uint64_t> NCCLFTComm::getMemoryStats() {
+#ifdef NCCL_HAS_COMM_OFFLOAD
+  LockType lock(mutex_);
+  at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex_);
+  auto comm = getNcclComm();
+  uint64_t suspend, suspended, persist, total;
+  C10D_NCCL_CHECK(
+      ncclCommMemStats(comm, ncclStatGpuMemSuspend, &suspend), std::nullopt);
+  C10D_NCCL_CHECK(
+      ncclCommMemStats(comm, ncclStatGpuMemSuspended, &suspended),
+      std::nullopt);
+  C10D_NCCL_CHECK(
+      ncclCommMemStats(comm, ncclStatGpuMemPersist, &persist), std::nullopt);
+  C10D_NCCL_CHECK(
+      ncclCommMemStats(comm, ncclStatGpuMemTotal, &total), std::nullopt);
+  return {
+      {"suspend", suspend},
+      {"suspended", suspended},
+      {"persist", persist},
+      {"total", total},
+  };
+#else
+  TORCH_CHECK(false, "getMemoryStats() requires NCCL 2.29.7 or later");
+#endif
 }
 
 #if (defined(IS_NCCLX) || defined(USE_ROCM)) && defined(NCCL_COMM_DUMP)

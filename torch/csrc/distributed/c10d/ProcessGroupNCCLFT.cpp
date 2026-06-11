@@ -24,6 +24,8 @@
 #include <c10/util/irange.h>
 #include <c10/util/thread_name.h>
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
+/* --- [NCCL-FT: 1. 顯式引入我們客製化的底層 NCCL 標頭檔] --- */
+#include <nccl.h>
 #include <torch/csrc/cuda/nccl.h>
 #include <torch/csrc/distributed/c10d/FlightRecorder.hpp>
 #include <torch/csrc/distributed/c10d/NCCLFTUtils.hpp>
@@ -44,10 +46,10 @@ using FlightRecorderCUDA = FlightRecorder<at::cuda::CUDAEvent>;
 
 /* ========================================================================= */
 /* --- [NCCL-FT: 強制宣告底層 C API (繞過 Header 路徑衝突)] --- */
-extern "C" {
-    typedef void (*ncclFaultCallback_t)(int dev_idx);
-    ncclResult_t ncclCommRegisterFaultCallback(ncclComm_t comm, ncclFaultCallback_t cb);
-}
+//extern "C" {
+//    typedef void (*ncclFaultCallback_t)(int dev_idx);
+//    ncclResult_t ncclCommRegisterFaultCallback(ncclComm_t comm, ncclFaultCallback_t cb);
+//}
 /* ========================================================================= */
 
 namespace {
