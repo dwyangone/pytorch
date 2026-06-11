@@ -534,7 +534,7 @@ ncclResult_t NCCLFTComm::registerSegment(
           " on ncclComm_ ",
           comm));
 #endif
-  registeredSegmentHandles_[ptr] = handle;
+  registeredSegmentHandles_[ptr] = {handle, window};
   return ncclSuccess;
 #else
   return ncclInvalidUsage;
@@ -551,7 +551,7 @@ ncclResult_t NCCLFTComm::deregisterSegment(void* ptr, bool window /*false*/) {
       " is not registered on ncclComm_ ",
       ncclComm_);
 
-  void* handle = registeredSegmentHandles_[ptr];
+  void* handle = registeredSegmentHandles_[ptr].first;
   // Use getNcclComm to make sure comm is ready before calling nccl APIs
   auto comm = getNcclComm();
 #ifdef NCCL_HAS_COMM_WINDOW_REGISTER
