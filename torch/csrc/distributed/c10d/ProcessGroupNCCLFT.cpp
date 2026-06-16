@@ -332,6 +332,9 @@ std::mutex g_ft_pg_mutex;
 std::unordered_set<ProcessGroupNCCLFT*> g_ft_pg_instances;
 
 extern "C" void nccl_ft_global_fault_callback(int dev_idx) {
+    // 【追蹤點 1】：如果沒看到這行，代表你改的 NCCL 根本沒送出信號！
+    LOG(ERROR) << "[NCCL-FT-TRACE] !!! NCCL 底層成功觸發 Callback !!! 故障網卡: " << dev_idx;
+
     std::lock_guard<std::mutex> lock(g_ft_pg_mutex);
     for (auto* pg : g_ft_pg_instances) {
         pg->trigger_fault_proposal(dev_idx);
@@ -3811,7 +3814,7 @@ float ProcessGroupNCCLFT::endTimeEstimate() {
 //NCCLFT new add function for Negotiator OP number to switch
 void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
     // 預約在未來 50 個 OP 後對齊切換
-    uint64_t target_op = this->seqCollective_ + 50; 
+    uint64_t target_op = this->seqCollective_ + 10; 
     std::string proposal = "PROPOSE:" + std::to_string(target_op) + ":" + std::to_string(dev_idx);
     try {
         std::vector<uint8_t> vec(proposal.begin(), proposal.end());
@@ -3842,6 +3845,8 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                         this->failed_dev_index_.store(dev_idx, std::memory_order_release);
                         this->final_commit_op_.store(target_op, std::memory_order_release);
 
+                        // 【追蹤點 2】：如果沒看到這行，代表 TCPStore 廣播失敗或沒寫進去
+                        LOG(ERROR) << logPrefix() << "[NCCL-FT-TRACE] 側車執行緒成功攔截提案！設定警戒線: " << target_op;
                         LOG(INFO) << logPrefix() << "[NCCL-FT] 收到提案，警戒線 OP: " << target_op;
                         
                         // 收到信號後休眠防抖，避免重複讀取
@@ -3991,6 +3996,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   uint64_t boundary = this->do_not_cross_op_.load(std::memory_order_relaxed);
 
   if (C10_UNLIKELY(boundary > 0 && current_op == boundary)) {
+      // 【追蹤點 3】：主執行緒成功撞上警戒線
+      LOG(ERROR) << logPrefix() << "[NCCL-FT-TRACE] 主執行緒抵達警戒線 OP: " << current_op << "，準備煞車對齊！";    
       LOG(INFO) << logPrefix() << "[NCCL-FT] 抵達警戒線 OP: " << current_op << "，準備煞車對齊！";
       
       // 等待最終決議
