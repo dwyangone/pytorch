@@ -1079,6 +1079,9 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   std::atomic<int> failed_dev_index_{-1};
   bool is_degraded_ = false;
 
+  // -1 代表沒有錯誤。若大於等於 0，代表該 Local Device Index 網卡故障
+  std::atomic<int> local_hardware_fault_dev_{-1};
+
   // 獨立的側車執行緒，專門負責 2PC 協商，絕對不干擾原生 Watchdog
   std::thread ft_negotiator_thread_;
   std::atomic<bool> ft_negotiator_running_{true};

@@ -3813,48 +3813,94 @@ float ProcessGroupNCCLFT::endTimeEstimate() {
 
 //NCCLFT new add function for Negotiator OP number to switch
 void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
-    // 預約在未來 50 個 OP 後對齊切換
-    uint64_t target_op = this->seqCollective_ + 10; 
-    std::string proposal = "PROPOSE:" + std::to_string(target_op) + ":" + std::to_string(dev_idx);
-    try {
-        std::vector<uint8_t> vec(proposal.begin(), proposal.end());
-        this->globalStore_->set("NCCL_FT_EVENT", vec);
-    } catch (...) {}
+    //// 預約在未來 50 個 OP 後對齊切換
+    //uint64_t target_op = this->seqCollective_ + 10; 
+    //std::string proposal = "PROPOSE:" + std::to_string(target_op) + ":" + std::to_string(dev_idx);
+    //try {
+    //    std::vector<uint8_t> vec(proposal.begin(), proposal.end());
+    //    this->globalStore_->set("NCCL_FT_EVENT", vec);
+    //} catch (...) {}
+ 
+    // ⚠️ 絕對不要在這裡呼叫 TCPStore！
+    // 0.001 毫秒內將控制權還給 NCCL 的底層執行緒
+    this->local_hardware_fault_dev_.store(dev_idx, std::memory_order_release);
+    LOG(INFO) << logPrefix() << "[NCCL-FT] 瞬間攔截本地網卡故障，標記 dev_idx: " << dev_idx;
+}
 }
 
 void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
+    ft_negotiator_running_.store(true);
     ft_negotiator_thread_ = std::thread([this]() {
         c10::setThreadName("pt_nccl_ft_side"); // 側車執行緒
         
+        // 【新增】：字串去重機制，防止同一個提案被無限重複處理
+        std::string last_handled_event = ""; 
+        
         while (ft_negotiator_running_.load()) {
             try {
-                // 關鍵修正：改用 check() 進行非阻塞檢查，避免 Exception 轟炸與 TCPStore 鎖死
+                // =================================================================
+                // 任務 1：代發提案 (Relay Write)
+                // 檢查 NCCL Callback 是否有透過記憶體傳來「本地網卡故障」的極速信號
+                // =================================================================
+                int failed_dev = this->local_hardware_fault_dev_.load(std::memory_order_acquire);
+                if (failed_dev != -1) {
+                    uint64_t target_op = this->seqCollective_ + calculate_safe_buffer();
+                    
+                    // 計算自己的 Node ID (假設 localDeviceCount_ 已經正確初始化)
+                    int my_node_id = this->rank_ / this->localDeviceCount_;
+                    
+                    // 封裝升級版協議: "PROPOSE:OP:NODE_ID:DEV_IDX"
+                    std::string proposal = "PROPOSE:" + std::to_string(target_op) + 
+                                           ":" + std::to_string(my_node_id) + 
+                                           ":" + std::to_string(failed_dev);
+
+                    // 由側車執行緒承受 TCPStore 的網路寫入延遲，釋放 NCCL 底層！
+                    std::vector<uint8_t> vec(proposal.begin(), proposal.end());
+                    this->globalStore_->set("NCCL_FT_EVENT", vec);
+
+                    // 復位信號
+                    this->local_hardware_fault_dev_.store(-1, std::memory_order_release);
+                    LOG(INFO) << logPrefix() << "[NCCL-FT] 側車執行緒成功代發提案至 TCPStore: " << proposal;
+                }
+
+                // =================================================================
+                // 任務 2：監聽全網提案 (保留你原本安全的 check 機制)
+                // =================================================================
                 if (this->globalStore_->check({"NCCL_FT_EVENT"})) {
                     
                     auto vec = this->globalStore_->get("NCCL_FT_EVENT");
                     std::string event_str(vec.begin(), vec.end());
 
-                    if (event_str.rfind("PROPOSE:", 0) == 0) {
-                        size_t first_colon = event_str.find(':');
-                        size_t second_colon = event_str.find(':', first_colon + 1);
-                        
-                        uint64_t target_op = std::stoull(event_str.substr(first_colon + 1, second_colon - first_colon - 1));
-                        int dev_idx = std::stoi(event_str.substr(second_colon + 1));
+                    // 【關鍵修正】：加入 event_str != last_handled_event 判斷，防 Spam
+                    if (event_str.rfind("PROPOSE:", 0) == 0 && event_str != last_handled_event) {
+                        last_handled_event = event_str; // 記錄下來，下次跳過
 
-                        this->do_not_cross_op_.store(target_op, std::memory_order_release);
-                        this->failed_dev_index_.store(dev_idx, std::memory_order_release);
-                        this->final_commit_op_.store(target_op, std::memory_order_release);
-
-                        // 【追蹤點 2】：如果沒看到這行，代表 TCPStore 廣播失敗或沒寫進去
-                        LOG(ERROR) << logPrefix() << "[NCCL-FT-TRACE] 側車執行緒成功攔截提案！設定警戒線: " << target_op;
-                        LOG(INFO) << logPrefix() << "[NCCL-FT] 收到提案，警戒線 OP: " << target_op;
+                        uint64_t target_op;
+                        int failed_node, f_dev;
                         
-                        // 收到信號後休眠防抖，避免重複讀取
+                        // 【關鍵修正】：解析新格式 "PROPOSE:OP:NODE_ID:DEV_IDX"
+                        // 使用 sscanf 提取三個變數，比 substr 更乾淨安全
+                        if (sscanf(event_str.c_str(), "PROPOSE:%lu:%d:%d", &target_op, &failed_node, &f_dev) == 3) {
+
+                            this->do_not_cross_op_.store(target_op, std::memory_order_release);
+                            this->failed_dev_index_.store(f_dev, std::memory_order_release);
+                            this->final_commit_op_.store(target_op, std::memory_order_release);
+
+                            // 保留你的追蹤點
+                            LOG(ERROR) << logPrefix() << "[NCCL-FT-TRACE] 側車執行緒成功攔截提案！設定警戒線: " << target_op;
+                            LOG(INFO) << logPrefix() << "[NCCL-FT] 收到 Node " << failed_node 
+                                      << " 網卡 " << f_dev << " 故障，警戒線 OP: " << target_op;
+                        }
+                        
+                        // 收到新信號後休眠防抖
                         std::this_thread::sleep_for(std::chrono::milliseconds(200)); 
+                    } else {
+                        // 雖然有 key，但是舊的提案，稍微休眠避免 CPU 空轉
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     }
                 } else {
                     // 沒事做就乖乖睡覺，把 CPU 與 TCPStore 的控制權還給主執行緒
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
             } catch (const std::exception& e) {
                 // 只在 TCPStore 真正發生連線錯誤時紀錄
