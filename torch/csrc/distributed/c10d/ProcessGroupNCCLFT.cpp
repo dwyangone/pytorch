@@ -3826,7 +3826,7 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
     this->local_hardware_fault_dev_.store(dev_idx, std::memory_order_release);
     LOG(INFO) << logPrefix() << "[NCCL-FT] 瞬間攔截本地網卡故障，標記 dev_idx: " << dev_idx;
 }
-}
+
 
 void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
     ft_negotiator_running_.store(true);
