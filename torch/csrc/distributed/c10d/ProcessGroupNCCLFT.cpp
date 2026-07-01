@@ -3844,7 +3844,7 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                 // =================================================================
                 int failed_dev = this->local_hardware_fault_dev_.load(std::memory_order_acquire);
                 if (failed_dev != -1) {
-                    uint64_t target_op = this->seqCollective_ + calculate_safe_buffer();
+                    uint64_t target_op = this->seqCollective_ + 10;
                     
                     // 計算自己的 Node ID (假設 localDeviceCount_ 已經正確初始化)
                     int my_node_id = this->rank_ / this->localDeviceCount_;
