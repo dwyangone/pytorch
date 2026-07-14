@@ -1069,12 +1069,23 @@ ProcessGroupNCCLFT::ProcessGroupNCCLFT(
   watchdog_ = std::make_unique<Watchdog>(this);
 
   /* --- [NCCL-FT: 註冊並啟動協商側車] --- */
-  {
-      std::lock_guard<std::mutex> lock(g_ft_pg_mutex);
-      g_ft_pg_instances.insert(this);
+  /* --- [NCCL-FT: 檢查環境變數決定是否啟動容錯控制面] --- */
+  const char* disable_env = getenv("NCCL_FT_DISABLE");
+  bool ft_disabled = (disable_env && strcmp(disable_env, "1") == 0);
+
+  if (!ft_disabled) {
+      {
+          std::lock_guard<std::mutex> lock(g_ft_pg_mutex);
+          g_ft_pg_instances.insert(this);
+      }
+      // 只有在沒被停用時，才啟動側車進行 TCPStore 協商與預約
+      start_ft_negotiator_thread(); 
+      LOG(INFO) << logPrefix() << "[NCCL-FT] 容錯優化控制面已成功啟動。";
+  } else {
+      this->is_degraded_ = false; // 強制不進入降級代傳模式
+      LOG(WARNING) << logPrefix() << "[NCCL-FT] 偵測到 NCCL_FT_DISABLE=1，完全恢復原生 NCCL 運作模式。";
   }
-  start_ft_negotiator_thread();
-  /* ------------------------------------ */
+  /* ----------------------------------------------------- */
 
 #ifdef ENABLE_NCCL_ERROR_CHECKING
   // in blockingWait mode, we don't need to enable the watchdog thread to check
@@ -4041,7 +4052,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   uint64_t current_op = this->seqCollective_; // 目前的 OP 時鐘
   uint64_t boundary = this->do_not_cross_op_.load(std::memory_order_relaxed);
 
-  if (C10_UNLIKELY(boundary > 0 && current_op == boundary)) {
+  if (!ft_disabled && C10_UNLIKELY(boundary > 0 && current_op == boundary)) {
       // 【追蹤點 3】：主執行緒成功撞上警戒線
       LOG(ERROR) << logPrefix() << "[NCCL-FT-TRACE] 主執行緒抵達警戒線 OP: " << current_op << "，準備煞車對齊！";    
       LOG(INFO) << logPrefix() << "[NCCL-FT] 抵達警戒線 OP: " << current_op << "，準備煞車對齊！";
