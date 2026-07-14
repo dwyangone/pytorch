@@ -1078,6 +1078,7 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   std::atomic<uint64_t> final_commit_op_{0}; 
   std::atomic<int> failed_dev_index_{-1};
   bool is_degraded_ = false;
+  bool ft_disabled_ = false;
 
   // -1 代表沒有錯誤。若大於等於 0，代表該 Local Device Index 網卡故障
   std::atomic<int> local_hardware_fault_dev_{-1};

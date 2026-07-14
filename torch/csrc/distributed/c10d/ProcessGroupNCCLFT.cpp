@@ -1071,9 +1071,9 @@ ProcessGroupNCCLFT::ProcessGroupNCCLFT(
   /* --- [NCCL-FT: 註冊並啟動協商側車] --- */
   /* --- [NCCL-FT: 檢查環境變數決定是否啟動容錯控制面] --- */
   const char* disable_env = getenv("NCCL_FT_DISABLE");
-  bool ft_disabled = (disable_env && strcmp(disable_env, "1") == 0);
+  this->ft_disabled_ = (disable_env && strcmp(disable_env, "1") == 0);
 
-  if (!ft_disabled) {
+  if (!this->ft_disabled_) {
       {
           std::lock_guard<std::mutex> lock(g_ft_pg_mutex);
           g_ft_pg_instances.insert(this);
@@ -4052,7 +4052,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   uint64_t current_op = this->seqCollective_; // 目前的 OP 時鐘
   uint64_t boundary = this->do_not_cross_op_.load(std::memory_order_relaxed);
 
-  if (!ft_disabled && C10_UNLIKELY(boundary > 0 && current_op == boundary)) {
+  if (!this->ft_disabled_ && C10_UNLIKELY(boundary > 0 && current_op == boundary)) {
       // 【追蹤點 3】：主執行緒成功撞上警戒線
       LOG(ERROR) << logPrefix() << "[NCCL-FT-TRACE] 主執行緒抵達警戒線 OP: " << current_op << "，準備煞車對齊！";    
       LOG(INFO) << logPrefix() << "[NCCL-FT] 抵達警戒線 OP: " << current_op << "，準備煞車對齊！";
