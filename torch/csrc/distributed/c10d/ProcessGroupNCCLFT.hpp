@@ -1074,8 +1074,8 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
 
   /* ===================================================================== */
   /* --- [NCCL-FT: 零開銷容錯控制面變數] --- */
-  std::atomic<uint64_t> do_not_cross_op_{0}; 
-  std::atomic<uint64_t> final_commit_op_{0}; 
+  std::atomic<uint64_t> do_not_cross_op_{0};
+  std::atomic<uint64_t> final_commit_op_{0};
   std::atomic<int> failed_dev_index_{-1};
   bool is_degraded_ = false;
   bool ft_disabled_ = false;
@@ -1083,14 +1083,32 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // -1 代表沒有錯誤。若大於等於 0，代表該 Local Device Index 網卡故障
   std::atomic<int> local_hardware_fault_dev_{-1};
 
+  // Intra-node NVLink-only communicator — never touches cross-node NICs.
+  // Used as the local scatter/gather channel in the Shadow Ping-Pong relay.
+  ncclComm_t local_nvlink_comm_{nullptr};
+
+  // Reduced cross-node communicator built after a NIC fault is confirmed.
+  // Healthy ranks participate; the faulty rank's slot is dropped symmetrically
+  // across all nodes.
+  ncclComm_t proxy_global_comm_{nullptr};
+  int proxy_comm_rank_{-1};
+  int proxy_comm_size_{0};
+  int proxy_failed_local_dev_{-1};
+  std::atomic<bool> proxy_comm_ready_{false};
+
   // 獨立的側車執行緒，專門負責 2PC 協商，絕對不干擾原生 Watchdog
   std::thread ft_negotiator_thread_;
   std::atomic<bool> ft_negotiator_running_{true};
 
   void start_ft_negotiator_thread();
   uint64_t calculate_safe_buffer();
+  void initLocalNvlinkComm();
   void rebuild_shadow_ping_pong_topology();
-  //void execute_shadow_ping_pong(at::Tensor& input, at::Tensor& output, at::cuda::CUDAStream& stream);
+  void execute_shadow_allreduce(
+      at::Tensor& input,
+      at::Tensor& output,
+      at::cuda::CUDAStream& stream,
+      ncclRedOp_t op);
   /* ===================================================================== */
 
 

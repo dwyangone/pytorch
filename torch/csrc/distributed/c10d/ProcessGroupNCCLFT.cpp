@@ -1079,7 +1079,8 @@ ProcessGroupNCCLFT::ProcessGroupNCCLFT(
           g_ft_pg_instances.insert(this);
       }
       // 只有在沒被停用時，才啟動側車進行 TCPStore 協商與預約
-      start_ft_negotiator_thread(); 
+      start_ft_negotiator_thread();
+      initLocalNvlinkComm();
       LOG(INFO) << logPrefix() << "[NCCL-FT] 容錯優化控制面已成功啟動。";
   } else {
       this->is_degraded_ = false; // 強制不進入降級代傳模式
@@ -1683,7 +1684,7 @@ void ProcessGroupNCCLFT::shutdown() {
 ProcessGroupNCCLFT::~ProcessGroupNCCLFT() {
   LOG(INFO) << logPrefix() << "ProcessGroupNCCLFT destructor entered.";
 
-  /* --- [NCCL-FT: 退出協商側車] --- */
+  /* --- [NCCL-FT: 退出協商側車與 FT 通訊子] --- */
   {
       std::lock_guard<std::mutex> lock(g_ft_pg_mutex);
       g_ft_pg_instances.erase(this);
@@ -1691,6 +1692,14 @@ ProcessGroupNCCLFT::~ProcessGroupNCCLFT() {
   ft_negotiator_running_.store(false);
   if (ft_negotiator_thread_.joinable()) {
       ft_negotiator_thread_.join();
+  }
+  if (local_nvlink_comm_ != nullptr) {
+      ncclCommDestroy(local_nvlink_comm_);
+      local_nvlink_comm_ = nullptr;
+  }
+  if (proxy_global_comm_ != nullptr) {
+      ncclCommDestroy(proxy_global_comm_);
+      proxy_global_comm_ = nullptr;
   }
   /* ------------------------------- */
 
@@ -2449,6 +2458,37 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
 
       // If work hits an exception (either an error or timeout)
       if (work.exception()) {
+        // [NCCL-FT] Recoverable path: treat all NCCL errors as NIC-level
+        // hardware faults when FT is enabled. Signal the ft_negotiator_thread_
+        // to begin the TCPStore negotiation, clear the exception so that the
+        // training loop can continue, and remove the poisoned work from the
+        // queue so the watchdog does not spin on a comm that will never fire.
+        // Error-type classification (ncclRemoteError vs ncclInternalError) is
+        // deferred to after the prototype is validated.
+        if (!pg_->ft_disabled_) {
+          int device_idx = work.device_.index() % pg_->localDeviceCount_;
+          LOG(WARNING) << pg_->logPrefix()
+                       << "[NCCL-FT] Recoverable NIC fault detected on local "
+                       << "device " << device_idx
+                       << " (work seq=" << work.seq_
+                       << "). Entering failover path, skipping abort.";
+          // Reset PG error state so subsequent ops are not blocked.
+          {
+            std::lock_guard<std::mutex> lock(pg_->errorMutex_);
+            pg_->error_ = ErrorType::SUCCESS;
+          }
+          // Signal the ft_negotiator_thread_ to write the TCPStore proposal.
+          pg_->local_hardware_fault_dev_.store(
+              device_idx, std::memory_order_release);
+          // Clear the exception on the work object so wait() does not rethrow.
+          work.setException(nullptr);
+          // Erase poisoned work so the watchdog loop does not stall.
+          it = pg_->workMetaList_.erase(it);
+          pg_->heartbeatMonitor_->setLastWorkListUpdateTime(
+              std::chrono::steady_clock::now());
+          continue;
+        }
+
         LOG(ERROR) << c10::str(
             pg_->logPrefix(),
             " failure detected by watchdog at work sequence id: ",
@@ -3822,6 +3862,182 @@ float ProcessGroupNCCLFT::endTimeEstimate() {
 #endif
 }
 
+// [NCCL-FT] Build the intra-node NVLink-only communicator once at startup.
+// Every rank on the same physical node participates; no cross-node NIC is used.
+void ProcessGroupNCCLFT::initLocalNvlinkComm() {
+    int node_id    = rank_ / localDeviceCount_;
+    int local_rank = rank_ % localDeviceCount_;
+    std::string uid_key = "NCCL_FT_LOCAL_UID_NODE_" + std::to_string(node_id);
+
+    ncclUniqueId uid{};
+    if (local_rank == 0) {
+        C10D_NCCL_FT_CHECK(ncclGetUniqueId(&uid), std::nullopt);
+        std::vector<uint8_t> vec(
+            reinterpret_cast<uint8_t*>(&uid),
+            reinterpret_cast<uint8_t*>(&uid) + sizeof(uid));
+        globalStore_->set(uid_key, vec);
+    } else {
+        auto vec = globalStore_->get(uid_key);
+        TORCH_CHECK(
+            vec.size() == sizeof(uid),
+            "NCCL_FT_LOCAL_UID size mismatch");
+        std::memcpy(&uid, vec.data(), sizeof(uid));
+    }
+
+    C10D_NCCL_FT_CHECK(
+        ncclCommInitRank(&local_nvlink_comm_, localDeviceCount_, uid, local_rank),
+        std::nullopt);
+    LOG(INFO) << logPrefix() << "[NCCL-FT] local_nvlink_comm_ initialised "
+              << "(node=" << node_id << ", local_rank=" << local_rank
+              << ", size=" << localDeviceCount_ << ")";
+}
+
+// [NCCL-FT] Build a reduced cross-node communicator that excludes the failed
+// local device index from every node (symmetric degradation). Healthy ranks
+// call ncclCommInitRank; the faulty rank skips and leaves proxy_global_comm_
+// as nullptr.
+void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
+    int failed_local_dev = failed_dev_index_.load(std::memory_order_acquire);
+    if (failed_local_dev < 0) {
+        LOG(WARNING) << logPrefix()
+                     << "[NCCL-FT] rebuild_shadow_ping_pong_topology called "
+                     << "with no failed device recorded, skipping.";
+        return;
+    }
+
+    proxy_failed_local_dev_ = failed_local_dev;
+    bool is_faulty = (rank_ % localDeviceCount_) == failed_local_dev;
+
+    // Build rank mapping: assign new contiguous indices to all ranks whose
+    // local device index != failed_local_dev.
+    proxy_comm_size_ = size_ - (size_ / localDeviceCount_);
+    int new_rank = 0;
+    proxy_comm_rank_ = -1;
+    for (int r = 0; r < size_; ++r) {
+        if (r % localDeviceCount_ != failed_local_dev) {
+            if (r == rank_) {
+                proxy_comm_rank_ = new_rank;
+            }
+            ++new_rank;
+        }
+    }
+
+    // Exchange UID: global rank 0 generates; everyone else reads.
+    std::string uid_key = "NCCL_FT_PROXY_UID";
+    ncclUniqueId uid{};
+    if (rank_ == 0) {
+        C10D_NCCL_FT_CHECK(ncclGetUniqueId(&uid), std::nullopt);
+        std::vector<uint8_t> vec(
+            reinterpret_cast<uint8_t*>(&uid),
+            reinterpret_cast<uint8_t*>(&uid) + sizeof(uid));
+        globalStore_->set(uid_key, vec);
+    } else {
+        auto vec = globalStore_->get(uid_key);
+        TORCH_CHECK(vec.size() == sizeof(uid), "NCCL_FT_PROXY_UID size mismatch");
+        std::memcpy(&uid, vec.data(), sizeof(uid));
+    }
+
+    if (!is_faulty) {
+        C10D_NCCL_FT_CHECK(
+            ncclCommInitRank(
+                &proxy_global_comm_, proxy_comm_size_, uid, proxy_comm_rank_),
+            std::nullopt);
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT] proxy_global_comm_ initialised "
+                  << "(proxy_rank=" << proxy_comm_rank_
+                  << ", proxy_size=" << proxy_comm_size_ << ")";
+    } else {
+        proxy_global_comm_ = nullptr;
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT] This rank is the faulty GPU; "
+                  << "proxy_global_comm_ left as nullptr.";
+    }
+    proxy_comm_ready_.store(true, std::memory_order_release);
+}
+
+// [NCCL-FT] Four-step Shadow Ping-Pong relay for AllReduce.
+//
+// Roles (determined by local device index within the node):
+//   faulty  — the GPU whose NIC failed; relays through the proxy.
+//   proxy   — healthy GPU on the same node; carries the faulty GPU's data.
+//   healthy — all other GPUs; run ncclAllReduce on proxy_global_comm_ directly.
+//
+// All NCCL calls are enqueued onto `stream` (async with respect to the CPU).
+void ProcessGroupNCCLFT::execute_shadow_allreduce(
+    at::Tensor& input,
+    at::Tensor& output,
+    at::cuda::CUDAStream& stream,
+    ncclRedOp_t op) {
+
+    int local_rank        = rank_ % localDeviceCount_;
+    int proxy_local_rank  = (proxy_failed_local_dev_ + 1) % localDeviceCount_;
+    bool is_faulty        = (local_rank == proxy_failed_local_dev_);
+    bool is_proxy         = (local_rank == proxy_local_rank);
+
+    auto ncclDataType = getNcclDataType(input.scalar_type());
+    size_t numel = static_cast<size_t>(input.numel());
+
+    if (is_faulty) {
+        // Step 1: send local tensor to proxy; Step 4: receive final result back.
+        C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
+        C10D_NCCL_FT_CHECK(
+            ncclSend(
+                input.data_ptr(), numel, ncclDataType,
+                proxy_local_rank, local_nvlink_comm_, stream.stream()),
+            std::nullopt);
+        C10D_NCCL_FT_CHECK(
+            ncclRecv(
+                output.data_ptr(), numel, ncclDataType,
+                proxy_local_rank, local_nvlink_comm_, stream.stream()),
+            std::nullopt);
+        C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
+
+    } else if (is_proxy) {
+        // Step 1 (recv): receive faulty GPU's tensor into a temp buffer.
+        at::Tensor proxy_buf = at::empty_like(input);
+        C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
+        C10D_NCCL_FT_CHECK(
+            ncclRecv(
+                proxy_buf.data_ptr(), numel, ncclDataType,
+                proxy_failed_local_dev_, local_nvlink_comm_, stream.stream()),
+            std::nullopt);
+        C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
+
+        // Step 2: pre-aggregate: add faulty GPU's data into our output buffer.
+        {
+            at::cuda::CUDAStreamGuard guard(stream);
+            output.copy_(input);   // ensure output holds our own data first
+            output.add_(proxy_buf);
+        }
+
+        // Step 3: cross-node AllReduce on the reduced communicator.
+        C10D_NCCL_FT_CHECK(
+            ncclAllReduce(
+                output.data_ptr(), output.data_ptr(),
+                numel, ncclDataType, op,
+                proxy_global_comm_, stream.stream()),
+            std::nullopt);
+
+        // Step 4 (send): distribute the final result back to the faulty GPU.
+        C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
+        C10D_NCCL_FT_CHECK(
+            ncclSend(
+                output.data_ptr(), numel, ncclDataType,
+                proxy_failed_local_dev_, local_nvlink_comm_, stream.stream()),
+            std::nullopt);
+        C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
+
+    } else {
+        // Healthy non-proxy rank: participate in the cross-node AllReduce directly.
+        C10D_NCCL_FT_CHECK(
+            ncclAllReduce(
+                input.data_ptr(), output.data_ptr(),
+                numel, ncclDataType, op,
+                proxy_global_comm_, stream.stream()),
+            std::nullopt);
+    }
+}
+
 //NCCLFT new add function for Negotiator OP number to switch
 void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
     //// 預約在未來 50 個 OP 後對齊切換
@@ -4063,11 +4279,10 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
       }
 
       if (this->final_commit_op_.load(std::memory_order_relaxed) == current_op) {
-          LOG(INFO) << logPrefix() << "[NCCL-FT] 節點對齊成功！進入降級模式。";
-          
-          // TODO: 建立 7-NIC 備用句柄
+          LOG(INFO) << logPrefix() << "[NCCL-FT] 節點對齊成功！建立 proxy 拓撲後進入降級模式。";
+          rebuild_shadow_ping_pong_topology();
           this->is_degraded_ = true;
-          
+
           this->do_not_cross_op_.store(0);
           this->final_commit_op_.store(0);
           if (this->rank_ == 0) {
@@ -4096,29 +4311,40 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 // TODO: we should clean up this in future (by either entirely removing lambda's
 // or removing input and output from lambda's signature).
 
-// 這裡就是「完美偽裝」的關鍵：分流執行，但共用同一個 Work 物件！
+// Shadow Ping-Pong degraded path vs. native path.
   if (C10_UNLIKELY(this->is_degraded_)) {
-      /* --- [NCCL-FT: Shadow Ping-Pong 執行路徑] --- */
-      // 這裡呼叫我們自定義的代傳邏輯 (包含 Local P2P 與 ATen 拼接)
-      // 這段邏輯的指令也會被推入 `ncclStream` 中
-
-      //for logging
-      LOG(INFO) << "NCCL is_degraded_ , now switch to shadow ping pong , rank" << this->rank_ ;
-      /* --- [原生 NCCL 執行路徑] --- */
+      LOG(INFO) << logPrefix()
+                << "[NCCL-FT] Degraded mode active, opType="
+                << opTypeToString(opType) << ", rank=" << rank_;
+      if (opType == OpType::ALLREDUCE && proxy_comm_ready_.load(std::memory_order_acquire)) {
+          // Extract reduce op from the tensor dtype. For the prototype we derive
+          // it the same way allreduce_impl does: re-compute ncclReduceOp using
+          // ncclSum as the reduce operation (training default). A future
+          // improvement can thread the actual op through.
+          auto ncclDataType = getNcclDataType(inputs[0].scalar_type());
+          ncclRedOpRAII ncclReduceOp = getNcclReduceOp(
+              ReduceOp::SUM, inputs[0], ncclDataType, comm);
+          execute_shadow_allreduce(inputs[0], outputs[0], ncclStream, ncclReduceOp);
+      } else {
+          // Non-AllReduce op or proxy comm not ready: fall back to native path
+          // and log a warning. proxy_global_comm_ has a different size, so we
+          // must still use the original comm here.
+          if (opType != OpType::ALLREDUCE) {
+              LOG(WARNING) << logPrefix()
+                           << "[NCCL-FT] Non-AllReduce op in degraded mode — "
+                           << "falling back to native comm (may fail if NIC is down).";
+          }
 #ifndef NCCL_HAS_COMM_NONBLOCKING
-    C10D_NCCL_FT_CHECK(
-        fn(inputs[0], outputs[0], comm, ncclStream),
-        ncclComm->getNcclCommFailureReason());
+          C10D_NCCL_FT_CHECK(
+              fn(inputs[0], outputs[0], comm, ncclStream),
+              ncclComm->getNcclCommFailureReason());
 #else
-    C10D_NCCL_FT_CHECK_TIMEOUT(
-        fn(inputs[0], outputs[0], comm, ncclStream),
-        ncclComm,
-        ncclComm->getNcclCommFailureReason());
+          C10D_NCCL_FT_CHECK_TIMEOUT(
+              fn(inputs[0], outputs[0], comm, ncclStream),
+              ncclComm,
+              ncclComm->getNcclCommFailureReason());
 #endif // NCCL_HAS_COMM_NONBLOCKING
-
-
-      //this->execute_shadow_ping_pong(inputs[0], outputs[0], ncclStream);
-      /* ------------------------------------------ */
+      }
   } else {
       /* --- [原生 NCCL 執行路徑] --- */
 #ifndef NCCL_HAS_COMM_NONBLOCKING
