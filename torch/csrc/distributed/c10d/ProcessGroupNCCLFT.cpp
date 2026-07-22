@@ -3905,6 +3905,18 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         return;
     }
 
+    // Mark proxy comm not-ready before rebuilding so that any concurrent
+    // proxy_comm_ready_ check sees false during reconstruction and falls
+    // back to the native path rather than using the stale communicator.
+    proxy_comm_ready_.store(false, std::memory_order_release);
+
+    // Destroy the previous proxy_global_comm_ before overwriting the pointer.
+    // Without this, repeated faults leak NCCL communicator handles.
+    if (proxy_global_comm_ != nullptr) {
+        ncclCommDestroy(proxy_global_comm_);
+        proxy_global_comm_ = nullptr;
+    }
+
     proxy_failed_local_dev_ = failed_local_dev;
     bool is_faulty = (rank_ % localDeviceCount_) == failed_local_dev;
 
@@ -3922,8 +3934,11 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         }
     }
 
-    // Exchange UID: global rank 0 generates; everyone else reads.
-    std::string uid_key = "NCCL_FT_PROXY_UID";
+    // Include seqCollective_ in the UID store key so each rebuild round uses
+    // a distinct key. This prevents ranks from reading a stale UID left by a
+    // previous rebuild when a second fault arrives before the old key expires.
+    std::string uid_key =
+        "NCCL_FT_PROXY_UID_" + std::to_string(seqCollective_);
     ncclUniqueId uid{};
     if (rank_ == 0) {
         C10D_NCCL_FT_CHECK(ncclGetUniqueId(&uid), std::nullopt);
