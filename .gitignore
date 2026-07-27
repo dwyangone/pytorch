@@ -156,6 +156,9 @@ torch/_rocm_init.py
 # IPython notebook checkpoints
 .ipynb_checkpoints
 
+#bob
+bob*
+
 # Editor temporaries
 *.swa
 *.swb
