@@ -1083,6 +1083,13 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // -1 代表沒有錯誤。若大於等於 0，代表該 Local Device Index 網卡故障
   std::atomic<int> local_hardware_fault_dev_{-1};
 
+  // The very first NCCL communicator created for this PG, built via the full
+  // ncclCommInitRankConfig path. All subsequent non-P2P comms are derived from
+  // this one via ncclCommSplit so that ncclCommInitRankConfig (and its NIC
+  // topology scan) is only executed once. ncclCommRegisterFaultCallback is also
+  // only registered on this comm.
+  std::shared_ptr<NCCLFTComm> ft_root_comm_{nullptr};
+
   // Intra-node communicator built via ncclCommSplit from the global comm.
   // Inherits the already-validated topology so no NIC topology scan is
   // triggered. Initialised lazily on the first collective() call.

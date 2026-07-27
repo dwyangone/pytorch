@@ -3257,11 +3257,10 @@ std::shared_ptr<NCCLFTComm> ProcessGroupNCCLFT::initNCCLComm(
 
 #ifdef NCCL_HAS_COMM_SPLIT
   // Use split to create a new communicator only if:
-  // 1. The parent comm is known; AND
+  // 1. The parent comm is known (new_group / split scenario); AND
   // 2. The new comm is not for a point-to-point operation.
-  // ncclCommSplit() is a collective call, so it does not work for P2P
-  // operations.
-  if (options_->split_from && !singleP2POp) {
+  // ncclCommSplit() is a collective call, so it does not work for P2P.
+  if (!ncclComm && options_->split_from && !singleP2POp) {
     // Find a valid, healthy communicator to split from if possible.
     std::lock_guard<std::mutex> lock(options_->split_from->mutex_);
     auto& other_comms = options_->split_from->devNCCLCommMap_;
@@ -3293,12 +3292,9 @@ std::shared_ptr<NCCLFTComm> ProcessGroupNCCLFT::initNCCLComm(
 
     if (!ncclComm) {
       auto rootIdx = getRootIndex(rank_, getSize(), numRoots);
-      // We only need to get unique IDs for roots. For non-root rank, index is
-      // set to -1.
       if (rootIdx >= 0) {
         C10D_NCCL_FT_CHECK(ncclGetUniqueId(&ncclID), std::nullopt);
       }
-      // We only need to all-gather the ncclID if the rank is root.
       auto timeStarted = std::chrono::steady_clock::now();
       allgatherUniqueNCCLIDs(rootIdx, &ncclID, ncclIDs);
       auto timerDeltaMs =
@@ -3322,18 +3318,11 @@ std::shared_ptr<NCCLFTComm> ProcessGroupNCCLFT::initNCCLComm(
 #endif // NCCL_HAS_INIT_RANK_SCALABLE
     }
   } else {
-    // To simplify conditional nesting, just create the ncclComms[i]
-    // entry if it hasn't been yet rather than untangling the
-    // conditions that might have resulted in a split above.
     if (!ncclComm) {
       if (getCvarBool(TORCH_NCCLFT_BCAST_UNIQUEID, true) && !isSendRecvSelf) {
-        // For point-to-point communication, lower rank of the two will get
-        // unique id.
         if (rank_ == 0 || (singleP2POp && p2pRank == 0)) {
           C10D_NCCL_FT_CHECK(ncclGetUniqueId(&ncclID), std::nullopt);
         }
-
-        // Broadcast so that each process can have a unique NCCL ID
         auto timeStarted = std::chrono::steady_clock::now();
         broadcastUniqueNCCLID(&ncclID, singleP2POp, deviceKey, p2pRank);
         auto timerDeltaMs =
@@ -3345,7 +3334,6 @@ std::shared_ptr<NCCLFTComm> ProcessGroupNCCLFT::initNCCLComm(
                   << "ProcessGroupNCCLFT broadcast unique ID through store took "
                   << timerDeltaMs << " ms";
       }
-
 #ifdef NCCL_HAS_CONFIG
       ncclComm = NCCLFTComm::create(
           numRanks, rank, ncclID, deviceIndex, options_->config);
@@ -3355,12 +3343,11 @@ std::shared_ptr<NCCLFTComm> ProcessGroupNCCLFT::initNCCLComm(
     }
   }
 
-  /* ===================================================================== */
-  /* --- [NCCL-FT: 綁定原生句柄硬體中斷] --- */
-  if (ncclComm && ncclComm->getNcclComm() != nullptr) {
-      ncclCommRegisterFaultCallback(ncclComm->getNcclComm(), nccl_ft_global_fault_callback);
-  }
-  /* ===================================================================== */
+  // [NCCL-FT] ncclCommRegisterFaultCallback is intentionally NOT called here.
+  // Registering the FT callback during ncclCommInitRankConfig corrupts NCCL's
+  // internal NIC topology state in NCCL 2.30.4, causing the next init call to
+  // fail. The callback is registered lazily in collective() after the first
+  // successful op, when NCCL's topology is guaranteed to be settled.
 
   // Creates the NCCL streams
   bool force_high = getCvarBool(TORCH_NCCLFT_HIGH_PRIORITY, false);
@@ -4429,14 +4416,32 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
     ncclComm = initNCCLComm(key, device, opType);
   }
 
-  // [NCCL-FT] Lazy init: build local_nvlink_comm_ via ncclCommSplit on the
-  // first collective after the global comm is established. All 16 ranks hit
-  // this path simultaneously on their first collective, satisfying the
-  // collective-call requirement of ncclCommSplit.
+  // [NCCL-FT] Lazy init block: runs once on the very first collective.
+  //
+  // WHY lazy and not in initNCCLComm:
+  //   ncclCommRegisterFaultCallback, when called inside ncclCommInitRankConfig,
+  //   activates the FT subsystem in our custom NCCL 2.30.4 in a way that
+  //   corrupts the internal NIC-to-GPU affinity state. Any subsequent call to
+  //   ncclCommInitRankConfig (e.g., by DDP's allgather during __init__) then
+  //   fails with "Could not find any local path from gpu 0 to net". By deferring
+  //   callback registration to after the first collective succeeds, we guarantee
+  //   that NCCL's topology is fully settled before we touch the FT subsystem.
+  //
+  //   initLocalNvlinkComm uses ncclCommSplit which is a collective call; it
+  //   therefore also needs the global comm to already exist, hence lazy.
   if (!ft_disabled_ && local_nvlink_comm_ == nullptr) {
     LOG(INFO) << logPrefix()
-              << "[NCCL-FT] First collective detected; initialising "
-              << "local_nvlink_comm_ via ncclCommSplit.";
+              << "[NCCL-FT] First collective detected; registering fault "
+              << "callback and initialising local_nvlink_comm_.";
+    // Register fault callback now that NCCL topology is stable.
+    if (ft_root_comm_ == nullptr) {
+      ft_root_comm_ = ncclComm;
+      ncclCommRegisterFaultCallback(
+          ncclComm->getNcclComm(), nccl_ft_global_fault_callback);
+      LOG(INFO) << logPrefix()
+                << "[NCCL-FT] Fault callback registered on comm "
+                << ncclComm->repr();
+    }
     initLocalNvlinkComm();
   }
 
