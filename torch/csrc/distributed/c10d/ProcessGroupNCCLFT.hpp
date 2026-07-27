@@ -1083,18 +1083,26 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // -1 代表沒有錯誤。若大於等於 0，代表該 Local Device Index 網卡故障
   std::atomic<int> local_hardware_fault_dev_{-1};
 
-  // Intra-node NVLink-only communicator — never touches cross-node NICs.
-  // Used as the local scatter/gather channel in the Shadow Ping-Pong relay.
-  ncclComm_t local_nvlink_comm_{nullptr};
+  // Intra-node communicator built via ncclCommSplit from the global comm.
+  // Inherits the already-validated topology so no NIC topology scan is
+  // triggered. Initialised lazily on the first collective() call.
+  // Uses NCCLFTComm RAII so no manual ncclCommDestroy is needed.
+  std::shared_ptr<NCCLFTComm> local_nvlink_comm_{nullptr};
 
   // Reduced cross-node communicator built after a NIC fault is confirmed.
   // Healthy ranks participate; the faulty rank's slot is dropped symmetrically
-  // across all nodes.
-  ncclComm_t proxy_global_comm_{nullptr};
+  // across all nodes. Built via ncclCommSplit (color=1 for healthy,
+  // NCCL_SPLIT_NOCOLOR for faulty) to avoid triggering a NIC topology scan.
+  std::shared_ptr<NCCLFTComm> proxy_global_comm_{nullptr};
   int proxy_comm_rank_{-1};
   int proxy_comm_size_{0};
   int proxy_failed_local_dev_{-1};
   std::atomic<bool> proxy_comm_ready_{false};
+
+  // The ReduceOp requested by the current allreduce call. Set by allreduce_impl
+  // before collective() is called so the degraded path can honour the real op
+  // instead of defaulting to SUM.
+  ReduceOp current_shadow_reduce_op_{ReduceOp::SUM};
 
   // 獨立的側車執行緒，專門負責 2PC 協商，絕對不干擾原生 Watchdog
   std::thread ft_negotiator_thread_;
@@ -1108,7 +1116,7 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
       at::Tensor& input,
       at::Tensor& output,
       at::cuda::CUDAStream& stream,
-      ncclRedOp_t op);
+      ReduceOp reduceOp);
   /* ===================================================================== */
 
 

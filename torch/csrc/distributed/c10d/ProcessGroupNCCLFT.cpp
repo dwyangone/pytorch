@@ -1080,8 +1080,12 @@ ProcessGroupNCCLFT::ProcessGroupNCCLFT(
       }
       // 只有在沒被停用時，才啟動側車進行 TCPStore 協商與預約
       start_ft_negotiator_thread();
-      initLocalNvlinkComm();
-      LOG(INFO) << logPrefix() << "[NCCL-FT] 容錯優化控制面已成功啟動。";
+      // local_nvlink_comm_ is initialised lazily on the first collective()
+      // call via initLocalNvlinkComm(), because ncclCommSplit requires the
+      // global comm (devNCCLCommMap_) to already exist — it is not available
+      // here in the constructor.
+      LOG(INFO) << logPrefix() << "[NCCL-FT] 容錯優化控制面已成功啟動。"
+                << " local_nvlink_comm_ will be built on first collective.";
   } else {
       this->is_degraded_ = false; // 強制不進入降級代傳模式
       LOG(WARNING) << logPrefix() << "[NCCL-FT] 偵測到 NCCL_FT_DISABLE=1，完全恢復原生 NCCL 運作模式。";
@@ -1693,14 +1697,10 @@ ProcessGroupNCCLFT::~ProcessGroupNCCLFT() {
   if (ft_negotiator_thread_.joinable()) {
       ft_negotiator_thread_.join();
   }
-  if (local_nvlink_comm_ != nullptr) {
-      ncclCommDestroy(local_nvlink_comm_);
-      local_nvlink_comm_ = nullptr;
-  }
-  if (proxy_global_comm_ != nullptr) {
-      ncclCommDestroy(proxy_global_comm_);
-      proxy_global_comm_ = nullptr;
-  }
+  // Both local_nvlink_comm_ and proxy_global_comm_ are shared_ptr<NCCLFTComm>;
+  // RAII via NCCLFTComm destructor handles ncclCommDestroy automatically.
+  local_nvlink_comm_.reset();
+  proxy_global_comm_.reset();
   /* ------------------------------- */
 
   // `shutdown()` or `abort` already called. Skip the favor of disposing
@@ -3862,40 +3862,100 @@ float ProcessGroupNCCLFT::endTimeEstimate() {
 #endif
 }
 
-// [NCCL-FT] Build the intra-node NVLink-only communicator once at startup.
-// Every rank on the same physical node participates; no cross-node NIC is used.
+// [NCCL-FT] Build the intra-node NVLink communicator via ncclCommSplit.
+//
+// Why ncclCommSplit instead of ncclCommInitRank:
+//   ncclCommInitRank always re-runs full hardware topology discovery, which
+//   scans cross-node NICs. In a setup where each GPU has a dedicated NIC,
+//   NCCL may fail with "Could not find any local path from gpu N to net" for
+//   GPUs whose NICs are not visible from that rank's NUMA context.
+//   ncclCommSplit inherits the already-validated topology from the global comm
+//   and avoids the NIC scan entirely.
+//
+// Collective semantics: ncclCommSplit is a collective call — ALL 16 ranks must
+// call it simultaneously. Each node uses its own color (= node_id), so each
+// node gets an independent sub-communicator of size=localDeviceCount_.
+//
+// This function must be called lazily (on the first collective), not in the
+// constructor, because the global comm does not exist until the first
+// initNCCLComm() call.
 void ProcessGroupNCCLFT::initLocalNvlinkComm() {
+#ifndef NCCL_HAS_COMM_SPLIT
+    LOG(WARNING) << logPrefix()
+                 << "[NCCL-FT] NCCL version does not support ncclCommSplit "
+                 << "(requires >= 2.14). local_nvlink_comm_ will remain null. "
+                 << "Shadow Ping-Pong failover will not work.";
+    return;
+#else
     int node_id    = rank_ / localDeviceCount_;
     int local_rank = rank_ % localDeviceCount_;
-    std::string uid_key = "NCCL_FT_LOCAL_UID_NODE_" + std::to_string(node_id);
 
-    ncclUniqueId uid{};
-    if (local_rank == 0) {
-        C10D_NCCL_FT_CHECK(ncclGetUniqueId(&uid), std::nullopt);
-        std::vector<uint8_t> vec(
-            reinterpret_cast<uint8_t*>(&uid),
-            reinterpret_cast<uint8_t*>(&uid) + sizeof(uid));
-        globalStore_->set(uid_key, vec);
-    } else {
-        auto vec = globalStore_->get(uid_key);
-        TORCH_CHECK(
-            vec.size() == sizeof(uid),
-            "NCCL_FT_LOCAL_UID size mismatch");
-        std::memcpy(&uid, vec.data(), sizeof(uid));
+    // Obtain the global communicator for the device this rank is bound to.
+    // It must exist at this point because initLocalNvlinkComm() is called
+    // only after the first initNCCLComm() has succeeded.
+    auto device = at::Device(at::DeviceType::CUDA, guessDeviceId());
+    const auto key = getKeyFromDevice(device);
+    std::shared_ptr<NCCLFTComm> globalComm;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = devNCCLCommMap_.find(key);
+        if (it == devNCCLCommMap_.end() || it->second == nullptr) {
+            LOG(WARNING) << logPrefix()
+                         << "[NCCL-FT] initLocalNvlinkComm: global comm not found "
+                         << "for device key=" << key
+                         << ". local_nvlink_comm_ will remain null.";
+            return;
+        }
+        globalComm = it->second;
     }
 
-    C10D_NCCL_FT_CHECK(
-        ncclCommInitRank(&local_nvlink_comm_, localDeviceCount_, uid, local_rank),
-        std::nullopt);
-    LOG(INFO) << logPrefix() << "[NCCL-FT] local_nvlink_comm_ initialised "
-              << "(node=" << node_id << ", local_rank=" << local_rank
-              << ", size=" << localDeviceCount_ << ")";
+    LOG(INFO) << logPrefix()
+              << "[NCCL-FT] initLocalNvlinkComm: splitting from global comm "
+              << globalComm->repr()
+              << " (node_id=" << node_id
+              << ", local_rank=" << local_rank
+              << ", color=" << node_id << ")";
+
+    // color = node_id: all ranks on the same node get the same color, so
+    // ncclCommSplit groups them into one sub-communicator per node.
+    // The new rank within the sub-comm is determined by NCCL ordering
+    // (consistent with local_rank because all global ranks are ordered 0..N-1
+    // and ranks on the same node are contiguous).
+    ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+    config.blocking = 1;  // blocking init to detect errors synchronously
+    local_nvlink_comm_ = NCCLFTComm::split(
+        globalComm.get(), node_id, rank_, config);
+
+    if (local_nvlink_comm_ == nullptr) {
+        LOG(ERROR) << logPrefix()
+                   << "[NCCL-FT] initLocalNvlinkComm: NCCLFTComm::split returned "
+                   << "nullptr. Shadow Ping-Pong failover will not work.";
+        return;
+    }
+
+    LOG(INFO) << logPrefix()
+              << "[NCCL-FT] local_nvlink_comm_ ready: "
+              << local_nvlink_comm_->repr()
+              << " (node=" << node_id
+              << ", local_rank=" << local_rank
+              << ", sub-comm size=" << localDeviceCount_ << ")";
+#endif // NCCL_HAS_COMM_SPLIT
 }
 
 // [NCCL-FT] Build a reduced cross-node communicator that excludes the failed
-// local device index from every node (symmetric degradation). Healthy ranks
-// call ncclCommInitRank; the faulty rank skips and leaves proxy_global_comm_
-// as nullptr.
+// local device index from every node (symmetric degradation).
+//
+// Why ncclCommSplit instead of ncclCommInitRank:
+//   ncclCommInitRank always re-runs full hardware topology discovery (NIC scan).
+//   In a setup where each GPU has a dedicated NIC that is only reachable from
+//   its own NUMA context, calling ncclCommInitRank from another rank crashes
+//   with "Could not find any local path from gpu N to net". ncclCommSplit
+//   inherits the already-validated topology from the global comm, avoids the
+//   NIC scan entirely, and is the correct API to use here.
+//
+// Collective semantics: ncclCommSplit is a collective call. ALL ranks must call
+// it simultaneously: healthy ranks pass color=1, faulty rank passes
+// NCCL_SPLIT_NOCOLOR so it is excluded from the resulting sub-communicator.
 void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     int failed_local_dev = failed_dev_index_.load(std::memory_order_acquire);
     if (failed_local_dev < 0) {
@@ -3906,22 +3966,17 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     }
 
     // Mark proxy comm not-ready before rebuilding so that any concurrent
-    // proxy_comm_ready_ check sees false during reconstruction and falls
-    // back to the native path rather than using the stale communicator.
+    // proxy_comm_ready_ check falls back to the native path rather than
+    // using the stale communicator.
     proxy_comm_ready_.store(false, std::memory_order_release);
-
-    // Destroy the previous proxy_global_comm_ before overwriting the pointer.
-    // Without this, repeated faults leak NCCL communicator handles.
-    if (proxy_global_comm_ != nullptr) {
-        ncclCommDestroy(proxy_global_comm_);
-        proxy_global_comm_ = nullptr;
-    }
+    // Drop the old proxy comm (NCCLFTComm RAII handles ncclCommDestroy).
+    proxy_global_comm_.reset();
 
     proxy_failed_local_dev_ = failed_local_dev;
     bool is_faulty = (rank_ % localDeviceCount_) == failed_local_dev;
 
-    // Build rank mapping: assign new contiguous indices to all ranks whose
-    // local device index != failed_local_dev.
+    // Compute rank mapping for healthy ranks (needed for proxy_comm_rank_).
+    // proxy_comm_size_ = original size minus one rank per node (symmetric drop).
     proxy_comm_size_ = size_ - (size_ / localDeviceCount_);
     int new_rank = 0;
     proxy_comm_rank_ = -1;
@@ -3934,38 +3989,55 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         }
     }
 
-    // Include seqCollective_ in the UID store key so each rebuild round uses
-    // a distinct key. This prevents ranks from reading a stale UID left by a
-    // previous rebuild when a second fault arrives before the old key expires.
-    std::string uid_key =
-        "NCCL_FT_PROXY_UID_" + std::to_string(seqCollective_);
-    ncclUniqueId uid{};
-    if (rank_ == 0) {
-        C10D_NCCL_FT_CHECK(ncclGetUniqueId(&uid), std::nullopt);
-        std::vector<uint8_t> vec(
-            reinterpret_cast<uint8_t*>(&uid),
-            reinterpret_cast<uint8_t*>(&uid) + sizeof(uid));
-        globalStore_->set(uid_key, vec);
-    } else {
-        auto vec = globalStore_->get(uid_key);
-        TORCH_CHECK(vec.size() == sizeof(uid), "NCCL_FT_PROXY_UID size mismatch");
-        std::memcpy(&uid, vec.data(), sizeof(uid));
+    // Obtain the global communicator for this device (must exist at this point).
+    auto device = at::Device(at::DeviceType::CUDA, guessDeviceId());
+    const auto key = getKeyFromDevice(device);
+    std::shared_ptr<NCCLFTComm> globalComm;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = devNCCLCommMap_.find(key);
+        TORCH_CHECK(
+            it != devNCCLCommMap_.end() && it->second != nullptr,
+            logPrefix(),
+            "[NCCL-FT] rebuild_shadow_ping_pong_topology: global comm not found "
+            "for device key=", key);
+        globalComm = it->second;
     }
 
+    // color=1 groups all healthy ranks into one sub-communicator.
+    // NCCL_SPLIT_NOCOLOR excludes the faulty rank from the resulting comm.
+    int color = is_faulty ? NCCL_SPLIT_NOCOLOR : 1;
+    ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+    config.blocking = 1;
+
+    LOG(INFO) << logPrefix()
+              << "[NCCL-FT] rebuild_shadow_ping_pong_topology: "
+              << "color=" << color
+              << " failed_local_dev=" << failed_local_dev
+              << " is_faulty=" << is_faulty
+              << " proxy_comm_size=" << proxy_comm_size_
+              << " proxy_comm_rank=" << proxy_comm_rank_;
+
+    proxy_global_comm_ = NCCLFTComm::split(
+        globalComm.get(), color, rank_, config);
+
     if (!is_faulty) {
-        C10D_NCCL_FT_CHECK(
-            ncclCommInitRank(
-                &proxy_global_comm_, proxy_comm_size_, uid, proxy_comm_rank_),
-            std::nullopt);
+        TORCH_CHECK(
+            proxy_global_comm_ != nullptr,
+            logPrefix(),
+            "[NCCL-FT] NCCLFTComm::split returned nullptr for healthy rank. "
+            "Cannot build proxy_global_comm_.");
         LOG(INFO) << logPrefix()
-                  << "[NCCL-FT] proxy_global_comm_ initialised "
-                  << "(proxy_rank=" << proxy_comm_rank_
+                  << "[NCCL-FT] proxy_global_comm_ ready: "
+                  << proxy_global_comm_->repr()
+                  << " (proxy_rank=" << proxy_comm_rank_
                   << ", proxy_size=" << proxy_comm_size_ << ")";
     } else {
-        proxy_global_comm_ = nullptr;
+        // NCCLFTComm::split with NCCL_SPLIT_NOCOLOR returns a valid but empty
+        // NCCLFTComm wrapper; we null it to signal "not participant" clearly.
+        proxy_global_comm_.reset();
         LOG(INFO) << logPrefix()
-                  << "[NCCL-FT] This rank is the faulty GPU; "
-                  << "proxy_global_comm_ left as nullptr.";
+                  << "[NCCL-FT] This rank is faulty; proxy_global_comm_ is null.";
     }
     proxy_comm_ready_.store(true, std::memory_order_release);
 }
@@ -3977,12 +4049,17 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 //   proxy   — healthy GPU on the same node; carries the faulty GPU's data.
 //   healthy — all other GPUs; run ncclAllReduce on proxy_global_comm_ directly.
 //
-// All NCCL calls are enqueued onto `stream` (async with respect to the CPU).
+// ReduceOp::AVG special-case:
+//   ncclAvg tells NCCL to sum then divide by comm_size. With proxy_global_comm_
+//   (size = size_ - nodes), division would be by proxy_comm_size_ rather than
+//   the original size_. To get the correct average, the proxy uses ncclSum on
+//   proxy_global_comm_ and then divides the result by size_ (original world size)
+//   on the CUDA stream before scatter-back.
 void ProcessGroupNCCLFT::execute_shadow_allreduce(
     at::Tensor& input,
     at::Tensor& output,
     at::cuda::CUDAStream& stream,
-    ncclRedOp_t op) {
+    ReduceOp reduceOp) {
 
     int local_rank        = rank_ % localDeviceCount_;
     int proxy_local_rank  = (proxy_failed_local_dev_ + 1) % localDeviceCount_;
@@ -3992,64 +4069,140 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
     auto ncclDataType = getNcclDataType(input.scalar_type());
     size_t numel = static_cast<size_t>(input.numel());
 
+    // Guard: local_nvlink_comm_ must be ready (set by lazy init in collective()).
+    TORCH_CHECK(
+        local_nvlink_comm_ != nullptr,
+        logPrefix(),
+        "[NCCL-FT] execute_shadow_allreduce called but local_nvlink_comm_ is null. "
+        "ncclCommSplit may have failed at init time.");
+    ncclComm_t nvlink_comm = local_nvlink_comm_->getNcclComm();
+
+    LOG(INFO) << logPrefix()
+              << "[NCCL-FT] execute_shadow_allreduce: role="
+              << (is_faulty ? "FAULTY" : (is_proxy ? "PROXY" : "HEALTHY"))
+              << " local_rank=" << local_rank
+              << " proxy_local_rank=" << proxy_local_rank
+              << " failed_dev=" << proxy_failed_local_dev_
+              << " op=" << static_cast<int>(reduceOp.op_)
+              << " numel=" << numel
+              << " seq=" << seqCollective_;
+
+    // For AVG: proxy uses SUM on proxy_global_comm_ then manually divides by
+    // size_ to avoid the wrong divisor that ncclAvg would apply
+    // (proxy_comm_size_ instead of size_).
+#ifdef NCCL_HAS_AVG
+    bool use_avg_workaround = (reduceOp == ReduceOp::AVG);
+#else
+    bool use_avg_workaround = false;
+#endif
+    ncclComm_t proxy_comm = (proxy_global_comm_ != nullptr)
+        ? proxy_global_comm_->getNcclComm()
+        : nullptr;
+    // ncclRedOp for the cross-node call. AVG is replaced by SUM; we divide
+    // manually after to apply the correct world_size denominator.
+    // Store as ncclRedOpRAII to handle PREMUL_SUM lifetime correctly.
+    ncclRedOpRAII nccl_proxy_op_raii = use_avg_workaround
+        ? ncclRedOpRAII(ncclSum)
+        : getNcclReduceOp(reduceOp, input, ncclDataType,
+                          proxy_comm ? proxy_comm : nvlink_comm);
+    ncclRedOp_t nccl_proxy_op = nccl_proxy_op_raii;
+
     if (is_faulty) {
-        // Step 1: send local tensor to proxy; Step 4: receive final result back.
+        // Step 1: send own tensor to proxy GPU via NVLink.
+        // Step 4: receive the final AllReduce result back from proxy GPU.
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT][FAULTY] Step 1: ncclSend to proxy local_rank="
+                  << proxy_local_rank << " via local_nvlink_comm_";
         C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
         C10D_NCCL_FT_CHECK(
             ncclSend(
                 input.data_ptr(), numel, ncclDataType,
-                proxy_local_rank, local_nvlink_comm_, stream.stream()),
+                proxy_local_rank, nvlink_comm, stream.stream()),
             std::nullopt);
         C10D_NCCL_FT_CHECK(
             ncclRecv(
                 output.data_ptr(), numel, ncclDataType,
-                proxy_local_rank, local_nvlink_comm_, stream.stream()),
+                proxy_local_rank, nvlink_comm, stream.stream()),
             std::nullopt);
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT][FAULTY] Step 4 enqueued (ncclRecv from proxy).";
 
     } else if (is_proxy) {
-        // Step 1 (recv): receive faulty GPU's tensor into a temp buffer.
+        // Step 1: receive faulty GPU's tensor into a temporary buffer.
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT][PROXY] Step 1: ncclRecv from faulty local_rank="
+                  << proxy_failed_local_dev_ << " via local_nvlink_comm_";
         at::Tensor proxy_buf = at::empty_like(input);
         C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
         C10D_NCCL_FT_CHECK(
             ncclRecv(
                 proxy_buf.data_ptr(), numel, ncclDataType,
-                proxy_failed_local_dev_, local_nvlink_comm_, stream.stream()),
+                proxy_failed_local_dev_, nvlink_comm, stream.stream()),
             std::nullopt);
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
 
-        // Step 2: pre-aggregate: add faulty GPU's data into our output buffer.
+        // Step 2: pre-aggregate. For all ops the proxy always sums its data
+        // with the faulty GPU's data (SUM/MIN/MAX are element-wise; AVG is
+        // handled by summing here and dividing after the AllReduce below).
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT][PROXY] Step 2: pre-aggregate "
+                  << "(output = input + proxy_buf) on stream";
         {
             at::cuda::CUDAStreamGuard guard(stream);
-            output.copy_(input);   // ensure output holds our own data first
+            output.copy_(input);
             output.add_(proxy_buf);
         }
 
         // Step 3: cross-node AllReduce on the reduced communicator.
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT][PROXY] Step 3: ncclAllReduce on proxy_global_comm_ "
+                  << "(proxy_comm_size=" << proxy_comm_size_
+                  << ", proxy_comm_rank=" << proxy_comm_rank_ << ")";
         C10D_NCCL_FT_CHECK(
             ncclAllReduce(
                 output.data_ptr(), output.data_ptr(),
-                numel, ncclDataType, op,
-                proxy_global_comm_, stream.stream()),
+                numel, ncclDataType, nccl_proxy_op,
+                proxy_comm, stream.stream()),
             std::nullopt);
 
-        // Step 4 (send): distribute the final result back to the faulty GPU.
+        // AVG workaround: divide the summed result by original world size.
+        if (use_avg_workaround) {
+            at::cuda::CUDAStreamGuard guard(stream);
+            output.div_(static_cast<double>(size_));
+        }
+
+        // Step 4: send the final result back to the faulty GPU.
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT][PROXY] Step 4: ncclSend result to faulty local_rank="
+                  << proxy_failed_local_dev_ << " via local_nvlink_comm_";
         C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
         C10D_NCCL_FT_CHECK(
             ncclSend(
                 output.data_ptr(), numel, ncclDataType,
-                proxy_failed_local_dev_, local_nvlink_comm_, stream.stream()),
+                proxy_failed_local_dev_, nvlink_comm, stream.stream()),
             std::nullopt);
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT][PROXY] All 4 steps enqueued on stream.";
 
     } else {
-        // Healthy non-proxy rank: participate in the cross-node AllReduce directly.
+        // Healthy non-proxy rank: participate in cross-node AllReduce directly.
+        // AVG workaround applies here too: use SUM then divide by size_.
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT][HEALTHY] ncclAllReduce on proxy_global_comm_ "
+                  << "(proxy_comm_size=" << proxy_comm_size_
+                  << ", proxy_comm_rank=" << proxy_comm_rank_ << ")";
         C10D_NCCL_FT_CHECK(
             ncclAllReduce(
                 input.data_ptr(), output.data_ptr(),
-                numel, ncclDataType, op,
-                proxy_global_comm_, stream.stream()),
+                numel, ncclDataType, nccl_proxy_op,
+                proxy_comm, stream.stream()),
             std::nullopt);
+        if (use_avg_workaround) {
+            at::cuda::CUDAStreamGuard guard(stream);
+            output.div_(static_cast<double>(size_));
+        }
     }
 }
 
@@ -4073,80 +4226,165 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
 void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
     ft_negotiator_running_.store(true);
     ft_negotiator_thread_ = std::thread([this]() {
-        c10::setThreadName("pt_nccl_ft_side"); // 側車執行緒
-        
-        // 【新增】：字串去重機制，防止同一個提案被無限重複處理
-        std::string last_handled_event = ""; 
-        
+        c10::setThreadName("pt_nccl_ft_side");
+
+        // De-duplication: skip a proposal we have already processed.
+        std::string last_handled_event;
+
         while (ft_negotiator_running_.load()) {
             try {
-                // =================================================================
-                // 任務 1：代發提案 (Relay Write)
-                // 檢查 NCCL Callback 是否有透過記憶體傳來「本地網卡故障」的極速信號
-                // =================================================================
-                int failed_dev = this->local_hardware_fault_dev_.load(std::memory_order_acquire);
+                // =========================================================
+                // Task 1: Relay Write
+                // If the watchdog (or NCCL callback) signalled a local NIC
+                // fault via local_hardware_fault_dev_, write a PROPOSE entry
+                // to TCPStore on behalf of the main thread so that all ranks
+                // see it.
+                // =========================================================
+                int failed_dev = this->local_hardware_fault_dev_.load(
+                    std::memory_order_acquire);
                 if (failed_dev != -1) {
                     uint64_t target_op = this->seqCollective_ + 10;
-                    
-                    // 計算自己的 Node ID (假設 localDeviceCount_ 已經正確初始化)
                     int my_node_id = this->rank_ / this->localDeviceCount_;
-                    
-                    // 封裝升級版協議: "PROPOSE:OP:NODE_ID:DEV_IDX"
-                    std::string proposal = "PROPOSE:" + std::to_string(target_op) + 
-                                           ":" + std::to_string(my_node_id) + 
-                                           ":" + std::to_string(failed_dev);
-
-                    // 由側車執行緒承受 TCPStore 的網路寫入延遲，釋放 NCCL 底層！
+                    // Protocol: "PROPOSE:<target_op>:<node_id>:<dev_idx>"
+                    std::string proposal =
+                        "PROPOSE:" + std::to_string(target_op) +
+                        ":" + std::to_string(my_node_id) +
+                        ":" + std::to_string(failed_dev);
                     std::vector<uint8_t> vec(proposal.begin(), proposal.end());
                     this->globalStore_->set("NCCL_FT_EVENT", vec);
-
-                    // 復位信號
-                    this->local_hardware_fault_dev_.store(-1, std::memory_order_release);
-                    LOG(INFO) << logPrefix() << "[NCCL-FT] 側車執行緒成功代發提案至 TCPStore: " << proposal;
+                    this->local_hardware_fault_dev_.store(
+                        -1, std::memory_order_release);
+                    LOG(INFO) << logPrefix()
+                              << "[NCCL-FT] Side-car relayed proposal to "
+                              << "TCPStore: " << proposal;
                 }
 
-                // =================================================================
-                // 任務 2：監聽全網提案 (保留你原本安全的 check 機制)
-                // =================================================================
+                // =========================================================
+                // Task 2: Listen for a global proposal and drive 2PC.
+                //
+                // 2PC protocol:
+                //   Phase 1 (PROPOSE): any rank writes NCCL_FT_EVENT.
+                //     - Every rank's side-car reads the key and writes its
+                //       own ACK key: "NCCL_FT_ACK_<rank>_<target_op>".
+                //     - Every rank sets do_not_cross_op_ locally so its
+                //       main thread stops at the barrier OP.
+                //   Phase 2 (COMMIT): rank 0's side-car polls until all
+                //     ACK keys exist, then writes NCCL_FT_COMMIT_<target_op>.
+                //     All ranks' side-cars poll for the COMMIT key and only
+                //     then set final_commit_op_, unblocking the main thread.
+                //
+                // This ensures every rank agrees on the same boundary OP
+                // before any rank's main thread crosses into degraded mode.
+                // =========================================================
                 if (this->globalStore_->check({"NCCL_FT_EVENT"})) {
-                    
                     auto vec = this->globalStore_->get("NCCL_FT_EVENT");
                     std::string event_str(vec.begin(), vec.end());
 
-                    // 【關鍵修正】：加入 event_str != last_handled_event 判斷，防 Spam
-                    if (event_str.rfind("PROPOSE:", 0) == 0 && event_str != last_handled_event) {
-                        last_handled_event = event_str; // 記錄下來，下次跳過
+                    if (event_str.rfind("PROPOSE:", 0) == 0 &&
+                        event_str != last_handled_event) {
+                        last_handled_event = event_str;
 
                         uint64_t target_op;
                         int failed_node, f_dev;
-                        
-                        // 【關鍵修正】：解析新格式 "PROPOSE:OP:NODE_ID:DEV_IDX"
-                        // 使用 sscanf 提取三個變數，比 substr 更乾淨安全
-                        if (sscanf(event_str.c_str(), "PROPOSE:%lu:%d:%d", &target_op, &failed_node, &f_dev) == 3) {
+                        if (sscanf(event_str.c_str(), "PROPOSE:%lu:%d:%d",
+                                   &target_op, &failed_node, &f_dev) == 3) {
 
-                            this->do_not_cross_op_.store(target_op, std::memory_order_release);
-                            this->failed_dev_index_.store(f_dev, std::memory_order_release);
-                            this->final_commit_op_.store(target_op, std::memory_order_release);
+                            LOG(ERROR) << logPrefix()
+                                       << "[NCCL-FT-TRACE] Side-car intercepted "
+                                       << "proposal; fence OP=" << target_op;
+                            LOG(INFO) << logPrefix()
+                                      << "[NCCL-FT] Node " << failed_node
+                                      << " NIC " << f_dev
+                                      << " fault; fence OP=" << target_op;
 
-                            // 保留你的追蹤點
-                            LOG(ERROR) << logPrefix() << "[NCCL-FT-TRACE] 側車執行緒成功攔截提案！設定警戒線: " << target_op;
-                            LOG(INFO) << logPrefix() << "[NCCL-FT] 收到 Node " << failed_node 
-                                      << " 網卡 " << f_dev << " 故障，警戒線 OP: " << target_op;
+                            // Phase 1: set local fence so main thread stops.
+                            this->do_not_cross_op_.store(
+                                target_op, std::memory_order_release);
+                            this->failed_dev_index_.store(
+                                f_dev, std::memory_order_release);
+
+                            // Write this rank's ACK.
+                            std::string ack_key =
+                                "NCCL_FT_ACK_" +
+                                std::to_string(this->rank_) + "_" +
+                                std::to_string(target_op);
+                            std::string ack_val = "1";
+                            this->globalStore_->set(
+                                ack_key,
+                                std::vector<uint8_t>(
+                                    ack_val.begin(), ack_val.end()));
+
+                            // Phase 2a: rank 0 polls until all ACKs arrive,
+                            // then writes the COMMIT key.
+                            std::string commit_key =
+                                "NCCL_FT_COMMIT_" +
+                                std::to_string(target_op);
+                            if (this->rank_ == 0) {
+                                bool all_acked = false;
+                                while (!all_acked &&
+                                       this->ft_negotiator_running_.load()) {
+                                    all_acked = true;
+                                    for (int r = 0; r < this->size_; ++r) {
+                                        std::string rkey =
+                                            "NCCL_FT_ACK_" +
+                                            std::to_string(r) + "_" +
+                                            std::to_string(target_op);
+                                        if (!this->globalStore_->check({rkey})) {
+                                            all_acked = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!all_acked) {
+                                        std::this_thread::sleep_for(
+                                            std::chrono::milliseconds(10));
+                                    }
+                                }
+                                if (all_acked) {
+                                    std::string cv = "1";
+                                    this->globalStore_->set(
+                                        commit_key,
+                                        std::vector<uint8_t>(
+                                            cv.begin(), cv.end()));
+                                    LOG(INFO) << logPrefix()
+                                              << "[NCCL-FT] All ranks ACKed; "
+                                              << "COMMIT written for OP "
+                                              << target_op;
+                                }
+                            }
+
+                            // Phase 2b: every rank waits for COMMIT before
+                            // setting final_commit_op_ to unblock main thread.
+                            while (this->ft_negotiator_running_.load()) {
+                                if (this->globalStore_->check({commit_key})) {
+                                    break;
+                                }
+                                std::this_thread::sleep_for(
+                                    std::chrono::milliseconds(10));
+                            }
+                            this->final_commit_op_.store(
+                                target_op, std::memory_order_release);
+                            LOG(INFO) << logPrefix()
+                                      << "[NCCL-FT] final_commit_op_ set to "
+                                      << target_op
+                                      << "; main thread will proceed.";
                         }
-                        
-                        // 收到新信號後休眠防抖
-                        std::this_thread::sleep_for(std::chrono::milliseconds(200)); 
+                        // Anti-spam sleep after processing a new proposal.
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(200));
                     } else {
-                        // 雖然有 key，但是舊的提案，稍微休眠避免 CPU 空轉
-                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                        // Same key as last time; nothing new to process.
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(50));
                     }
                 } else {
-                    // 沒事做就乖乖睡覺，把 CPU 與 TCPStore 的控制權還給主執行緒
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    // No event key; sleep to avoid busy-spinning.
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(50));
                 }
             } catch (const std::exception& e) {
-                // 只在 TCPStore 真正發生連線錯誤時紀錄
-                LOG(WARNING) << logPrefix() << "[NCCL-FT] 側車執行緒網路例外: " << e.what();
+                LOG(WARNING) << logPrefix()
+                             << "[NCCL-FT] Side-car thread exception: "
+                             << e.what();
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             } catch (...) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -4189,6 +4427,17 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   std::shared_ptr<NCCLFTComm> ncclComm = getNCCLComm(key);
   if (ncclComm == nullptr) {
     ncclComm = initNCCLComm(key, device, opType);
+  }
+
+  // [NCCL-FT] Lazy init: build local_nvlink_comm_ via ncclCommSplit on the
+  // first collective after the global comm is established. All 16 ranks hit
+  // this path simultaneously on their first collective, satisfying the
+  // collective-call requirement of ncclCommSplit.
+  if (!ft_disabled_ && local_nvlink_comm_ == nullptr) {
+    LOG(INFO) << logPrefix()
+              << "[NCCL-FT] First collective detected; initialising "
+              << "local_nvlink_comm_ via ncclCommSplit.";
+    initLocalNvlinkComm();
   }
 
   if (coalescing_state_ & CoalActive) {
@@ -4332,14 +4581,11 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
                 << "[NCCL-FT] Degraded mode active, opType="
                 << opTypeToString(opType) << ", rank=" << rank_;
       if (opType == OpType::ALLREDUCE && proxy_comm_ready_.load(std::memory_order_acquire)) {
-          // Extract reduce op from the tensor dtype. For the prototype we derive
-          // it the same way allreduce_impl does: re-compute ncclReduceOp using
-          // ncclSum as the reduce operation (training default). A future
-          // improvement can thread the actual op through.
-          auto ncclDataType = getNcclDataType(inputs[0].scalar_type());
-          ncclRedOpRAII ncclReduceOp = getNcclReduceOp(
-              ReduceOp::SUM, inputs[0], ncclDataType, comm);
-          execute_shadow_allreduce(inputs[0], outputs[0], ncclStream, ncclReduceOp);
+          // Pass current_shadow_reduce_op_ which was set by allreduce_impl
+          // before calling collective(). This ensures AVG, MIN, MAX etc. are
+          // honoured by execute_shadow_allreduce rather than defaulting to SUM.
+          execute_shadow_allreduce(
+              inputs[0], outputs[0], ncclStream, current_shadow_reduce_op_);
       } else {
           // Non-AllReduce op or proxy comm not ready: fall back to native path
           // and log a warning. proxy_global_comm_ has a different size, so we
@@ -5045,6 +5291,9 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
     at::Tensor& tensor,
     const char* profilingTitle,
     const AllreduceOptions& opts) {
+  // Record the requested ReduceOp so the degraded collective() path can pass
+  // the correct op to execute_shadow_allreduce instead of defaulting to SUM.
+  current_shadow_reduce_op_ = opts.reduceOp;
   return collective(
       tensor,
       tensor,
