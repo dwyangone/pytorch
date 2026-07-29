@@ -4241,8 +4241,31 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
 
         // Step 2: pre-aggregate.
+        // [NCCL-FT Bug 5 monitor] ATen copy_/add_ are enqueued on `stream`
+        // via CUDAStreamGuard. They must land on the SAME stream as the
+        // ncclRecv above so CUDA's in-order serialisation guarantees the recv
+        // data is ready before the arithmetic reads it.
+        //
+        // Verification: the stream handle printed here should match the stream
+        // handle used in the ncclGroupStart/End block above. If they differ, a
+        // race exists (ward_bufs may hold uninitialized values).
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT][PROXY][Bug5-check] ATen pre-aggregate on stream="
+                  << stream.stream()
+                  << " device=" << stream.device_index()
+                  << " (should match ncclRecv stream above)";
         {
             at::cuda::CUDAStreamGuard guard(stream);
+            at::cuda::CUDAStream active = at::cuda::getCurrentCUDAStream(
+                stream.device_index());
+            if (active.stream() != stream.stream()) {
+                LOG(WARNING) << logPrefix()
+                             << "[NCCL-FT][PROXY][Bug5-WARN] CUDAStreamGuard "
+                             << "did not switch stream! active="
+                             << active.stream()
+                             << " expected=" << stream.stream()
+                             << " — ATen ops may race with ncclRecv.";
+            }
             output.copy_(input);
             for (const auto& wb : ward_bufs) {
                 output.add_(wb);
@@ -4765,26 +4788,52 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
       LOG(INFO) << logPrefix()
                 << "[NCCL-FT] 抵達警戒線 OP: " << current_op << "，等待 2PC COMMIT";
 
-      // Spin until the negotiator thread sets final_commit_op_ for this round.
-      while (this->final_commit_op_.load(std::memory_order_relaxed) == 0) {
+      // [NCCL-FT Bug 3 fix] Spin until the negotiator sets final_commit_op_
+      // equal to the SPECIFIC op we are waiting for. Using != current_op is
+      // more precise than == 0: it handles the edge case where a prior round's
+      // cleanup reset the atomic to 0 races with the new commit being written.
+      while (this->final_commit_op_.load(std::memory_order_relaxed) != current_op) {
           std::this_thread::yield();
       }
 
-      if (this->final_commit_op_.load(std::memory_order_relaxed) == current_op) {
+      LOG(INFO) << logPrefix()
+                << "[NCCL-FT] 2PC committed for OP=" << current_op
+                << "; rebuilding proxy topology (may be second/Nth fault).";
+
+      rebuild_shadow_ping_pong_topology();
+      this->is_degraded_ = true;
+
+      // Clean up TCPStore keys for this fault round so they do not accumulate
+      // over a long training run. Each rank deletes its own ACK and SHADOW_SEQ
+      // keys (no contention). Rank 0 deletes the shared keys last, after
+      // everyone has read them (safe because all ranks are past the barrier).
+      try {
+          std::string op_str = std::to_string(current_op);
+          std::string my_ack =
+              "NCCL_FT_ACK_" + std::to_string(this->rank_) + "_" + op_str;
+          std::string my_ss =
+              "NCCL_FT_SHADOW_SEQ_" + std::to_string(this->rank_) + "_" + op_str;
+          this->globalStore_->deleteKey(my_ack);
+          this->globalStore_->deleteKey(my_ss);
           LOG(INFO) << logPrefix()
-                    << "[NCCL-FT] 2PC committed for OP=" << current_op
-                    << "; rebuilding proxy topology (may be second/Nth fault).";
-
-          rebuild_shadow_ping_pong_topology();
-          this->is_degraded_ = true;
-
-          // Reset 2PC control atomics so the next fault round can reuse them.
-          this->do_not_cross_op_.store(0, std::memory_order_release);
-          this->final_commit_op_.store(0, std::memory_order_release);
+                    << "[NCCL-FT] TCPStore: deleted per-rank keys for OP=" << current_op;
           if (this->rank_ == 0) {
-              try { this->globalStore_->deleteKey("NCCL_FT_EVENT"); } catch(...) {}
+              this->globalStore_->deleteKey("NCCL_FT_EVENT");
+              this->globalStore_->deleteKey("NCCL_FT_COMMIT_" + op_str);
+              this->globalStore_->deleteKey(
+                  "NCCL_FT_SHADOW_SEQ_AGREED_" + op_str);
+              LOG(INFO) << logPrefix()
+                        << "[NCCL-FT] TCPStore: deleted shared keys for OP=" << current_op;
           }
+      } catch (const std::exception& e) {
+          LOG(WARNING) << logPrefix()
+                       << "[NCCL-FT] TCPStore key cleanup failed (non-fatal): "
+                       << e.what();
       }
+
+      // Reset 2PC control atomics so the next fault round can reuse them.
+      this->do_not_cross_op_.store(0, std::memory_order_release);
+      this->final_commit_op_.store(0, std::memory_order_release);
   }
   /* ===================================================================== */
 
@@ -4815,14 +4864,31 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 // rebuilt and proxy_comm_ready_ is true.  We detect this combination here
 // and replay the failed AllReduce via execute_shadow_allreduce on the clean
 // (restored) tensor, then skip the normal fn() call.
+//
+// seqCollective_ double-count fix:
+// collective() already bumped seqCollective_ for this invocation (line ~4615).
+// But this invocation is the REPLAY of the failed op — it is not a new op from
+// DDP's perspective. DDP's Reducer issued the original allreduce (seq N), it
+// was aborted, and now we are re-executing seq N. If we leave seqCollective_
+// bumped to N+1, the Watchdog's seq tracking and the next fault's target_op
+// calculation will be off by one. Fix: undo the bump before replay and restore
+// it after, so seqCollective_ stays at N (the replayed op) when collective()
+// returns, matching what DDP expects for the next bucket.
   bool ran_shadow_replay = false;
   if (!ft_disabled_ && C10_UNLIKELY(shadow_replay_pending_) &&
       opType == OpType::ALLREDUCE &&
       proxy_comm_ready_.load(std::memory_order_acquire)) {
+      // Undo the seqCollective_ bump: this call IS the replay of seq N, not
+      // a new op. After replay, seqCollective_ should equal committed_shadow_seq_
+      // (the agreed seq of the replayed op).
+      if (!coalescing_state_) {
+          seqCollective_--;
+      }
+      uint64_t replay_seq = committed_shadow_seq_.load(std::memory_order_acquire);
       LOG(INFO) << logPrefix()
                 << "[NCCL-FT] Sub-Task 5 REPLAY after rollback for seq="
-                << committed_shadow_seq_.load()
-                << " (current_op=" << seqCollective_ << ")";
+                << replay_seq
+                << " (seqCollective_ adjusted to " << seqCollective_ << ")";
       execute_shadow_allreduce(
           inputs[0], outputs[0], ncclStream, current_shadow_reduce_op_);
       {
@@ -5588,6 +5654,16 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
       c10::intrusive_ptr<WorkNCCLFT>& /* work */) {
     if (ft_disabled_ || !shadow_buf_.has_value()) return;
     std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+    // [NCCL-FT Bug 1 fix] Do not overwrite the already-restored shadow buffer
+    // when a replay is pending. The Watchdog restored shadow_buf_ to the clean
+    // pre-fault gradient; overwriting it now (with possibly the same or a
+    // different bucket's data) would corrupt the replay input.
+    if (shadow_replay_pending_) {
+      LOG(INFO) << logPrefix()
+                << "[NCCL-FT] shadow_pre: skipping checkpoint because "
+                << "shadow_replay_pending_=true (seq=" << seqCollective_ << ")";
+      return;
+    }
     int64_t numel = tensor.numel();
     // narrow() gives a view of the first numel elements; safe when shadow_buf_
     // is larger than the current tensor (auto-grown for a prior larger tensor).
