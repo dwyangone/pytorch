@@ -18,6 +18,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/NCCLFTUtils.hpp>
@@ -1076,12 +1077,20 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   /* --- [NCCL-FT: 零開銷容錯控制面變數] --- */
   std::atomic<uint64_t> do_not_cross_op_{0};
   std::atomic<uint64_t> final_commit_op_{0};
-  std::atomic<int> failed_dev_index_{-1};
   bool is_degraded_ = false;
   bool ft_disabled_ = false;
 
-  // -1 代表沒有錯誤。若大於等於 0，代表該 Local Device Index 網卡故障
+  // Pending fault signal from NCCL callback / Watchdog.
+  // -1: no pending fault. >= 0: local device index of the newly faulted NIC.
+  // Written by the callback/watchdog, cleared by the negotiator thread after
+  // it relays the proposal to TCPStore.
   std::atomic<int> local_hardware_fault_dev_{-1};
+
+  // Persistent set of all local device indices confirmed as faulty by 2PC.
+  // Grows monotonically; never shrinks. Protected by faulty_devs_mutex_.
+  // The main thread reads it (under lock) only at rebuild time.
+  std::unordered_set<int> faulty_local_devs_;
+  std::mutex faulty_devs_mutex_;
 
   // The very first NCCL communicator created for this PG, built via the full
   // ncclCommInitRankConfig path. All subsequent non-P2P comms are derived from
@@ -1096,20 +1105,77 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // Uses NCCLFTComm RAII so no manual ncclCommDestroy is needed.
   std::shared_ptr<NCCLFTComm> local_nvlink_comm_{nullptr};
 
-  // Reduced cross-node communicator built after a NIC fault is confirmed.
-  // Healthy ranks participate; the faulty rank's slot is dropped symmetrically
-  // across all nodes. Built via ncclCommSplit (color=1 for healthy,
+  // Reduced cross-node communicator built after each fault round is confirmed.
+  // Only ranks whose local_rank is NOT in faulty_local_devs_ participate.
+  // Rebuilt via ncclCommSplit on every new fault (color=1 for healthy,
   // NCCL_SPLIT_NOCOLOR for faulty) to avoid triggering a NIC topology scan.
   std::shared_ptr<NCCLFTComm> proxy_global_comm_{nullptr};
   int proxy_comm_rank_{-1};
   int proxy_comm_size_{0};
-  int proxy_failed_local_dev_{-1};
   std::atomic<bool> proxy_comm_ready_{false};
 
   // The ReduceOp requested by the current allreduce call. Set by allreduce_impl
   // before collective() is called so the degraded path can honour the real op
   // instead of defaulting to SUM.
   ReduceOp current_shadow_reduce_op_{ReduceOp::SUM};
+
+  // -----------------------------------------------------------------------
+  // Shadow Buffer: protects AllReduce gradient tensors from partial writes
+  // when a NIC fault aborts the op mid-way.
+  //
+  // Lifecycle:
+  //   allreduce_impl (main thread):
+  //     ensure_shadow_buffer() -> shadow_buf_.copy_(tensor) in pre lambda
+  //     -> records shadow_seq_ and shadow_nccl_stream_
+  //   Watchdog (on fault):
+  //     restores tensor from shadow_buf_ on shadow_nccl_stream_
+  //     -> records shadow_restore_event_, sets shadow_restore_pending_
+  //        and shadow_replay_pending_
+  //   collective() (main thread, next call after barrier):
+  //     waits on shadow_restore_event_ before replay
+  //     -> calls execute_shadow_allreduce with clean tensor
+  //
+  // Thread safety: shadow_buf_mutex_ protects shadow_buf_, shadow_seq_,
+  // shadow_nccl_stream_, shadow_restore_pending_, and shadow_replay_pending_.
+  // The two atomics (pending_shadow_seq_, committed_shadow_seq_) are written
+  // by trigger_fault_proposal and the negotiator thread respectively, and
+  // read by the negotiator and main threads — no mutex needed for them.
+  // -----------------------------------------------------------------------
+
+  // Single contiguous GPU buffer sized to the largest tensor seen.
+  // nullopt until the first allreduce. Reallocated if a larger tensor arrives.
+  std::optional<at::Tensor> shadow_buf_;
+  std::mutex shadow_buf_mutex_;
+
+  // seqCollective_ value of the AllReduce whose input was last checkpointed.
+  uint64_t shadow_seq_{0};
+
+  // The NCCL stream that ran the checkpointed AllReduce. Used by the Watchdog
+  // to enqueue the restore copy on the correct stream. Saved in the pre lambda.
+  at::cuda::CUDAStream shadow_nccl_stream_{
+      at::cuda::getStreamFromPool(/*isHighPriority=*/false)};
+
+  // CUDA event recorded by the Watchdog after the restore copy is enqueued.
+  // The main thread waits on this event before starting the replay AllReduce.
+  at::cuda::CUDAEvent shadow_restore_event_;
+
+  // Set by Watchdog when a restore has been enqueued; cleared by main thread
+  // after shadow_restore_event_.block() returns.
+  bool shadow_restore_pending_{false};
+
+  // Set by Watchdog alongside shadow_restore_pending_; tells collective() to
+  // run the Shadow Ping-Pong replay instead of the normal fn() path.
+  bool shadow_replay_pending_{false};
+
+  // shadow_seq_ captured at the moment trigger_fault_proposal fires.
+  // Read by the negotiator thread to include in the PROPOSE message.
+  std::atomic<uint64_t> pending_shadow_seq_{0};
+
+  // The shadow_seq value agreed by all ranks via TCPStore consensus.
+  // Written by the negotiator thread after COMMIT; read by main thread at replay.
+  std::atomic<uint64_t> committed_shadow_seq_{0};
+
+  // -----------------------------------------------------------------------
 
   // 獨立的側車執行緒，專門負責 2PC 協商，絕對不干擾原生 Watchdog
   std::thread ft_negotiator_thread_;
@@ -1119,6 +1185,7 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   uint64_t calculate_safe_buffer();
   void initLocalNvlinkComm();
   void rebuild_shadow_ping_pong_topology();
+  void ensure_shadow_buffer(const at::Tensor& t);
   void execute_shadow_allreduce(
       at::Tensor& input,
       at::Tensor& output,

@@ -158,6 +158,7 @@ torch/_rocm_init.py
 
 #bob
 bob*
+nccl/
 
 # Editor temporaries
 *.swa
