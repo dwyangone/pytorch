@@ -1,426 +1,104 @@
 # ProcessGroupNCCLFT — End-to-End Prototype Gap Analysis & Plan
 
-**Version:** 2025-07 全面審查
-**範圍:** 基於原始碼完整靜態分析，找出所有阻礙端到端測試的缺口並提供修復方案
-**狀態:** Bug 1, 2, 4+5, 6, 9, 10 已全部修復並寫入 ProcessGroupNCCLFT.cpp / .hpp
-
 ---
 
 ## 一、系統現狀總結
 
-目前 `ProcessGroupNCCLFT` 已完成以下核心骨架：
+ProcessGroupNCCLFT 是基於 ProcessGroupNCCL 複製並擴充的自訂 backend（已在 c10d 中以 `nccl_ft` 名稱註冊）。
 
-| 模組 | 狀態 | 所在位置 |
-|---|---|---|
-| Watchdog FT 錯誤清除路徑 | ✅ 已完成 (含 Bug A SIGSEGV 修復) | Line ~2477–2565 |
-| `initLocalNvlinkComm()` (NVLink comm) | ✅ 已完成 | Line ~3945–4005 |
-| `rebuild_shadow_ping_pong_topology()` | ✅ 已完成 | Line ~4022–4116 |
-| `execute_shadow_allreduce()` (4-step relay) | ✅ 已完成 | Line ~4149–4341 |
-| `trigger_fault_proposal()` | ✅ 已完成 | Line ~4343–4364 |
-| `start_ft_negotiator_thread()` (2PC) | ✅ 已完成 | Line ~4367–4634 |
-| Shadow Buffer checkpoint/restore | ✅ 已完成 | Line ~5634–5723 |
-| `collective()` 2PC barrier + replay | ✅ 已完成 | Line ~4807–4924 |
-| Multi-fault `faulty_local_devs_` set | ✅ 已完成 | HPP ~Line 1092 |
-| TCPStore key cleanup | ✅ 已完成 | Line ~4835–4856 |
+目前架構：三執行緒模型
+- **主執行緒**：執行 collective（AllReduce 等），遇到故障後在 2PC barrier 停下等待
+- **Watchdog**（`pt_nccl_watchdg`）：偵測失敗的 work、清除 poison、恢復 shadow buffer、設置 replay 旗標
+- **Side-car negotiator**（`pt_nccl_ft_side`）：透過 TCPStore 2PC 協商故障邊界，建立所有 rank 的共識
+
+硬體假設：2 台 server × 8 GPU，每張 GPU 對應一張 NIC（NUMA-local），同 server 內所有 GPU 以 NVLink 互連。
 
 ---
 
-## 二、已確認的 Bug 與缺口（阻礙端到端測試）
+## 二、已確認的 Bug 與缺口
 
-以下依照**嚴重程度**排序，從必須修復（P0）到建議修復（P2）。
-
----
-
-### Bug 1 (P0): Watchdog 在 FT 路徑中仍然先寫入 `COMM_ERROR`，再清除為 `SUCCESS`
-
-**位置:** `ProcessGroupNCCLFT.cpp` Line 2424–2430（在 FT 路徑之前）
-
-**問題描述:**  
-Watchdog 迴圈的結構是：
-```
-if (work.exception()) {
-    // Line 2424: 先無條件寫入 COMM_ERROR   <--- 問題在這裡
-    pg_->error_ = ErrorType::COMM_ERROR;
-}
-// ... timeout check ...
-if (work.exception()) {
-    if (!pg_->ft_disabled_) {
-        // Line 2487: 再清除回 SUCCESS
-        pg_->error_ = ErrorType::SUCCESS;
-```
-
-在 FT 路徑清除之前，`error_` 已短暫被設為 `COMM_ERROR`。雖然之後會被清除，但如果主執行緒在這個窗口呼叫了任何會讀取 `error_` 的函數（例如 `checkError()`），就會觸發不必要的錯誤傳播。
-
-**修復方案:**  
-在第一個 `if (work.exception())` 區塊中，加入 FT 模式的判斷，**不要**在 FT 路徑中寫入 `COMM_ERROR`：
-
-```cpp
-if (work.exception()) {
-    // [NCCL-FT] In FT mode, do NOT set COMM_ERROR here.
-    // The FT branch below will clear it anyway, but the window
-    // between set and clear can cause spurious checkError() failures.
-    if (!pg_->ft_disabled_) {
-        // FT mode: skip setting COMM_ERROR; let the FT branch handle it.
-    } else {
-        std::lock_guard<std::mutex> lock(pg_->errorMutex_);
-        if (pg_->error_ == ErrorType::SUCCESS) {
-            pg_->error_ = ErrorType::COMM_ERROR;
-        }
-    }
-}
-```
+### 已修復（不需再處理）
+- ✅ Bug 1: Watchdog 提前寫入 COMM_ERROR
+- ✅ Bug 2: 2PC barrier spin-wait 位置在 pre() 之後
+- ✅ Bug 4+5: target_op 計算錯誤 / seqCollective_ 非 atomic 跨執行緒讀取
+- ✅ Bug 6: intraNodeComm_ bypass 繞過降級路徑
+- ✅ Bug 7: PROXY step 2 ATen op 在 ncclRecv 完成前執行
+- ✅ Bug 9: pending_shadow_seq_ 初始 sentinel 為 0
+- ✅ Bug 10: work->ncclComm_ 在降級路徑指向壞掉的 comm
+- ✅ Bug 11: last_handled_event 去重邏輯用字串比較而非 target_op 數值
+- ✅ Bug A (SIGSEGV): Watchdog 對 work.outputs_ 的 nullptr 解引用
 
 ---
 
-### Bug 2 (P0): `collective()` 主執行緒在 2PC barrier spin-wait 期間沒有保護 `errorMutex_`
+### Bug 12 (P2): multi-NIC 同時故障時 `local_hardware_fault_dev_` 遺失後續故障
 
-**位置:** `ProcessGroupNCCLFT.cpp` Line 4809–4822
+**問題描述：**
+`local_hardware_fault_dev_` 是 `atomic<int>`，只能存一個值。
+若 NIC 0 和 NIC 1 幾乎同時故障：
+- 第一次 CAS 成功（例如 NIC 0 寫入）
+- 第二次 CAS 失敗（`expected=-1` 但實際已是 0），NIC 1 的故障被靜默丟棄
+- Watchdog 的 fallback CAS 也會同樣失敗
 
-**問題描述:**  
-主執行緒在 2PC barrier spin-wait 時：
-```cpp
-while (this->final_commit_op_.load(std::memory_order_relaxed) != current_op) {
-    std::this_thread::yield();
-}
-```
-此時 Watchdog 可能正在清除多個 poisoned work（多個 in-flight ops 在 dead comm 上全部失敗）。Watchdog 每次清除都會設/清 `error_`，主執行緒同時也在呼叫 `collective()` 的前置作業。雖然 `error_` 有 `errorMutex_` 保護，但 2PC spin-wait 沒有 `errorMutex_`，這本身沒問題。  
+同時，PROPOSE 訊息的 `dev_idx` 欄位只有一個整數，無法一次傳遞多個故障裝置。
 
-**真正的問題**是：如果主執行緒在 2PC spin-wait 之前（Line 4805）呼叫了 `pre(ncclStream, work)` ── `pre` 就是 `shadow_pre` lambda ── 但在 FT 模式下 `shadow_replay_pending_` 可能尚未被設置（Watchdog 還沒跑到），因此 `shadow_pre` 會做一次新的 checkpoint，覆蓋掉本應用來 replay 的 shadow buffer 內容。
-
-**根本原因:** `pre(ncclStream, work)` 在 Line 4805 **先被呼叫**，2PC barrier 在 Line 4812 **後被檢查**。若故障恰好在 `pre` 到 2PC barrier 之間觸發，順序倒置。
-
-**修復方案:**  
-把 2PC barrier 的檢查（`boundary > 0 && current_op == boundary`）**移到 `pre()` 呼叫之前**，或者在 `pre()` 內部確保此時 `shadow_replay_pending_` 已被正確設置：
-
-```cpp
-// CORRECT order:
-// 1. Check shadow restore event wait (already at Line 4782)
-// 2. Check 2PC barrier FIRST (move from Line 4812 to before pre())
-// 3. Call pre(ncclStream, work)   <-- checkpoint only after barrier clears
-// 4. Execute fn() or shadow replay
-```
-
-實際修改：將整個 `if (!this->ft_disabled_ && C10_UNLIKELY(boundary > 0 && ...))` 區塊從 Line 4812 移到 Line 4805 `pre(ncclStream, work)` **之前**。
+**修復策略：**
+- 將 `local_hardware_fault_dev_` 改為 `atomic<uint64_t>` bitmask，使用 `fetch_or` 而非 CAS
+- bit `i` 表示本地裝置 `i` 發生故障
+- PROPOSE 訊息的 `dev_idx` 欄位由一個整數改為十六進位 bitmask 字串（例如 `0x5` = NIC 0 和 NIC 2 同時故障）
+- 收到 PROPOSE 時，解析 bitmask 並將所有對應 bit 的裝置都加入 `faulty_local_devs_`
 
 ---
 
-### Bug 3 (P0): `collective()` 降級路徑在 `ran_shadow_replay=true` 後，仍然呼叫了 `post(ncclStream, work)` 和 `work->ncclEndEvent_->record()`
+### Bug 13 (P1): 非對稱降級（per-server NIC pool）設計分析
 
-**位置:** `ProcessGroupNCCLFT.cpp` Line 4967–4972
+**現況的對稱降級問題：**
+目前 `rebuild_shadow_ping_pong_topology()` 假設所有 server 上發生故障的本地裝置索引完全相同（symmetric degradation）：所有 node 都從 `faulty_local_devs_` 中讀取同一組本地 rank 並排除。
 
-**問題描述:**  
-`execute_shadow_allreduce` 直接呼叫底層 NCCL API，不會回傳 `ncclResult_t` 給 `collective()`。`post()` 和 `ncclEndEvent_->record()` 之後被無條件呼叫，這本身沒有問題。
+但當 Server 0 的 NIC 2 故障、Server 1 的 NIC 3 故障時（不同本地索引），目前行為會讓**所有 node 都丟棄本地 2 和本地 3**，造成過度降級（每個 server 多損失一張健康的 GPU）。
 
-但更重要的是：在 replay 路徑（`ran_shadow_replay=true`）中，`work->outputs_` 已在 Line 4753 設好，`work->future_` 在 Line 4978 完成。這條路徑沒有明顯問題。
+**Per-Server NIC Pool 策略：**
+- 每個 server 獨立維護自己的健康 NIC 集合
+- `proxy_global_comm_` 的 size 由各 server 最小健康 NIC 數決定
+- 不同 server 可以有不同的故障 NIC，只要每個 server 能提供足夠的健康 GPU 參與就行
 
-**實際問題:** 經過重新審查，此項目升級為**注意事項**而非 Bug，標記為 P1，見下方。
+**ncclCommSplit 的限制：**
+`ncclCommSplit` 是 **collective 操作**，所有 rank 必須同時呼叫，傳入的 `color` 決定是否參與。
+當不同 server 有不同的健康 NIC 組合時，需要一個全域共識機制來決定「哪些 global rank 參與新的 proxy_global_comm_」。
 
----
+**分析結論：**
+Per-Server NIC Pool 在數學上可行，但需要以下額外工作：
+1. PROPOSE 訊息需攜帶 `(node_id, dev_mask)` 而非 `(node_id, dev_idx)`
+2. 收到所有節點的故障資訊後（2PC COMMIT 前），rank 0 計算全域 color 表（哪些 global rank 應 color=1 / NOCOLOR）
+3. 計算結果寫入 TCPStore，所有 rank 在 barrier 處讀取後再呼叫 ncclCommSplit
 
-### Bug 4 (P0): `target_op` 計算使用 `seqCollective_ + 10` 但沒有理由
-
-**位置:** `ProcessGroupNCCLFT.cpp` Line 4387
-
-```cpp
-uint64_t target_op = this->seqCollective_ + 10;
-```
-
-**問題描述:**  
-`seqCollective_` 在 Watchdog 執行緒中被讀取（無鎖），同時主執行緒也在修改它。加 10 是一個任意的緩衝，確保 "所有 in-flight ops 都能完成或被清除後，再設置 barrier"。
-
-但問題在於：當 AllReduce 失敗時，**所有 in-flight ops 都會一起失敗**（因為 NCCL comm 已標記為 error）。Watchdog 會清除所有 poisoned works。主執行緒在這些 ops 完成之前已被阻塞（因為 `asyncOp=false` 的 `collective()` 回傳 nullptr，不會 `wait()`，但 DDP 也不會進行下一個 allreduce 直到前一個完成）。
-
-實際上 `seqCollective_` 讀取時沒有 memory fence，且 side-car 執行緒和主執行緒的 `seqCollective_` 值可能不一致。
-
-**更重要的問題:** 固定加 10 可能造成 `target_op` 太大，主執行緒在 barrier 等待時的 `current_op` 永遠不等於 `target_op`，導致**永久死結**。
-
-**例如:** 故障時 `seqCollective_=37`，`target_op=47`。但只有 4 個 ops (34,35,36,37) 在 in-flight，主執行緒在清除後的下一個 op 是 38。`current_op == 47` 需要主執行緒又執行了 9 個 ops，但 2PC 在 op 47 之前不允許任何跨節點通訊，造成死結。
-
-**修復方案:**  
-`target_op` 應設為**當前正在執行的 op + 1**（即下一個要執行的 op），而不是 +10：
-```cpp
-// 故障時，主執行緒被 Watchdog 清除後，下一個 op 就是 barrier
-// seqCollective_ 是已失敗的最後一個 op，下一個 collective 是 seqCollective_+1
-uint64_t target_op = this->seqCollective_ + 1;
-```
-
-但由於 `seqCollective_` 在 side-car 執行緒讀取時無鎖，且實際值需要 memory ordering，更安全的做法是：
-```cpp
-// 從 Watchdog 清除的最後一個 seq 推算（最大 seq + 1）
-// 因為 side-car 在觸發後立即讀取，此時 seqCollective_ 還沒被下一個 op bump
-uint64_t target_op = this->seqCollective_.load(std::memory_order_acquire) + 1;
-```
-注意 `seqCollective_` 在 HPP 宣告為 `uint64_t`（非 atomic），需要確認它是否受到足夠的保護，或改成 `std::atomic<uint64_t>`。
-
----
-
-### Bug 5 (P0): `seqCollective_` 不是 atomic，但 side-car 執行緒讀取它
-
-**位置:** `ProcessGroupNCCLFT.hpp` (繼承自 ProcessGroupNCCL)，`ProcessGroupNCCLFT.cpp` Line 4387
-
-**問題描述:**  
-`seqCollective_` 是 `uint64_t`（非 atomic），主執行緒寫入，side-car 執行緒在 `trigger_fault_proposal()` 和 `start_ft_negotiator_thread()` 中讀取。這是一個 **data race**，屬於 undefined behavior。
-
-**修復方案:**  
-在讀取 `seqCollective_` 前加 `std::memory_order_acquire`，或在 side-car 執行緒中改用 `pgStatus_->lastEnqueuedSeq`（已是 atomic-safe 的）來推算 target_op：
-```cpp
-// 使用 lastEnqueuedSeq 替代 seqCollective_
-uint64_t current_seq = static_cast<uint64_t>(
-    pg_->pgStatus_->lastEnqueuedSeq.load(std::memory_order_acquire));
-uint64_t target_op = current_seq + 1;
-```
-
----
-
-### Bug 6 (P1): `allreduce()` 中的 `intraNodeComm_` 路徑繞過了 Shadow Buffer 和降級路徑
-
-**位置:** `ProcessGroupNCCLFT.cpp` Line 5741–5752
-
-**問題描述:**  
-```cpp
-if (opts.reduceOp == ReduceOp::SUM) {
-    if (intraNodeComm_ != nullptr) {
-        auto algo = intraNodeComm_->selectAllReduceAlgo(tensor);
-        if (algo != intra_node_comm::AllReduceAlgo::NONE) {
-            intraNodeComm_->allReduce(tensor, algo);
-            return c10::make_intrusive<IntraNodeCommWork>();  // <-- 直接 return！
-        }
-    }
-}
-```
-這條路徑完全繞過了 `allreduce_impl()`，因此：
-- 沒有 `current_shadow_reduce_op_` 設定
-- 沒有 Shadow Buffer checkpoint
-- 降級後不會走 Shadow Ping-Pong relay
-
-如果 `intraNodeComm_` 被初始化（它需要特定的環境變數），在故障後此路徑仍然走 intraNode comm 而非降級路徑，導致**靜默數學錯誤或崩潰**。
-
-**修復方案:**  
-在 FT 模式下，如果 `is_degraded_` 為 true，**跳過** intraNodeComm 路徑：
-```cpp
-if (opts.reduceOp == ReduceOp::SUM && !is_degraded_) {  // <-- 加上 !is_degraded_
-    if (intraNodeComm_ != nullptr) {
-        ...
-    }
-}
-```
-
----
-
-### Bug 7 (P1): `execute_shadow_allreduce` 中 PROXY 步驟 2 的 ATen 操作（`output.copy_` / `output.add_`）可能在 ncclRecv 完成前執行
-
-**位置:** `ProcessGroupNCCLFT.cpp` Line 4282–4297
-
-**問題描述:**  
-```cpp
-C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);  // ncclRecv enqueued
-
-{
-    at::cuda::CUDAStreamGuard guard(stream);
-    output.copy_(input);     // ATen kernel enqueued
-    for (const auto& wb : ward_bufs) {
-        output.add_(wb);     // reads ward_bufs data
-    }
-}
-```
-
-NCCL 的 `ncclGroupEnd()` 只保證 NCCL kernel 被**提交**到 CUDA stream，但不保證執行完成。在同一個 `stream` 上，CUDA kernel 是串行的，所以 `output.copy_` 會在 `ncclRecv` 之後執行。這**理論上是正確的**，只要 `CUDAStreamGuard` 正確地設定了 stream。
-
-但 Bug 5 診斷 LOG 顯示：如果 `CUDAStreamGuard` 沒有正確切換（`active.stream() != stream.stream()`），ATen ops 就會落在錯誤的 stream 上，造成 race。
-
-**目前狀態:** 已有 Bug5 診斷 LOG，但沒有自動修復。如果 WARNING 觸發，需要手動介入。
-
-**建議修復:** 改用 `at::cuda::setCurrentCUDAStream(stream)` + 手動恢復，或確認 `CUDAStreamGuard` 在 NCCL 進度執行緒上下文中是否正確運作。
-
----
-
-### Bug 8 (P1): `rebuild_shadow_ping_pong_topology()` 從**已壞掉的** global comm split
-
-**位置:** `ProcessGroupNCCLFT.cpp` Line 4067–4097
-
-**問題描述:**  
-```cpp
-auto it = devNCCLCommMap_.find(key);
-...
-globalComm = it->second;  // 這是已失敗的原始 global comm
-...
-proxy_global_comm_ = NCCLFTComm::split(globalComm.get(), color, rank_, config);
-```
-
-從一個已經報告 `ncclRemoteError` 的 comm 呼叫 `ncclCommSplit`，行為是**未定義的**。NCCL 可能：
-- 直接回傳 error → `NCCLFTComm::split` 回傳 nullptr → `TORCH_CHECK` 失敗（對 healthy rank）
-- 或者 NCCL 在 split 之前先完成 comm abort，再從 abort 狀態 split（也是未定義）
-
-**正確做法（根據先前分析）:**  
-先呼叫 `ncclCommBanNic(dev_idx)`（在 custom NCCL 中），然後 `ncclCommSplit` 會自動排除被 ban 的 NIC，並基於**仍然健康的**部分建立新 comm。這依賴於 custom NCCL 的 `ncclCommBanNic` 實作正確地更新 comm 的 NIC 可見性，而不是讓整個 comm 進入 error 狀態。
-
-**需要確認的問題:**  
-在你的 custom NCCL 中，`ncclCommBanNic` 呼叫後，原始 comm 是否還能被用來呼叫 `ncclCommSplit`？還是必須使用一個從來沒壞過的 comm（例如 `local_nvlink_comm_`，它永遠不走有問題的 NIC）？
-
-**建議的防禦性修復:**  
-在 `rebuild_shadow_ping_pong_topology()` 中，加入 comm 健康檢查：
-```cpp
-// Check if global comm is still usable before split
-if (globalComm->isAborted()) {
-    LOG(ERROR) << "[NCCL-FT] Global comm is aborted; cannot split from it. "
-               << "Rebuild failed.";
-    proxy_comm_ready_.store(false);
-    return;
-}
-```
-
----
-
-### Bug 9 (P1): `pending_shadow_seq_` 初始化為 0，但 0 也是合法的 shadow_seq
-
-**位置:** `ProcessGroupNCCLFT.hpp` Line 1172
-
-**問題描述:**  
-```cpp
-std::atomic<uint64_t> pending_shadow_seq_{0};
-```
-
-在 `start_ft_negotiator_thread()` 中：
-```cpp
-uint64_t my_ss = this->pending_shadow_seq_.load(std::memory_order_acquire);
-if (my_ss == 0) {
-    my_ss = proposal_shadow_seq;  // 使用 proposer 的值作為 fallback
-}
-```
-
-如果訓練在第 1 個 op 就失敗（`shadow_seq_=0` 是合法的，`seqCollective_` 從 0 開始），`pending_shadow_seq_=0` 會被誤判為 "尚未設定"，導致非故障節點的 ranks 使用 proposer 的 shadow_seq 而非自己的 0。
-
-**修復方案:**  
-使用 sentinel 值，例如 `UINT64_MAX` 表示 "未設定"：
-```cpp
-std::atomic<uint64_t> pending_shadow_seq_{UINT64_MAX};
-// 在 trigger_fault_proposal():
-this->pending_shadow_seq_.store(this->shadow_seq_, std::memory_order_release);
-// 在 negotiator thread:
-uint64_t my_ss = this->pending_shadow_seq_.load(std::memory_order_acquire);
-if (my_ss == UINT64_MAX) {
-    my_ss = proposal_shadow_seq;
-}
-// Reset after use:
-this->pending_shadow_seq_.store(UINT64_MAX, std::memory_order_release);
-```
-
----
-
-### Bug 10 (P1): `collective()` 降級路徑在 ALLREDUCE 走 execute_shadow_allreduce 後，`fn()` 被跳過，但 WorkNCCLFT 仍然被 enqueue 到 Watchdog
-
-**位置:** `ProcessGroupNCCLFT.cpp` Line 4900–5016
-
-**問題描述:**  
-在 shadow replay 和降級路徑下，`execute_shadow_allreduce()` 直接呼叫 `ncclSend/ncclRecv/ncclAllReduce`，這些是立即提交到 stream 的 NCCL 操作。之後仍然呼叫了：
-```cpp
-work->ncclEndEvent_->record(ncclStream);  // Line 4971
-workEnqueue(work);                         // Line 5013
-```
-
-`ncclEndEvent_` 被 record 在 `ncclStream` 上，這個 stream 上有 `execute_shadow_allreduce` 的 kernel。Watchdog 用 `ncclEndEvent_` 來偵測 work 是否完成，這是正確的。
-
-**但問題在於:** `work->ncclComm_` 在 Line 4973 被設為**已壞的** `ncclComm`（原始 global comm），而不是 `proxy_global_comm_`。Watchdog 呼叫 `work.checkAndSetException()` 時，它查詢的是 `ncclComm->getNcclCommFailureReason()`，即**已壞的** comm，這會永遠回傳 error，讓 Watchdog 再次誤判這個 work 為失敗。
-
-**修復方案:**  
-在 shadow replay 和降級路徑下，設定 `work->ncclComm_` 為 `proxy_global_comm_` （對 healthy/proxy ranks）或 `local_nvlink_comm_` （對 faulty ranks）：
-```cpp
-if (ran_shadow_replay || (is_degraded_ && opType == OpType::ALLREDUCE)) {
-    int local_rank = rank_ % localDeviceCount_;
-    bool is_faulty = (faulty_local_devs_.count(local_rank) > 0);
-    if (is_faulty) {
-        work->ncclComm_ = local_nvlink_comm_;
-    } else if (proxy_global_comm_ != nullptr) {
-        work->ncclComm_ = proxy_global_comm_;
-    }
-} else {
-    work->ncclComm_ = ncclComm;  // 原始路徑
-}
-```
-
----
-
-### Bug 11 (P2): 連續第二次故障時，`last_handled_event` 去重邏輯可能導致新故障被忽略
-
-**位置:** `ProcessGroupNCCLFT.cpp` Line 4431–4432
-
-**問題描述:**  
-```cpp
-if (event_str.rfind("PROPOSE:", 0) == 0 &&
-    event_str != last_handled_event) {
-```
-
-`last_handled_event` 儲存的是上一次已處理的 proposal 字串（含 target_op, node, dev, shadow_seq）。第二次故障時如果恰好有相同的參數組合（例如相同 dev 再次失敗），`event_str == last_handled_event`，新故障被忽略。
-
-**修復方案:**  
-改用 `target_op` 作為去重 key，而非整個 proposal 字串：
-```cpp
-uint64_t last_handled_target_op = 0;
-// ...
-if (target_op != last_handled_target_op) {
-    last_handled_target_op = target_op;
-    // ... process proposal
-}
-```
-
----
-
-### Bug 12 (P2): `do_not_cross_op_` 和 `final_commit_op_` 重置順序可能導致第二次故障的 side-car 立即讀到 stale NCCL_FT_EVENT
-
-**位置:** `ProcessGroupNCCLFT.cpp` Line 4859–4861
-
-```cpp
-this->do_not_cross_op_.store(0, std::memory_order_release);
-this->final_commit_op_.store(0, std::memory_order_release);
-```
-
-TCPStore cleanup 在 Line 4835–4856 中刪除了 `NCCL_FT_EVENT`，但 side-car 執行緒在 Line 4427 `check({"NCCL_FT_EVENT"})` 可能在 delete 和下一個 PROPOSE 之間的時窗讀到一個剛被寫入的新 PROPOSE（因為 TCPStore `set` 是冪等的，`deleteKey` 後立刻 `set` 相當於覆寫）。  
-
-這實際上是正確的（新 PROPOSE 應該被處理），但 `last_handled_event` 機制需要確保不重複處理同一個 proposal。目前邏輯看起來是正確的，標記為注意事項。
+Prototype 階段（2 × 8 環境）的簡化做法：仍使用對稱降級（Step 7），後續再實作非對稱（Step 8）。
 
 ---
 
 ## 三、NCCL Custom Source 端的必要修改
 
-（提醒事項，不需要在 PyTorch 端修改）
+以下修改需由使用者在 custom NCCL fork 中完成（不在本計劃的 PyTorch 修改範圍內）：
 
-| 項目 | 說明 |
+| 修改點 | 原因 |
 |---|---|
-| **Bug A (P0)**: FT init hook 在 topology 建構期間自動 ban NIC | 必須移除或加 guard，只允許透過 `ncclCommBanNic()` 顯式呼叫 |
-| **Bug B (P0)**: Ban function 每個 rank 觸發兩次 | 加 `bool ft_init_done` guard |
-| **確認事項**: `ncclCommBanNic` 後，原始 comm 是否可用於 `ncclCommSplit` | 如不可用，需改從 `local_nvlink_comm_` split |
+| `ncclIbResiliencyHandleDeviceFailure`: `ncclSystemError` → `ncclRemoteError` | FT callback 路徑需要 ncclRemoteError 而非 system error，避免直接 abort |
+| `ncclIbResiliencyProbeHandleCompletionEvent`: `ncclSuccess` → `ncclRemoteError` | 同上 |
+| `topo.cc ncclTopoPopulateNics`: 移除 ban check block | 避免 NCCL 自行在 topo 掃描時過濾掉已 ban 的 NIC |
+| `init.cc`: 新增 `ncclCommBanNicReset()` API | 支援從 PyTorch 側重置 ban 狀態 |
+| `init.cc nccl_ft_trigger_fault`: 呼叫 PyTorch 的 `trigger_fault_proposal` callback | NCCL 偵測到 IB 故障時通知 PyTorch |
 
 ---
 
 ## 四、端到端測試前的最小修復清單（Must-Fix Before Testing）
 
-按優先順序：
-
-### Step 1: 修復 `target_op` 計算（Bug 4 + Bug 5）
-```cpp
-// ProcessGroupNCCLFT.cpp Line 4387
-// BEFORE:
-uint64_t target_op = this->seqCollective_ + 10;
-// AFTER:
-uint64_t current_seq = static_cast<uint64_t>(
-    pg_->pgStatus_->lastEnqueuedSeq.load(std::memory_order_acquire));
-uint64_t target_op = current_seq + 1;
-```
-
-### Step 2: 修復 Watchdog COMM_ERROR 提前設定（Bug 1）
-在 `if (work.exception())` 第一個區塊中（Line 2424），FT 模式下跳過 `COMM_ERROR` 設定。
-
-### Step 3: 移動 2PC barrier 到 `pre()` 之前（Bug 2）
-將 Line 4812 的 2PC barrier 判斷移到 Line 4805 `pre(ncclStream, work)` 之前。
-
-### Step 4: 修復 `work->ncclComm_` 降級路徑指向壞掉的 comm（Bug 10）
-在 replay/降級路徑下，`work->ncclComm_` 改指向 `proxy_global_comm_` 或 `local_nvlink_comm_`。
-
-### Step 5: 修復 `intraNodeComm_` 繞過降級路徑（Bug 6）
-在 `allreduce()` 中加入 `!is_degraded_` 判斷。
-
-### Step 6: 修復 `pending_shadow_seq_` 0 sentinel（Bug 9）
-改用 `UINT64_MAX` 作為 "未設定" 的 sentinel 值。
+| Step | Bug | 狀態 |
+|---|---|---|
+| Step 1 | Bug 4+5: target_op 計算 | ✅ 已完成 |
+| Step 2 | Bug 1: Watchdog COMM_ERROR 提前設定 | ✅ 已完成 |
+| Step 3 | Bug 2: 2PC barrier 移到 pre() 之前 | ✅ 已完成 |
+| Step 4 | Bug 10: work->ncclComm_ 降級路徑 | ✅ 已完成 |
+| Step 5 | Bug 6: intraNodeComm_ bypass | ✅ 已完成 |
+| Step 6 | Bug 9: pending_shadow_seq_ sentinel | ✅ 已完成 |
 
 ---
 
@@ -433,13 +111,88 @@ uint64_t target_op = current_seq + 1;
 [Step 4] Bug 10:  修復 work->ncclComm_ 在降級路徑 → 避免 Watchdog 誤判 replay work ✅ 已完成
 [Step 5] Bug 6:   intraNodeComm_ bypass 修復 → 確保降級後 allreduce 走正確路徑    ✅ 已完成
 [Step 6] Bug 9:   pending_shadow_seq_ sentinel 修復 → 首個 op 故障時正確運作        ✅ 已完成
-[Step 7] NCCL端: 修復 FT init hook 自動 ban NIC（需使用者在 custom NCCL 修改）     ⏳ 待處理
-[Step 8] 驗證:   2-node × 8-GPU 端到端測試，注入單 NIC 故障，觀察訓練繼續執行     ⏳ 待處理
+[Step 7] Bug 12:  multi-NIC 同時故障 bitmask 修復                                  ⏳ 待處理
+[Step 8] NCCL 端: 修復 FT init hook 自動 ban NIC（需使用者在 custom NCCL 修改）    ⏳ 待處理
+[Step 9] 驗證:   2-node × 8-GPU 端到端測試，注入單 NIC 故障，觀察訓練繼續執行     ⏳ 待處理
+[Step 10] Bug 13: Per-Server NIC Pool 非對稱降級（進階功能，Prototype 後再做）      ⏳ 待處理
 ```
 
 ---
 
-## 六、端到端測試驗證清單
+## 六、Step 7 詳細實作計劃：Bug 12 Multi-NIC Bitmask 修復
+
+### 6.1 Sub-Task A：HPP 變數型別修改
+
+**Intent:** 將單一整數的故障信號改為 bitmask，讓多張 NIC 同時故障時不丟失任何一個。
+
+**Relevant Context:**
+- `ProcessGroupNCCLFT.hpp` line ~1087: `std::atomic<int> local_hardware_fault_dev_{-1};`
+
+**Todo List:**
+1. 將 `local_hardware_fault_dev_` 型別由 `std::atomic<int>` 改為 `std::atomic<uint64_t>`，初始值改為 `0`（0 表示無故障）
+2. 更新 HPP 中的說明註解：bit `i` 表示本地裝置 `i` 發生故障
+
+**Expected Outcomes:**
+- 多個 NIC 同時故障時，所有 bit 都被記錄，無任何靜默丟棄
+
+---
+
+### 6.2 Sub-Task B：`trigger_fault_proposal()` 改用 `fetch_or`
+
+**Intent:** 讓 NCCL callback 和 Watchdog 都能透過 fetch_or 安全寫入多個故障 bit，不互相覆蓋。
+
+**Relevant Context:**
+- `ProcessGroupNCCLFT.cpp` lines 4349-4370: `trigger_fault_proposal(int dev_idx)`
+
+**Todo List:**
+1. 移除 CAS 邏輯，改為 `local_hardware_fault_dev_.fetch_or(1ULL << dev_idx, std::memory_order_release)`
+2. 更新 `pending_shadow_seq_` 快照邏輯：只在 `pending_shadow_seq_` 還是 sentinel（UINT64_MAX）時才寫入（避免第二次故障覆蓋第一次的 seq）
+
+**Expected Outcomes:**
+- 連續兩次 `trigger_fault_proposal(0)` + `trigger_fault_proposal(1)` 後，bitmask = `0x3`
+
+---
+
+### 6.3 Sub-Task C：Side-car negotiator 讀取 bitmask、組裝並解析新格式 PROPOSE
+
+**Intent:** PROPOSE 訊息需攜帶整個 bitmask（所有同時故障的 NIC），讓所有 node 在一輪 2PC 內收到完整故障集合。
+
+**Relevant Context:**
+- `ProcessGroupNCCLFT.cpp` lines ~4430-4460: 組裝 PROPOSE 字串的程式碼
+- `ProcessGroupNCCLFT.cpp` lines ~4470-4490: 解析 PROPOSE 的 `sscanf` 呼叫
+- 目前協議格式：`"PROPOSE:<target_op>:<node_id>:<dev_idx>:<shadow_seq>"`
+
+**Todo List:**
+1. **讀取：** 讀取 `local_hardware_fault_dev_` 的完整 bitmask（`uint64_t`），用 `exchange(0)` 一次清空，避免重複 relay
+2. **組裝：** 將格式由 `:<dev_idx>:` 改為 `:<dev_mask_hex>:`（例如 `0x5`），使用 `std::hex`
+3. **清除：** 在 relay 完成後不需要額外清除（已在 step 1 用 exchange(0) 清空）
+4. **解析：** 將接收端的 `sscanf` 改為解析十六進位 bitmask；對 bitmask 的每個 set bit 都呼叫 `faulty_local_devs_.insert(bit_index)`
+
+**Expected Outcomes:**
+- 格式範例：`"PROPOSE:42:0:0x6:1234"` 表示 node 0 的 NIC 1 和 NIC 2 同時故障
+- 所有 rank 收到後，`faulty_local_devs_` 中同時包含 1 和 2
+
+---
+
+### 6.4 Sub-Task D：Watchdog fallback 路徑改用 `fetch_or`
+
+**Intent:** Watchdog 在掃描 NCCL error 時，若發現故障是 NIC 問題，需要透過同一個 bitmask 通知 negotiator。
+
+**Relevant Context:**
+- `ProcessGroupNCCLFT.cpp` Watchdog FT recoverable path（lines ~2420-2572）：目前有 CAS fallback 寫入 `local_hardware_fault_dev_`
+
+**Todo List:**
+1. 找出所有 Watchdog 中寫入 `local_hardware_fault_dev_` 的地方
+2. 將 CAS (`compare_exchange_strong`) 改為 `fetch_or(1ULL << dev_idx)`
+3. 確認 Watchdog 中 `trigger_fault_proposal()` 的呼叫已使用新 bitmask 邏輯
+
+**Expected Outcomes:**
+- Watchdog 發現故障時，`local_hardware_fault_dev_` 的對應 bit 被設置
+- 不影響同時由 NCCL callback 設置的其他 bit
+
+---
+
+## 七、端到端測試驗證清單
 
 測試完成後，以下 LOG 應出現且順序正確：
 
@@ -481,12 +234,12 @@ uint64_t target_op = current_seq + 1;
 
 ---
 
-## 七、已完成項目（不需再處理）
+## 八、已完成項目（不需再處理）
 
 - ✅ `initLocalNvlinkComm()` — ncclCommSplit 方式，已驗證邏輯正確
 - ✅ `rebuild_shadow_ping_pong_topology()` — symmetric degradation，multi-fault 集合
 - ✅ `execute_shadow_allreduce()` — 4-step relay，AVG 修正，multi-ward 支援
-- ✅ `trigger_fault_proposal()` — atomic CAS，pending_shadow_seq snapshot
+- ✅ `trigger_fault_proposal()` — atomic CAS（Step 7 後改為 fetch_or），pending_shadow_seq snapshot
 - ✅ 2PC 完整協議 — PROPOSE/ACK/COMMIT，shadow_seq 共識（min 策略）
 - ✅ Shadow Buffer — checkpoint/restore，grow-on-demand，replay_pending guard
 - ✅ SIGSEGV Bug A 修復 — nullptr guard on `work.outputs_`
@@ -496,7 +249,7 @@ uint64_t target_op = current_seq + 1;
 
 ---
 
-## 八、已知不在 Prototype 範圍的項目
+## 九、已知不在 Prototype 範圍的項目
 
 | 項目 | 原因 |
 |---|---|
@@ -506,3 +259,4 @@ uint64_t target_op = current_seq + 1;
 | Error type 分類 | 目前所有 NCCL error 視為 NIC 故障；精細分類為後續工作 |
 | Proxy 負載均衡 | 固定 `(failed+1) % N`；動態選擇為後續工作 |
 | Tensor shard fan-out | 單一代理，非多路廣播；效能優化為後續工作 |
+| Per-Server NIC Pool（Bug 13）| Prototype 後進階功能，Step 10 |

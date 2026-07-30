@@ -2467,19 +2467,14 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
       if (work.exception()) {
         // [NCCL-FT] Recoverable path: when FT is enabled, clear the exception
         // so training can continue. The fault signal to the negotiator thread
-        // is driven exclusively by the NCCL callback path:
+        // is driven by the NCCL callback path:
         //   nccl_ft_trigger_fault -> nccl_ft_global_fault_callback
-        //   -> trigger_fault_proposal -> local_hardware_fault_dev_
+        //   -> trigger_fault_proposal -> local_hardware_fault_mask_ (fetch_or)
         //
-        // Writing local_hardware_fault_dev_ here a second time would race with
-        // the callback path and could produce a second PROPOSE with a different
-        // target_op, confusing the 2PC protocol. This path only clears the
-        // exception and removes the poisoned work item.
-        //
-        // Fallback: if the NCCL callback path is broken (e.g. callback not yet
-        // registered on first collective), local_hardware_fault_dev_ may still
-        // be -1 here. In that case, write the fault signal so the negotiator
-        // thread can still start the proposal.
+        // Fallback: if the NCCL callback path is not yet registered, the
+        // Watchdog also writes to local_hardware_fault_mask_ via fetch_or so
+        // the negotiator can still start the proposal. Both paths are safe to
+        // call concurrently because fetch_or is atomic.
         if (!pg_->ft_disabled_) {
           int device_idx = work.device_.index() % pg_->localDeviceCount_;
           LOG(WARNING) << pg_->logPrefix()
@@ -2556,12 +2551,13 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
             }
           }
 
-          // Only write the fault signal if the callback hasn't already done so
-          // (avoids racing with the callback path and producing duplicate
-          // PROPOSEs with different target_op values).
-          int expected = -1;
-          pg_->local_hardware_fault_dev_.compare_exchange_strong(
-              expected, device_idx, std::memory_order_release);
+          // [NCCL-FT Bug 12 fix] Use fetch_or so this Watchdog fallback never
+          // races with the NCCL callback path.  Both may fire concurrently
+          // (callback for the send comm, Watchdog for the recv comm of the same
+          // NIC), and both should be recorded.  fetch_or is idempotent for
+          // the same bit, so double-writes for the same device are harmless.
+          pg_->local_hardware_fault_mask_.fetch_or(
+              1ULL << device_idx, std::memory_order_release);
           // Clear the exception on the work object so wait() does not rethrow.
           work.setException(nullptr);
           // Erase poisoned work so the watchdog loop does not stall.
@@ -4349,23 +4345,26 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
 // Called from the NCCL fault callback (NCCL progress thread) or the Watchdog.
 // Must return in microseconds — no TCPStore, no locks, only atomic writes.
 void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
-    // Use CAS so that if the callback fires twice (send + recv comms) for the
-    // same device, only the first write wins. The negotiator thread clears this
-    // back to -1 after it relays the proposal.
-    int expected = -1;
-    this->local_hardware_fault_dev_.compare_exchange_strong(
-        expected, dev_idx, std::memory_order_release);
+    // [NCCL-FT Bug 12 fix] Use fetch_or on a bitmask instead of CAS on a
+    // single int.  When multiple NICs fault simultaneously (or the callback
+    // fires twice for the same device on send+recv comms), every bit is
+    // recorded atomically and nothing is silently dropped.
+    this->local_hardware_fault_mask_.fetch_or(
+        1ULL << dev_idx, std::memory_order_release);
 
     // [NCCL-FT] Sub-Task 4: snapshot the current shadow_seq so the negotiator
-    // can include it in the PROPOSE message. Reading shadow_seq_ without a lock
-    // is safe here: we are on the NCCL progress thread, the main thread is
-    // blocked (the AllReduce just failed), and the Watchdog has not yet written
-    // shadow_restore_pending_. There is no concurrent writer at this instant.
-    this->pending_shadow_seq_.store(
-        this->shadow_seq_, std::memory_order_release);
+    // can include it in the PROPOSE message. Only write when the sentinel is
+    // still UINT64_MAX — if two NICs fault back-to-back, the first snapshot
+    // is the correct one (oldest checkpoint is safest for replay).
+    uint64_t sentinel = UINT64_MAX;
+    this->pending_shadow_seq_.compare_exchange_strong(
+        sentinel, this->shadow_seq_, std::memory_order_release);
 
     LOG(INFO) << logPrefix()
               << "[NCCL-FT] 瞬間攔截本地網卡故障，標記 dev_idx: " << dev_idx
+              << " mask=0x" << std::hex
+              << this->local_hardware_fault_mask_.load(std::memory_order_relaxed)
+              << std::dec
               << " pending_shadow_seq=" << this->shadow_seq_;
 }
 
@@ -4389,53 +4388,47 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
             try {
                 // =========================================================
                 // Task 1: Relay Write
-                // If the watchdog (or NCCL callback) signalled a local NIC
-                // fault via local_hardware_fault_dev_, write a PROPOSE entry
-                // to TCPStore on behalf of the main thread so that all ranks
-                // see it.
+                // If the watchdog (or NCCL callback) signalled one or more
+                // local NIC faults via local_hardware_fault_mask_, write a
+                // PROPOSE entry to TCPStore so all ranks see it.
+                //
+                // [NCCL-FT Bug 12 fix] exchange(0) atomically drains the
+                // entire bitmask in one operation.  Any new bits set by a
+                // concurrent callback after this exchange will be picked up
+                // in the next negotiator loop iteration (the next fault round
+                // starts a fresh 2PC anyway).
                 // =========================================================
-                int failed_dev = this->local_hardware_fault_dev_.load(
-                    std::memory_order_acquire);
-                if (failed_dev != -1) {
+                uint64_t fault_mask = this->local_hardware_fault_mask_.exchange(
+                    0, std::memory_order_acquire);
+                if (fault_mask != 0) {
                     // [NCCL-FT Bug 4+5 fix] Use pgStatus_->lastEnqueuedSeq
                     // instead of seqCollective_ (plain uint64_t — reading it
                     // from a side-car thread is a data race).
-                    // lastEnqueuedSeq is int64_t (non-atomic), but it is only
-                    // written by the main thread under workMetaList_ lock, and
-                    // we read it here with a plain load which is safe on x86/ARM
-                    // for 64-bit aligned values (torn reads cannot happen).
-                    // target_op = lastEnqueuedSeq + 1: the very next op the main
-                    // thread will try to execute is the barrier point. +10 caused
-                    // a permanent deadlock because the main thread could never
-                    // advance 10 more ops while holding the 2PC gate closed.
+                    // target_op = lastEnqueuedSeq + 1: the very next op the
+                    // main thread will try to execute is the barrier point.
                     uint64_t target_op = static_cast<uint64_t>(
                         this->pgStatus_->lastEnqueuedSeq) + 1;
                     int my_node_id = this->rank_ / this->localDeviceCount_;
-                    // Protocol: "PROPOSE:<target_op>:<node_id>:<dev_idx>:<shadow_seq>"
-                    // dev_idx is the newly detected fault. shadow_seq is the
-                    // checkpoint sequence number captured at fault time so all
-                    // ranks can agree on which op to replay.
-                    uint64_t my_shadow_seq =
-                        this->pending_shadow_seq_.load(std::memory_order_acquire);
                     // [NCCL-FT Bug 9 fix] UINT64_MAX is the sentinel for
                     // "pending_shadow_seq_ not yet set by trigger_fault_proposal".
-                    // If it is still UINT64_MAX here, use 0 as a safe fallback
-                    // (training has not advanced far enough to checkpoint anything
-                    // meaningful). The negotiator will later take the min across
-                    // all ranks.
+                    uint64_t my_shadow_seq =
+                        this->pending_shadow_seq_.load(std::memory_order_acquire);
                     if (my_shadow_seq == UINT64_MAX) {
                         my_shadow_seq = 0;
                     }
-                    std::string proposal =
-                        "PROPOSE:" + std::to_string(target_op) +
-                        ":" + std::to_string(my_node_id) +
-                        ":" + std::to_string(failed_dev) +
-                        ":" + std::to_string(my_shadow_seq);
+                    // Protocol:
+                    //   "PROPOSE:<target_op>:<node_id>:<dev_mask_hex>:<shadow_seq>"
+                    // dev_mask_hex is a hexadecimal bitmask of all simultaneously
+                    // faulted local device indices (e.g. "0x6" = NIC 1 and NIC 2).
+                    // All receivers expand the bitmask into faulty_local_devs_.
+                    std::ostringstream oss;
+                    oss << "PROPOSE:" << target_op
+                        << ":" << my_node_id
+                        << ":0x" << std::hex << fault_mask << std::dec
+                        << ":" << my_shadow_seq;
+                    std::string proposal = oss.str();
                     std::vector<uint8_t> vec(proposal.begin(), proposal.end());
                     this->globalStore_->set("NCCL_FT_EVENT", vec);
-                    // Clear pending signal only after TCPStore write succeeds.
-                    this->local_hardware_fault_dev_.store(
-                        -1, std::memory_order_release);
                     LOG(INFO) << logPrefix()
                               << "[NCCL-FT] Side-car relayed proposal to "
                               << "TCPStore: " << proposal;
@@ -4463,32 +4456,38 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                     std::string event_str(vec.begin(), vec.end());
 
                     if (event_str.rfind("PROPOSE:", 0) == 0) {
-                        uint64_t target_op, proposal_shadow_seq;
-                        int failed_node, f_dev;
-                        if (sscanf(event_str.c_str(), "PROPOSE:%lu:%d:%d:%lu",
-                                   &target_op, &failed_node, &f_dev,
+                        uint64_t target_op, proposal_shadow_seq, f_mask;
+                        int failed_node;
+                        // Parse: "PROPOSE:<target_op>:<node_id>:0x<mask>:<shadow_seq>"
+                        // sscanf %lx reads the leading "0x" prefix correctly.
+                        if (sscanf(event_str.c_str(), "PROPOSE:%lu:%d:%lx:%lu",
+                                   &target_op, &failed_node, &f_mask,
                                    &proposal_shadow_seq) == 4 &&
                             target_op != last_handled_target_op) {
-                        last_handled_target_op = target_op;
+                            last_handled_target_op = target_op;
 
                             LOG(ERROR) << logPrefix()
                                        << "[NCCL-FT-TRACE] Side-car intercepted "
                                        << "proposal; fence OP=" << target_op;
                             LOG(INFO) << logPrefix()
                                       << "[NCCL-FT] Node " << failed_node
-                                      << " NIC " << f_dev
+                                      << " NIC mask=0x" << std::hex << f_mask
+                                      << std::dec
                                       << " fault; fence OP=" << target_op;
 
                             // Phase 1: set local fence so main thread stops,
-                            // and accumulate the new faulty device into the
-                            // persistent set. The set grows monotonically so
-                            // previous faults are never forgotten.
+                            // and expand the bitmask into the persistent faulty
+                            // set.  Every set bit becomes a faulty local device.
                             this->do_not_cross_op_.store(
                                 target_op, std::memory_order_release);
                             {
                                 std::lock_guard<std::mutex> lk(
                                     this->faulty_devs_mutex_);
-                                this->faulty_local_devs_.insert(f_dev);
+                                for (int b = 0; b < 64; ++b) {
+                                    if (f_mask & (1ULL << b)) {
+                                        this->faulty_local_devs_.insert(b);
+                                    }
+                                }
                             }
 
                             // Write this rank's ACK alongside its shadow_seq.

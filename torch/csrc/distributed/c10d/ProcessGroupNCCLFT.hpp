@@ -1081,10 +1081,13 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   bool ft_disabled_ = false;
 
   // Pending fault signal from NCCL callback / Watchdog.
-  // -1: no pending fault. >= 0: local device index of the newly faulted NIC.
-  // Written by the callback/watchdog, cleared by the negotiator thread after
-  // it relays the proposal to TCPStore.
-  std::atomic<int> local_hardware_fault_dev_{-1};
+  // Bitmask: bit i is set when local device i has a pending NIC fault.
+  // 0 means no pending fault.
+  // Written via fetch_or by the callback/watchdog; cleared by the negotiator
+  // thread via exchange(0) after it relays the proposal to TCPStore.
+  // Using a bitmask (instead of a single int) allows multiple NICs to fault
+  // simultaneously without any write silently losing to a failed CAS.
+  std::atomic<uint64_t> local_hardware_fault_mask_{0};
 
   // Persistent set of all local device indices confirmed as faulty by 2PC.
   // Grows monotonically; never shrinks. Protected by faulty_devs_mutex_.
