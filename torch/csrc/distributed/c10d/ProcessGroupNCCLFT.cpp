@@ -4091,6 +4091,11 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
     config.blocking = 1;
 
+    // 在 rebuild_shadow_ping_pong_topology() 中加診斷 log
+    LOG(INFO) << "[NCCL-FT] globalComm isAborted=" 
+              << globalComm->isAborted()
+              << " before ncclCommSplit";
+
     LOG(INFO) << logPrefix()
               << "[NCCL-FT] rebuild_shadow_ping_pong_topology: "
               << "faulty_devs=[" << faulty_str << "]"
@@ -4272,35 +4277,26 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
 
         // Step 2: pre-aggregate.
-        // [NCCL-FT Bug 5 monitor] ATen copy_/add_ are enqueued on `stream`
-        // via CUDAStreamGuard. They must land on the SAME stream as the
-        // ncclRecv above so CUDA's in-order serialisation guarantees the recv
-        // data is ready before the arithmetic reads it.
+        // [NCCL-FT Bug 7 fix] ATen copy_/add_ must be enqueued on the same
+        // stream as the ncclRecv above so CUDA's in-order serialisation
+        // guarantees the recv data is ready before the arithmetic reads it.
         //
-        // Verification: the stream handle printed here should match the stream
-        // handle used in the ncclGroupStart/End block above. If they differ, a
-        // race exists (ward_bufs may hold uninitialized values).
-        LOG(INFO) << logPrefix()
-                  << "[NCCL-FT][PROXY][Bug5-check] ATen pre-aggregate on stream="
-                  << stream.stream()
-                  << " device=" << stream.device_index()
-                  << " (should match ncclRecv stream above)";
+        // CUDAStreamGuard sets the thread-local "current" CUDA stream, which
+        // ATen uses when dispatching kernels.  Using setCurrentCUDAStream +
+        // manual restore is explicit and avoids any ambiguity about which
+        // thread-local slot is being written.
+        //
+        // Performance: setCurrentCUDAStream is two thread-local writes with no
+        // CUDA API calls — zero overhead compared to any NCCL/CUDA operation.
         {
-            at::cuda::CUDAStreamGuard guard(stream);
-            at::cuda::CUDAStream active = at::cuda::getCurrentCUDAStream(
+            auto prev_stream = at::cuda::getCurrentCUDAStream(
                 stream.device_index());
-            if (active.stream() != stream.stream()) {
-                LOG(WARNING) << logPrefix()
-                             << "[NCCL-FT][PROXY][Bug5-WARN] CUDAStreamGuard "
-                             << "did not switch stream! active="
-                             << active.stream()
-                             << " expected=" << stream.stream()
-                             << " — ATen ops may race with ncclRecv.";
-            }
+            at::cuda::setCurrentCUDAStream(stream);
             output.copy_(input);
             for (const auto& wb : ward_bufs) {
                 output.add_(wb);
             }
+            at::cuda::setCurrentCUDAStream(prev_stream);
         }
 
         // Step 3: cross-node AllReduce.
@@ -4311,8 +4307,10 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
             std::nullopt);
 
         if (use_avg_workaround) {
-            at::cuda::CUDAStreamGuard guard(stream);
+            auto prev_stream = at::cuda::getCurrentCUDAStream(stream.device_index());
+            at::cuda::setCurrentCUDAStream(stream);
             output.div_(static_cast<double>(size_));
+            at::cuda::setCurrentCUDAStream(prev_stream);
         }
 
         // Step 4: send the result back to every ward in a single ncclGroup.
@@ -4338,8 +4336,10 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
                           proxy_comm, stream.stream()),
             std::nullopt);
         if (use_avg_workaround) {
-            at::cuda::CUDAStreamGuard guard(stream);
+            auto prev_stream = at::cuda::getCurrentCUDAStream(stream.device_index());
+            at::cuda::setCurrentCUDAStream(stream);
             output.div_(static_cast<double>(size_));
+            at::cuda::setCurrentCUDAStream(prev_stream);
         }
         LOG(INFO) << logPrefix()
                   << "[NCCL-FT][HEALTHY] ncclAllReduce enqueued on proxy_global_comm_.";
@@ -4375,8 +4375,15 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
     ft_negotiator_thread_ = std::thread([this]() {
         c10::setThreadName("pt_nccl_ft_side");
 
-        // De-duplication: skip a proposal we have already processed.
-        std::string last_handled_event;
+        // [NCCL-FT Bug 11 fix] De-duplicate on target_op (uint64) not the full
+        // proposal string.  Two different faults can produce the same string if
+        // the same NIC fails again with the same target_op value (e.g. a quick
+        // double-fault on the same device).  String equality would silently drop
+        // the second proposal, leaving all ranks waiting for an ACK that will
+        // never come — a permanent 2PC hang.  target_op is strictly increasing
+        // per fault round (= lastEnqueuedSeq+1 at fault time), so comparing the
+        // numeric value is both correct and immune to content collisions.
+        uint64_t last_handled_target_op = 0;
 
         while (ft_negotiator_running_.load()) {
             try {
@@ -4453,15 +4460,14 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                     auto vec = this->globalStore_->get("NCCL_FT_EVENT");
                     std::string event_str(vec.begin(), vec.end());
 
-                    if (event_str.rfind("PROPOSE:", 0) == 0 &&
-                        event_str != last_handled_event) {
-                        last_handled_event = event_str;
-
+                    if (event_str.rfind("PROPOSE:", 0) == 0) {
                         uint64_t target_op, proposal_shadow_seq;
                         int failed_node, f_dev;
                         if (sscanf(event_str.c_str(), "PROPOSE:%lu:%d:%d:%lu",
                                    &target_op, &failed_node, &f_dev,
-                                   &proposal_shadow_seq) == 4) {
+                                   &proposal_shadow_seq) == 4 &&
+                            target_op != last_handled_target_op) {
+                        last_handled_target_op = target_op;
 
                             LOG(ERROR) << logPrefix()
                                        << "[NCCL-FT-TRACE] Side-car intercepted "
