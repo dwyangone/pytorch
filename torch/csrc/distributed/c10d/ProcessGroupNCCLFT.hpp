@@ -1169,7 +1169,11 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
 
   // shadow_seq_ captured at the moment trigger_fault_proposal fires.
   // Read by the negotiator thread to include in the PROPOSE message.
-  std::atomic<uint64_t> pending_shadow_seq_{0};
+  // [NCCL-FT Bug 9 fix] Sentinel is UINT64_MAX ("not yet set"), not 0.
+  // shadow_seq_ 0 is a valid checkpoint (the very first AllReduce), so 0
+  // cannot be used as a sentinel — it would cause the negotiator to wrongly
+  // use the proposer's seq instead of this rank's own checkpoint seq.
+  std::atomic<uint64_t> pending_shadow_seq_{UINT64_MAX};
 
   // The shadow_seq value agreed by all ranks via TCPStore consensus.
   // Written by the negotiator thread after COMMIT; read by main thread at replay.

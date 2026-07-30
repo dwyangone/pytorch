@@ -2422,10 +2422,16 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
       }
 
       if (work.exception()) {
-        // set the error to the first error found
-        std::lock_guard<std::mutex> lock(pg_->errorMutex_);
-        if (pg_->error_ == ErrorType::SUCCESS) {
-          pg_->error_ = ErrorType::COMM_ERROR;
+        // [NCCL-FT Bug 1 fix] In FT mode, do NOT set COMM_ERROR here.
+        // The FT recovery branch below clears it back to SUCCESS anyway,
+        // but the brief window between this write and the clear is enough
+        // for the main thread's checkError() to see COMM_ERROR and propagate
+        // a spurious error to Python. Only set COMM_ERROR when FT is disabled.
+        if (pg_->ft_disabled_) {
+          std::lock_guard<std::mutex> lock(pg_->errorMutex_);
+          if (pg_->error_ == ErrorType::SUCCESS) {
+            pg_->error_ = ErrorType::COMM_ERROR;
+          }
         }
       }
 
@@ -4384,7 +4390,17 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                 int failed_dev = this->local_hardware_fault_dev_.load(
                     std::memory_order_acquire);
                 if (failed_dev != -1) {
-                    uint64_t target_op = this->seqCollective_ + 10;
+                    // [NCCL-FT Bug 4+5 fix] Use pgStatus_->lastEnqueuedSeq
+                    // (atomic, thread-safe) instead of seqCollective_ (plain
+                    // uint64_t — reading it from a side-car thread is a data
+                    // race). target_op = lastEnqueuedSeq + 1 means: "the very
+                    // next op the main thread will try to execute is the barrier
+                    // point". +10 caused a permanent deadlock because the main
+                    // thread would never advance 10 more ops while holding the
+                    // 2PC gate closed.
+                    uint64_t target_op = static_cast<uint64_t>(
+                        this->pgStatus_->lastEnqueuedSeq.load(
+                            std::memory_order_acquire)) + 1;
                     int my_node_id = this->rank_ / this->localDeviceCount_;
                     // Protocol: "PROPOSE:<target_op>:<node_id>:<dev_idx>:<shadow_seq>"
                     // dev_idx is the newly detected fault. shadow_seq is the
@@ -4392,6 +4408,15 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                     // ranks can agree on which op to replay.
                     uint64_t my_shadow_seq =
                         this->pending_shadow_seq_.load(std::memory_order_acquire);
+                    // [NCCL-FT Bug 9 fix] UINT64_MAX is the sentinel for
+                    // "pending_shadow_seq_ not yet set by trigger_fault_proposal".
+                    // If it is still UINT64_MAX here, use 0 as a safe fallback
+                    // (training has not advanced far enough to checkpoint anything
+                    // meaningful). The negotiator will later take the min across
+                    // all ranks.
+                    if (my_shadow_seq == UINT64_MAX) {
+                        my_shadow_seq = 0;
+                    }
                     std::string proposal =
                         "PROPOSE:" + std::to_string(target_op) +
                         ":" + std::to_string(my_node_id) +
@@ -4478,9 +4503,13 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                             // Use our own pending_shadow_seq_ if we have one
                             // (this rank may also be the faulty rank), otherwise
                             // fall back to the proposer's value from the message.
+                            // [NCCL-FT Bug 9 fix] sentinel is UINT64_MAX, not 0.
+                            // Using 0 as sentinel was wrong because seq 0 is a valid
+                            // checkpoint (first op failure). UINT64_MAX means "this
+                            // rank has not set pending_shadow_seq_ yet".
                             uint64_t my_ss = this->pending_shadow_seq_.load(
                                 std::memory_order_acquire);
-                            if (my_ss == 0) {
+                            if (my_ss == UINT64_MAX) {
                                 my_ss = proposal_shadow_seq;
                             }
                             std::string ss_key =
@@ -4604,10 +4633,15 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
 
                             this->final_commit_op_.store(
                                 target_op, std::memory_order_release);
+                            // [NCCL-FT Bug 9 fix] Reset pending_shadow_seq_ to
+                            // sentinel so the next fault round starts clean.
+                            this->pending_shadow_seq_.store(
+                                UINT64_MAX, std::memory_order_release);
                             LOG(INFO) << logPrefix()
                                       << "[NCCL-FT] final_commit_op_ set to "
                                       << target_op
-                                      << "; main thread will proceed.";
+                                      << "; main thread will proceed. "
+                                      << "pending_shadow_seq_ reset to sentinel.";
                         }
                         // Anti-spam sleep after processing a new proposal.
                         std::this_thread::sleep_for(
@@ -4779,33 +4813,26 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
     work->ncclStartEvent_->record(ncclStream);
   }
 
-  // [NCCL-FT] Sub-Task 3 (event-wait): if the Watchdog enqueued a shadow
-  // restore on the previous fault, wait for it to complete before we issue
-  // the pre lambda (which would overwrite shadow_buf_ with the new checkpoint)
-  // or the replay AllReduce (which reads the restored tensor).
-  //
-  // shadow_restore_event_.block(stream) inserts a GPU-side dependency: the
-  // stream will not start any new work until the restore copy recorded by
-  // shadow_restore_event_ has finished. This is a zero-CPU-overhead fence.
-  if (!ft_disabled_) {
-      bool pending;
-      {
-          std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
-          pending = shadow_restore_pending_;
-      }
-      if (pending) {
-          shadow_restore_event_.block(ncclStream);
-          std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
-          shadow_restore_pending_ = false;
-          LOG(INFO) << logPrefix()
-                    << "[NCCL-FT] shadow_restore_event_ waited on ncclStream.";
-      }
-  }
-
-  pre(ncclStream, work);
-
   /* ===================================================================== */
   /* --- [NCCL-FT: 條件式防死結煞車與拓撲切換] --- */
+  // [NCCL-FT Bug 2 fix] The 2PC barrier check MUST come before pre().
+  //
+  // pre() for AllReduce is the shadow_pre lambda: it checkpoints the current
+  // tensor into shadow_buf_ and records shadow_seq_. If a fault happened on
+  // the previous op, the Watchdog already restored shadow_buf_ to the clean
+  // pre-fault gradient and set shadow_replay_pending_=true. If we call pre()
+  // first, shadow_pre will overwrite that restored checkpoint with the tensor
+  // in its current (possibly partially-modified) state — corrupting the replay
+  // input. The shadow_pre lambda already has a guard (shadow_replay_pending_)
+  // to skip the checkpoint in that case, but the guard is only correct if
+  // the 2PC barrier has already run (because shadow_replay_pending_ is set by
+  // the Watchdog which runs concurrently with the main thread up to the barrier).
+  //
+  // Correct order:
+  //   1. shadow_restore_event_ wait (GPU-side fence — stream ordering)
+  //   2. 2PC barrier spin (CPU — ensures topology is rebuilt before replay)
+  //   3. pre(ncclStream, work)  ← shadow_pre skips if replay_pending
+  //   4. fn() or shadow replay
   uint64_t current_op = this->seqCollective_;
   uint64_t boundary = this->do_not_cross_op_.load(std::memory_order_relaxed);
 
@@ -4861,6 +4888,35 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
       this->final_commit_op_.store(0, std::memory_order_release);
   }
   /* ===================================================================== */
+
+  // [NCCL-FT] Sub-Task 3 (event-wait): wait for the Watchdog's shadow restore
+  // copy to complete on the GPU before the pre lambda checkpoints the tensor
+  // (which might now hold the restored clean gradient).
+  //
+  // This wait is placed AFTER the 2PC barrier (not before) because:
+  //   - The Watchdog records shadow_restore_event_ only after clearing the
+  //     poisoned work, which happens before the negotiator sets final_commit_op_.
+  //   - By the time the main thread exits the 2PC spin-wait, the restore copy
+  //     is already enqueued (the Watchdog ran first). We just need the GPU-side
+  //     fence before the stream executes the next kernel.
+  //   - Moving the wait here (after barrier, before pre) ensures the sequence:
+  //     [restore copy] → [barrier] → [wait] → [pre lambda / replay AllReduce]
+  if (!ft_disabled_) {
+      bool pending;
+      {
+          std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+          pending = shadow_restore_pending_;
+      }
+      if (pending) {
+          shadow_restore_event_.block(ncclStream);
+          std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+          shadow_restore_pending_ = false;
+          LOG(INFO) << logPrefix()
+                    << "[NCCL-FT] shadow_restore_event_ waited on ncclStream.";
+      }
+  }
+
+  pre(ncclStream, work);
 
   ncclComm_t comm = ncclComm->getNcclComm();
 
@@ -4970,7 +5026,50 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   if (!coalescing_state_) {
     work->ncclEndEvent_->record(ncclStream);
   }
-  work->ncclComm_ = ncclComm;
+
+  // [NCCL-FT Bug 10 fix] In degraded/replay mode, work->ncclComm_ must point
+  // to the communicator that is actually used for this op, NOT the original
+  // (broken) global comm.
+  //
+  // The Watchdog calls work.checkAndSetException() which internally queries
+  // ncclCommGetAsyncError() on work->ncclComm_. If ncclComm_ points to the
+  // original comm that reported ncclRemoteError, every subsequent Watchdog
+  // cycle will see an error and re-enter the FT path for this already-handled
+  // work — or, worse, trip the abort path if ft_disabled_ races.
+  //
+  // Correct mapping:
+  //   - Shadow replay / degraded ALLREDUCE (faulty rank): local_nvlink_comm_
+  //     (the faulty rank only communicates via NVLink in execute_shadow_allreduce)
+  //   - Shadow replay / degraded ALLREDUCE (proxy/healthy rank): proxy_global_comm_
+  //     (both NVLink sends and the cross-node AllReduce are enqueued on this stream)
+  //   - Non-AllReduce degraded ops: original ncclComm (fall-back path)
+  //   - Normal (non-degraded) ops: original ncclComm
+  if (ran_shadow_replay || (C10_UNLIKELY(this->is_degraded_) && opType == OpType::ALLREDUCE)) {
+    int local_rank_for_comm = rank_ % localDeviceCount_;
+    std::unordered_set<int> snap;
+    {
+      std::lock_guard<std::mutex> lk(faulty_devs_mutex_);
+      snap = faulty_local_devs_;
+    }
+    bool is_faulty_rank = (snap.count(local_rank_for_comm) > 0);
+    if (is_faulty_rank && local_nvlink_comm_ != nullptr) {
+      work->ncclComm_ = local_nvlink_comm_;
+      LOG(INFO) << logPrefix()
+                << "[NCCL-FT] Bug10: work->ncclComm_ -> local_nvlink_comm_ (faulty rank)";
+    } else if (!is_faulty_rank && proxy_global_comm_ != nullptr) {
+      work->ncclComm_ = proxy_global_comm_;
+      LOG(INFO) << logPrefix()
+                << "[NCCL-FT] Bug10: work->ncclComm_ -> proxy_global_comm_ (proxy/healthy rank)";
+    } else {
+      // Fallback: keep original comm (should not normally happen)
+      work->ncclComm_ = ncclComm;
+      LOG(WARNING) << logPrefix()
+                   << "[NCCL-FT] Bug10: degraded path but expected comm is null; "
+                   << "falling back to original comm for work seq=" << work->seq_;
+    }
+  } else {
+    work->ncclComm_ = ncclComm;
+  }
 
   {
     c10::cuda::CUDAMultiStreamGuard streamGuard(ncclStream);
@@ -5738,7 +5837,15 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce(
   }
   check_gpu_single_tensor(tensor);
 
-  if (opts.reduceOp == ReduceOp::SUM) {
+  // [NCCL-FT Bug 6 fix] Skip the intraNodeComm fast-path in degraded mode.
+  // intraNodeComm_->allReduce() returns an IntraNodeCommWork that bypasses:
+  //   - allreduce_impl() and its shadow buffer checkpoint
+  //   - the degraded-path branch in collective()
+  //   - execute_shadow_allreduce()
+  // After a NIC fault and topology rebuild, this would silently produce wrong
+  // results (or crash) because intraNodeComm_ still uses the pre-fault topology.
+  // In degraded mode (is_degraded_=true), always fall through to allreduce_impl.
+  if (opts.reduceOp == ReduceOp::SUM && !is_degraded_) {
     using namespace intra_node_comm;
     if (intraNodeComm_ == nullptr && IntraNodeComm::isEnabled()) {
       intraNodeComm_ = initIntraNodeComm();
