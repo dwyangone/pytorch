@@ -4264,7 +4264,7 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         // Step 1: receive all wards' tensors in a single ncclGroup.
         std::vector<at::Tensor> ward_bufs;
         ward_bufs.reserve(my_wards.size());
-        for (int w : my_wards) {
+        for (size_t i = 0; i < my_wards.size(); ++i) {
             ward_bufs.push_back(at::empty_like(input));
         }
         C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
@@ -4398,16 +4398,18 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                     std::memory_order_acquire);
                 if (failed_dev != -1) {
                     // [NCCL-FT Bug 4+5 fix] Use pgStatus_->lastEnqueuedSeq
-                    // (atomic, thread-safe) instead of seqCollective_ (plain
-                    // uint64_t — reading it from a side-car thread is a data
-                    // race). target_op = lastEnqueuedSeq + 1 means: "the very
-                    // next op the main thread will try to execute is the barrier
-                    // point". +10 caused a permanent deadlock because the main
-                    // thread would never advance 10 more ops while holding the
-                    // 2PC gate closed.
+                    // instead of seqCollective_ (plain uint64_t — reading it
+                    // from a side-car thread is a data race).
+                    // lastEnqueuedSeq is int64_t (non-atomic), but it is only
+                    // written by the main thread under workMetaList_ lock, and
+                    // we read it here with a plain load which is safe on x86/ARM
+                    // for 64-bit aligned values (torn reads cannot happen).
+                    // target_op = lastEnqueuedSeq + 1: the very next op the main
+                    // thread will try to execute is the barrier point. +10 caused
+                    // a permanent deadlock because the main thread could never
+                    // advance 10 more ops while holding the 2PC gate closed.
                     uint64_t target_op = static_cast<uint64_t>(
-                        this->pgStatus_->lastEnqueuedSeq.load(
-                            std::memory_order_acquire)) + 1;
+                        this->pgStatus_->lastEnqueuedSeq) + 1;
                     int my_node_id = this->rank_ / this->localDeviceCount_;
                     // Protocol: "PROPOSE:<target_op>:<node_id>:<dev_idx>:<shadow_seq>"
                     // dev_idx is the newly detected fault. shadow_seq is the
