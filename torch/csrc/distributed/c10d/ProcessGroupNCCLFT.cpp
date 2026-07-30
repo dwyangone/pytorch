@@ -2500,28 +2500,53 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
           // Guard: only restore if this is an AllReduce work AND the seq
           // matches the checkpoint seq (prevents restoring for the wrong op
           // if two faults fire back-to-back).
+          // [NCCL-FT] Diagnostic log for every poisoned work item cleared.
+          // When multiple ops fail in a burst (all in-flight ops on a dead
+          // comm), only the one whose seq matches shadow_seq_ gets restored.
+          // This log lets us verify that no unexpected null-outputs path is hit.
+          LOG(INFO) << pg_->logPrefix()
+                    << "[NCCL-FT] Watchdog FT detail: seq=" << work.seq_
+                    << " opType=" << static_cast<int>(work.opType_)
+                    << " shadow_seq=" << pg_->shadow_seq_
+                    << " outputs_null=" << (work.outputs_ == nullptr)
+                    << " outputs_empty="
+                    << (work.outputs_ == nullptr || work.outputs_->empty());
+
           if (work.opType_ == OpType::ALLREDUCE) {
             std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
+            // [NCCL-FT Bug A fix] Guard against nullptr work.outputs_ before
+            // dereferencing. When multiple AllReduces are in-flight and the comm
+            // fails, all of them land here. Ops that were submitted via the
+            // coalescing path or that lost their outputs ref can have a null
+            // (or empty) outputs_ shared_ptr. Dereferencing it was the cause of
+            // the SIGSEGV (signal 11) crash seen in test.log:2154.
             if (pg_->shadow_buf_.has_value() &&
-                work.seq_ == pg_->shadow_seq_) {
-              auto& outputs_ref = *work.outputs_;
-              if (!outputs_ref.empty()) {
-                at::Tensor& out = outputs_ref[0];
-                int64_t numel = out.numel();
-                // Enqueue the restore copy on the failed op's stream.
-                at::cuda::CUDAStreamGuard sg(pg_->shadow_nccl_stream_);
-                out.copy_(
-                    pg_->shadow_buf_->narrow(0, 0, numel),
-                    /*non_blocking=*/true);
-                // Record the event so the main thread can wait for the copy
-                // to complete before starting the replay AllReduce.
-                pg_->shadow_restore_event_.record(pg_->shadow_nccl_stream_);
-                pg_->shadow_restore_pending_ = true;
-                pg_->shadow_replay_pending_  = true;
-                LOG(INFO) << pg_->logPrefix()
-                          << "[NCCL-FT] Shadow restore enqueued for seq="
-                          << work.seq_ << " on stream.";
-              }
+                work.seq_ == pg_->shadow_seq_ &&
+                work.outputs_ != nullptr &&
+                !work.outputs_->empty()) {
+              at::Tensor& out = (*work.outputs_)[0];
+              int64_t numel = out.numel();
+              // Enqueue the restore copy on the failed op's stream.
+              at::cuda::CUDAStreamGuard sg(pg_->shadow_nccl_stream_);
+              out.copy_(
+                  pg_->shadow_buf_->narrow(0, 0, numel),
+                  /*non_blocking=*/true);
+              // Record the event so the main thread can wait for the copy
+              // to complete before starting the replay AllReduce.
+              pg_->shadow_restore_event_.record(pg_->shadow_nccl_stream_);
+              pg_->shadow_restore_pending_ = true;
+              pg_->shadow_replay_pending_  = true;
+              LOG(INFO) << pg_->logPrefix()
+                        << "[NCCL-FT] Shadow restore enqueued for seq="
+                        << work.seq_ << " on stream.";
+            } else if (pg_->shadow_buf_.has_value() &&
+                       work.seq_ != pg_->shadow_seq_) {
+              // Secondary failed op: seq does not match the checkpoint.
+              // No restore needed; the tensor was not yet written by this op.
+              LOG(INFO) << pg_->logPrefix()
+                        << "[NCCL-FT] Skipping shadow restore for seq="
+                        << work.seq_ << " (shadow_seq=" << pg_->shadow_seq_
+                        << "); op did not corrupt the gradient buffer.";
             }
           }
 
