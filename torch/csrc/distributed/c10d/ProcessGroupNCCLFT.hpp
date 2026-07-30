@@ -1128,24 +1128,37 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   //
   // Lifecycle:
   //   allreduce_impl (main thread):
-  //     ensure_shadow_buffer() -> shadow_buf_.copy_(tensor) in pre lambda
-  //     -> records shadow_seq_ and shadow_nccl_stream_
+  //     ensure_shadow_buffer() allocates pinned CPU buffer once.
+  //     shadow_pre lambda runs on shadow_copy_stream_ (independent of NCCL
+  //     stream) to copy GPU gradient -> pinned CPU asynchronously.
+  //     shadow_copy_event_ is recorded after the D2H copy so the Watchdog
+  //     can verify the checkpoint is complete before doing a restore.
+  //
   //   Watchdog (on fault):
-  //     restores tensor from shadow_buf_ on shadow_nccl_stream_
-  //     -> records shadow_restore_event_, sets shadow_restore_pending_
-  //        and shadow_replay_pending_
-  //   collective() (main thread, next call after barrier):
-  //     waits on shadow_restore_event_ before replay
-  //     -> calls execute_shadow_allreduce with clean tensor
+  //     waits for shadow_copy_event_ (ensures D2H finished before this fault).
+  //     enqueues H2D restore on shadow_copy_stream_: pinned CPU -> GPU output.
+  //     records shadow_restore_event_ so the main thread can fence before
+  //     starting the replay AllReduce on the NCCL stream.
+  //     sets shadow_restore_pending_ and shadow_replay_pending_.
+  //
+  //   collective() (main thread, next call after 2PC barrier):
+  //     shadow_restore_event_.block(ncclStream): inserts a stream-wait so the
+  //     NCCL stream does not start the replay AllReduce until the H2D restore
+  //     copy on shadow_copy_stream_ has completed.
+  //     calls execute_shadow_allreduce with the now-clean tensor.
+  //
+  // Performance: shadow_copy_stream_ is independent of the NCCL stream.
+  // The D2H checkpoint copy runs in parallel with ncclAllReduce on every
+  // iteration. The CPU is never blocked; GPU throughput is not reduced.
   //
   // Thread safety: shadow_buf_mutex_ protects shadow_buf_, shadow_seq_,
-  // shadow_nccl_stream_, shadow_restore_pending_, and shadow_replay_pending_.
+  // shadow_restore_pending_, and shadow_replay_pending_.
   // The two atomics (pending_shadow_seq_, committed_shadow_seq_) are written
   // by trigger_fault_proposal and the negotiator thread respectively, and
   // read by the negotiator and main threads — no mutex needed for them.
   // -----------------------------------------------------------------------
 
-  // Single contiguous GPU buffer sized to the largest tensor seen.
+  // Pinned CPU buffer sized to the largest gradient tensor seen.
   // nullopt until the first allreduce. Reallocated if a larger tensor arrives.
   std::optional<at::Tensor> shadow_buf_;
   std::mutex shadow_buf_mutex_;
@@ -1153,13 +1166,20 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // seqCollective_ value of the AllReduce whose input was last checkpointed.
   uint64_t shadow_seq_{0};
 
-  // The NCCL stream that ran the checkpointed AllReduce. Used by the Watchdog
-  // to enqueue the restore copy on the correct stream. Saved in the pre lambda.
-  at::cuda::CUDAStream shadow_nccl_stream_{
+  // Dedicated low-priority CUDA stream for shadow buffer D2H and H2D copies.
+  // Kept separate from the NCCL stream so checkpoint copies run in parallel
+  // with AllReduce and do not add latency to the normal training path.
+  at::cuda::CUDAStream shadow_copy_stream_{
       at::cuda::getStreamFromPool(/*isHighPriority=*/false)};
 
-  // CUDA event recorded by the Watchdog after the restore copy is enqueued.
-  // The main thread waits on this event before starting the replay AllReduce.
+  // Recorded on shadow_copy_stream_ immediately after each D2H checkpoint
+  // copy.  The Watchdog waits for this event before enqueuing the H2D restore,
+  // ensuring the CPU buffer holds a complete, un-torn checkpoint.
+  at::cuda::CUDAEvent shadow_copy_event_;
+
+  // Recorded on shadow_copy_stream_ after the Watchdog enqueues the H2D
+  // restore copy.  The main thread inserts a stream-wait on the NCCL stream
+  // so the replay AllReduce starts only after the restore is complete.
   at::cuda::CUDAEvent shadow_restore_event_;
 
   // Set by Watchdog when a restore has been enqueued; cleared by main thread

@@ -30,6 +30,13 @@ ProcessGroupNCCLFT 是基於 ProcessGroupNCCL 複製並擴充的自訂 backend�
 
 ---
 
+> **2025-07 更新：Shadow Buffer OOM 修復**
+> `ensure_shadow_buffer()` 改為分配 **Pinned CPU 記憶體**（非 GPU HBM）。
+> 對 `model_size_gb=16` 的訓練腳本，此修改節省 16 GiB GPU 記憶體，解決 OOM 問題。
+> Checkpoint (GPU→CPU) 和 Restore (CPU→GPU) 均使用 `cudaMemcpyAsync` via `copy_(non_blocking=true)`。
+
+---
+
 ### Bug 12 (P2): multi-NIC 同時故障時 `local_hardware_fault_dev_` 遺失後續故障
 
 **問題描述：**

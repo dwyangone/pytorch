@@ -2490,13 +2490,11 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
 
           // [NCCL-FT] Sub-Task 3: restore shadow buffer into the output tensor.
           //
-          // The restore is enqueued on the NCCL stream that the failed AllReduce
-          // ran on (shadow_nccl_stream_). After NCCL aborts an op, the stream is
-          // idle, so enqueueing here from a different CPU thread is safe — CUDA
-          // serialises concurrent CPU enqueues on the same stream internally.
-          //
-          // The main thread is blocked at the 2PC barrier spin-wait, so it is
-          // not touching the stream concurrently.
+          // The restore (H2D copy) is enqueued on shadow_copy_stream_.
+          // shadow_copy_event_.synchronize() is called first to ensure the
+          // D2H checkpoint copy has fully completed and the CPU buffer is safe
+          // to read.  The main thread is blocked at the 2PC barrier spin-wait,
+          // so shadow_copy_stream_ is not being written concurrently.
           //
           // Guard: only restore if this is an AllReduce work AND the seq
           // matches the checkpoint seq (prevents restoring for the wrong op
@@ -2527,14 +2525,28 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
                 !work.outputs_->empty()) {
               at::Tensor& out = (*work.outputs_)[0];
               int64_t numel = out.numel();
-              // Enqueue the restore copy on the failed op's stream.
-              at::cuda::CUDAStreamGuard sg(pg_->shadow_nccl_stream_);
-              out.copy_(
-                  pg_->shadow_buf_->narrow(0, 0, numel),
-                  /*non_blocking=*/true);
-              // Record the event so the main thread can wait for the copy
-              // to complete before starting the replay AllReduce.
-              pg_->shadow_restore_event_.record(pg_->shadow_nccl_stream_);
+              // Before trusting the CPU buffer, ensure the D2H checkpoint
+              // copy that ran on shadow_copy_stream_ has fully completed.
+              // shadow_copy_event_ was recorded by shadow_pre immediately
+              // after the copy; synchronizing here on the CPU is safe because
+              // the Watchdog is a background thread — it does not block the
+              // main training thread.
+              pg_->shadow_copy_event_.synchronize();
+              // Enqueue H2D restore (pinned CPU -> GPU) on shadow_copy_stream_.
+              // Using the same stream as the D2H copy avoids introducing a
+              // second stream into the picture and keeps the ordering simple.
+              // shadow_restore_event_ is recorded after so the main thread
+              // can insert a stream-wait on the NCCL stream before replay.
+              {
+                auto prev = at::cuda::getCurrentCUDAStream(
+                    pg_->shadow_copy_stream_.device_index());
+                at::cuda::setCurrentCUDAStream(pg_->shadow_copy_stream_);
+                out.copy_(
+                    pg_->shadow_buf_->narrow(0, 0, numel),
+                    /*non_blocking=*/true);
+                pg_->shadow_restore_event_.record(pg_->shadow_copy_stream_);
+                at::cuda::setCurrentCUDAStream(prev);
+              }
               pg_->shadow_restore_pending_ = true;
               pg_->shadow_replay_pending_  = true;
               LOG(INFO) << pg_->logPrefix()
@@ -4915,11 +4927,18 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
           pending = shadow_restore_pending_;
       }
       if (pending) {
+          // Insert a GPU-side stream-wait: the NCCL stream will not advance
+          // past this point until shadow_restore_event_ (recorded on
+          // shadow_copy_stream_ after the H2D restore copy) is signalled.
+          // This is a pure GPU fence — no CPU blocking — so the main thread
+          // returns immediately and CUDA enforces the ordering at execution
+          // time.
           shadow_restore_event_.block(ncclStream);
           std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
           shadow_restore_pending_ = false;
           LOG(INFO) << logPrefix()
-                    << "[NCCL-FT] shadow_restore_event_ waited on ncclStream.";
+                    << "[NCCL-FT] NCCL stream fenced on shadow_restore_event_ "
+                    << "(H2D restore must complete before replay AllReduce).";
       }
   }
 
@@ -5745,10 +5764,31 @@ void ProcessGroupNCCLFT::ensure_shadow_buffer(const at::Tensor& t) {
     // Caller must hold shadow_buf_mutex_ or be on the single main thread
     // path where no concurrent writer exists yet (before first pre lambda).
     if (!shadow_buf_.has_value() || t.numel() > shadow_buf_->numel()) {
-        shadow_buf_ = at::empty({t.numel()}, t.options());
+        // Allocate shadow_buf_ in PINNED CPU memory, not GPU memory.
+        //
+        // Rationale: the shadow buffer checkpoints the pre-AllReduce gradient
+        // tensor so it can be restored if a NIC fault aborts the op mid-way.
+        // During normal (fault-free) training it sits idle.  Allocating it on
+        // the GPU wastes precious HBM and pushes large-model workloads into OOM
+        // (for a 16 GiB gradient this adds a full 16 GiB of permanent GPU
+        // overhead).
+        //
+        // Pinned (page-locked) CPU memory allows cudaMemcpyAsync H2D at close
+        // to PCIe peak bandwidth (~25-50 GB/s on modern systems), which is fast
+        // enough for a fault-recovery restore that happens at most once per NIC
+        // failure.  The normal-path checkpoint (shadow_pre) copies GPU->CPU
+        // with non_blocking=true, so it runs asynchronously on the NCCL stream
+        // and does not block the forward pass.
+        //
+        // Layout: flat 1-D tensor with the same dtype as the gradient, pinned.
+        auto cpu_opts = t.options()
+                         .device(at::kCPU)
+                         .memory_format(at::MemoryFormat::Contiguous);
+        shadow_buf_ = at::empty({t.numel()}, cpu_opts).pin_memory();
         LOG(INFO) << logPrefix()
-                  << "[NCCL-FT] shadow_buf_ allocated/grown to numel="
-                  << t.numel() << " dtype=" << t.scalar_type();
+                  << "[NCCL-FT] shadow_buf_ allocated in PINNED CPU memory, numel="
+                  << t.numel() << " dtype=" << t.scalar_type()
+                  << " size_bytes=" << t.nbytes();
     }
 }
 
@@ -5767,21 +5807,20 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
       ensure_shadow_buffer(tensor);
   }
 
-  // [NCCL-FT] Sub-Task 2: pre lambda — checkpoint tensor into shadow_buf_
-  // on the NCCL stream BEFORE ncclAllReduce is enqueued.
+  // [NCCL-FT] Sub-Task 2: pre lambda — checkpoint tensor into shadow_buf_.
   //
-  // Why in pre and not here on the CPU:
-  //   The copy must be ordered on the same stream as ncclAllReduce. If we
-  //   copy here (CPU side) before collective() determines ncclStream, we
-  //   cannot guarantee the copy precedes the AllReduce on the GPU timeline.
-  //   The pre lambda receives ncclStream and is called immediately before
-  //   the fn() (ncclAllReduce), so stream ordering is guaranteed.
+  // The checkpoint runs on shadow_copy_stream_ (NOT the NCCL stream) so that
+  // the D2H copy runs in parallel with ncclAllReduce without adding any
+  // latency to the normal training path.
   //
-  // Both asyncOp=false (ncclStream == currentCUDAStream) and asyncOp=true
-  // (ncclStream == ncclStreams_[key]) are handled correctly because the pre
-  // lambda always receives the actual stream used for this AllReduce.
+  // Ordering guarantee:
+  //   backward() writes `tensor` on the default compute stream.
+  //   shadow_copy_stream_.synchronize_with(compute_stream) inserts a GPU-side
+  //   wait so the D2H copy sees fully written gradients before reading them.
+  //   shadow_copy_event_ is recorded after the copy completes so the Watchdog
+  //   can verify the CPU buffer is complete before using it for restore.
   auto shadow_pre = [this, &tensor](
-      at::cuda::CUDAStream& stream,
+      at::cuda::CUDAStream& /* nccl_stream */,
       c10::intrusive_ptr<WorkNCCLFT>& /* work */) {
     if (ft_disabled_ || !shadow_buf_.has_value()) return;
     std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
@@ -5796,11 +5835,16 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
       return;
     }
     int64_t numel = tensor.numel();
-    // narrow() gives a view of the first numel elements; safe when shadow_buf_
-    // is larger than the current tensor (auto-grown for a prior larger tensor).
+    // Wait for the compute stream to finish writing `tensor`, then copy
+    // GPU -> pinned CPU on the dedicated shadow_copy_stream_.
+    auto prev = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
+    at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
+    shadow_copy_stream_.synchronize_with(
+        at::cuda::getCurrentCUDAStream(tensor.device().index()));
     shadow_buf_->narrow(0, 0, numel).copy_(tensor, /*non_blocking=*/true);
-    shadow_seq_          = seqCollective_;  // already bumped by collective()
-    shadow_nccl_stream_  = stream;
+    shadow_copy_event_.record(shadow_copy_stream_);
+    at::cuda::setCurrentCUDAStream(prev);
+    shadow_seq_ = seqCollective_;  // already bumped by collective()
   };
 
   return collective(
