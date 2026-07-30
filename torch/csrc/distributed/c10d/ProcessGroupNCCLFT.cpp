@@ -5835,12 +5835,22 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
       return;
     }
     int64_t numel = tensor.numel();
-    // Wait for the compute stream to finish writing `tensor`, then copy
-    // GPU -> pinned CPU on the dedicated shadow_copy_stream_.
+    // Cross-stream dependency: shadow_copy_stream_ must not read `tensor`
+    // until the compute stream (which ran backward() and wrote the gradients)
+    // has finished.  The correct PyTorch idiom is:
+    //   1. Record an event on the producer stream (compute stream).
+    //   2. Call event.block(consumer_stream) to insert a cudaStreamWaitEvent
+    //      on the consumer, making it wait for the event before proceeding.
+    // This is a pure GPU-side fence — no CPU stalling.
+    at::cuda::CUDAEvent compute_done;
+    auto compute_stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
+    compute_done.record(compute_stream);
+    compute_done.block(shadow_copy_stream_);
+    // Now enqueue the D2H copy on shadow_copy_stream_.  ATen dispatches
+    // copy_(CPU_dst, CUDA_src, non_blocking=true) as cudaMemcpyAsync(D2H)
+    // on the currently set stream, so we switch temporarily.
     auto prev = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
     at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
-    shadow_copy_stream_.synchronize_with(
-        at::cuda::getCurrentCUDAStream(tensor.device().index()));
     shadow_buf_->narrow(0, 0, numel).copy_(tensor, /*non_blocking=*/true);
     shadow_copy_event_.record(shadow_copy_stream_);
     at::cuda::setCurrentCUDAStream(prev);
