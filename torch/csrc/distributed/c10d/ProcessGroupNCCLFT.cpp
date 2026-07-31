@@ -2455,18 +2455,26 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
         uint64_t commit_signal =
             pg_->final_commit_op_.load(std::memory_order_acquire);
         if (C10_UNLIKELY(commit_signal > 0)) {
-          int device_idx = work.device_.index() % pg_->localDeviceCount_;
-          LOG(WARNING) << pg_->logPrefix()
-                       << "[NCCL-FT] Watchdog early-abort: 2PC committed "
-                       << "(commit_signal=" << commit_signal
-                       << "), force-clearing work seq=" << work.seq_
-                       << " device=" << device_idx
-                       << " without waiting for timeout.";
-          std::string exceptionMsg = c10::str(
-              work.logPrefix(),
-              "FT early-abort: 2PC committed while work was in-flight.");
-          work.setException(std::make_exception_ptr(
-              C10_BUILD_ERROR(DistBackendError, exceptionMsg)));
+          uint64_t ckpt_seq =
+              pg_->committed_shadow_seq_.load(std::memory_order_acquire);
+          // Only abort work that predates or is at the checkpoint seq.
+          // work.seq_ > ckpt_seq means it was submitted after the rollback
+          // point — it is a post-fault op that must NOT be force-failed.
+          if (work.seq_ <= ckpt_seq) {
+            int device_idx = work.device_.index() % pg_->localDeviceCount_;
+            LOG(WARNING) << pg_->logPrefix()
+                         << "[NCCL-FT] Watchdog early-abort: 2PC committed "
+                         << "(commit_signal=" << commit_signal
+                         << " ckpt_seq=" << ckpt_seq
+                         << "), force-clearing work seq=" << work.seq_
+                         << " device=" << device_idx
+                         << " without waiting for timeout.";
+            std::string exceptionMsg = c10::str(
+                work.logPrefix(),
+                "FT early-abort: 2PC committed while work was in-flight.");
+            work.setException(std::make_exception_ptr(
+                C10_BUILD_ERROR(DistBackendError, exceptionMsg)));
+          }
         }
       }
 
@@ -4503,9 +4511,8 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                         uint64_t my_shadow_seq =
                             this->pending_shadow_seq_.load(
                                 std::memory_order_acquire);
-                        if (my_shadow_seq == UINT64_MAX) {
-                            my_shadow_seq = 0;
-                        }
+                        // Keep UINT64_MAX as-is; coordinator treats it as
+                        // "no checkpoint yet" and does not fold it into min().
                         // Protocol (per-rank key):
                         //   "PROPOSE:<round>:<node_id>:0x<dev_mask_hex>:<shadow_seq>"
                         // Rank 0 coordinator aggregates all per-rank keys.
@@ -4580,9 +4587,8 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                         uint64_t my_shadow_seq =
                             this->pending_shadow_seq_.load(
                                 std::memory_order_acquire);
-                        if (my_shadow_seq == UINT64_MAX) {
-                            my_shadow_seq = 0;
-                        }
+                        // Preserve UINT64_MAX sentinel so coordinator knows
+                        // this rank has no checkpoint yet.
                         std::ostringstream oss;
                         oss << "PROPOSE:" << cur_round
                             << ":" << my_node_id
@@ -4631,6 +4637,17 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                                    &p_fmask, &p_ss) == 4) {
                             agg_fault_mask |= p_fmask;
                             if (agg_failed_node < 0) agg_failed_node = p_node;
+                            // Only fold ranks that have a real checkpoint
+                            // (p_ss != UINT64_MAX means pending_shadow_seq_
+                            // was set at least once — i.e., at least one
+                            // AllReduce completed before the fault).
+                            // p_ss == UINT64_MAX means "no checkpoint yet";
+                            // including it would collapse agreed_ss to 0
+                            // (due to the UINT64_MAX sentinel value being
+                            // written literally into the PROPOSE string and
+                            // then parsed back as the raw number), causing
+                            // the replay path to attempt seq=0 on an empty
+                            // shadow buffer.
                             if (p_ss != UINT64_MAX) {
                                 agreed_ss = (agreed_ss == UINT64_MAX)
                                     ? p_ss
@@ -4668,8 +4685,11 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                 }
 
                 // ── Phase 2: rank 0 writes COMMIT; all ranks wait for it ─
+                // agreed_ss == UINT64_MAX means no rank had a checkpoint yet
+                // (fault happened before the first AllReduce completed).
+                // Write UINT64_MAX as-is; the main thread handles it in
+                // the REBUILD path as a no-replay topology rebuild.
                 if (this->rank_ == 0) {
-                    if (agreed_ss == UINT64_MAX) agreed_ss = 0;
                     std::string agreed_key =
                         "NCCL_FT_SS_AGREED_" + std::to_string(cur_round);
                     std::string agreed_val = std::to_string(agreed_ss);
@@ -4969,7 +4989,40 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
                     << " agreed_ss=" << agreed_ss
                     << " current_op=" << current_op;
 
-          if (current_op > agreed_ss + 1) {
+          // agreed_ss == UINT64_MAX means the fault happened before any
+          // AllReduce completed a shadow checkpoint.  No tensor restore is
+          // needed; just rebuild the topology and continue normally.
+          // The DRAIN/REBUILD seq arithmetic must not run in this case
+          // because agreed_ss + 1 would wrap to 0 and the DRAIN condition
+          // (current_op > 0) would be trivially true, draining all ops.
+          if (agreed_ss == UINT64_MAX) {
+              LOG(INFO) << logPrefix()
+                        << "[NCCL-FT] No checkpoint (agreed_ss=UINT64_MAX); "
+                        << "topology rebuild only, no replay.";
+              rebuild_shadow_ping_pong_topology();
+              this->is_degraded_ = true;
+              this->rollback_done_ = false; // no replay pending
+              this->ft_round_++;
+              // TCPStore cleanup
+              try {
+                  uint64_t committed_round = commit_signal - 1;
+                  std::string round_str = std::to_string(committed_round);
+                  this->globalStore_->deleteKey(
+                      "NCCL_FT_PROPOSE_" +
+                      std::to_string(this->rank_) + "_" + round_str);
+                  if (this->rank_ == 0) {
+                      this->globalStore_->deleteKey("NCCL_FT_COMMIT_" + round_str);
+                      this->globalStore_->deleteKey("NCCL_FT_SS_AGREED_" + round_str);
+                  }
+              } catch (const std::exception& e) {
+                  LOG(WARNING) << logPrefix()
+                               << "[NCCL-FT] TCPStore cleanup failed (non-fatal): "
+                               << e.what();
+              }
+              this->do_not_cross_op_.store(0, std::memory_order_release);
+              this->final_commit_op_.store(0, std::memory_order_release);
+              // Fall through to execute fn() normally on the first post-fault op.
+          } else if (current_op > agreed_ss + 1) {
               // ── DRAIN path ──────────────────────────────────────────
               // This is an op that DDP already enqueued while the NIC was
               // failing.  Do not execute it: just return a NullWork so
@@ -5001,8 +5054,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
                   work->future_->markCompleted(at::IValue(*work->outputs_));
               }
               return work;
-          }
-
+          } else {
           // ── REBUILD path (current_op == agreed_ss + 1) ──────────────
           LOG(INFO) << logPrefix()
                     << "[NCCL-FT] 抵達重播點 OP=" << current_op
@@ -5057,6 +5109,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
           // rollback_done_ is intentionally left true here.  It is reset at
           // the end of this block (after the shadow restore fence and replay)
           // so the next fault round starts with it false.  See [Step E].
+          } // end else (REBUILD path)
       }
   }
   /* ===================================================================== */
