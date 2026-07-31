@@ -2486,7 +2486,7 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
             // and erases the work — fully transparent to Python.
             at::cuda::CUDAGuard device_guard(work.device_);
             auto ncclStream = pg_->ncclStreams_.at(
-                pg_->getKeyFromDevice(work.device_));
+                getKeyFromDevice(work.device_));
             work.ncclEndEvent_->record(ncclStream);
             std::string exceptionMsg = c10::str(
                 work.logPrefix(),
@@ -2649,7 +2649,7 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
           {
             at::cuda::CUDAGuard device_guard(work.device_);
             auto ncclStream = pg_->ncclStreams_.at(
-                pg_->getKeyFromDevice(work.device_));
+                getKeyFromDevice(work.device_));
             work.ncclEndEvent_->record(ncclStream);
           }
           // Clear the exception on the work object so wait() does not rethrow.
