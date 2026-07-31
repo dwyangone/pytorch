@@ -2469,6 +2469,25 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
                          << "), force-clearing work seq=" << work.seq_
                          << " device=" << device_idx
                          << " without waiting for timeout.";
+            // Record ncclEndEvent_ NOW so that any concurrent DDP wait()
+            // call's synchronize() -> ncclEndEvent_->block() returns
+            // immediately instead of hanging forever.
+            //
+            // Why this is necessary: early-abort fires while the kernel is
+            // still in-flight (or never completed).  ncclEndEvent_ has not
+            // been recorded on the NCCL stream yet.  block() on an
+            // un-recorded event spins indefinitely.  Recording it here on
+            // the stream with no kernel after it signals the event instantly.
+            //
+            // handleException(CleanUpOnlyFT) in wait() does NOT rethrow
+            // (SHOULD_TEAR_DOWN_FT(CleanUpOnlyFT) == false), so the
+            // exception is silently dropped and Python never sees it.
+            // The next Watchdog iteration then calls setException(nullptr)
+            // and erases the work — fully transparent to Python.
+            at::cuda::CUDAGuard device_guard(work.device_);
+            auto ncclStream = pg_->ncclStreams_.at(
+                pg_->getKeyFromDevice(work.device_));
+            work.ncclEndEvent_->record(ncclStream);
             std::string exceptionMsg = c10::str(
                 work.logPrefix(),
                 "FT early-abort: 2PC committed while work was in-flight.");
@@ -2617,6 +2636,22 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
                               std::memory_order_relaxed)
                        << std::dec
                        << " (side-car should pick this up within 50ms)";
+          // Record ncclEndEvent_ before clearing the exception.
+          // If DDP's wait() is concurrently executing synchronize(), it calls
+          // ncclEndEvent_->block() which spins until the event is signalled.
+          // The failed NCCL op never completed, so the event was never recorded
+          // on the stream.  Recording it here (on an otherwise empty stream
+          // segment) signals it immediately, letting block() return.
+          // This makes the FT recovery fully transparent to Python:
+          //   wait() -> synchronize() returns instantly
+          //   wait() -> handleException(CleanUpOnlyFT) does NOT rethrow
+          //   Python never sees an exception
+          {
+            at::cuda::CUDAGuard device_guard(work.device_);
+            auto ncclStream = pg_->ncclStreams_.at(
+                pg_->getKeyFromDevice(work.device_));
+            work.ncclEndEvent_->record(ncclStream);
+          }
           // Clear the exception on the work object so wait() does not rethrow.
           work.setException(nullptr);
           // Erase poisoned work so the watchdog loop does not stall.

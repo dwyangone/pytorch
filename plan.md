@@ -298,31 +298,37 @@ LOG(INFO) << "[NCCL-FT] globalComm isAborted=" << globalComm->isAborted()
 
 ---
 
-### Gap 6（P1）：DDP 的 exception handling 路徑
+### Gap 6（已修復）：DDP 透明性 — `ncclEndEvent_->block()` hang
 
-**問題描述：**
+**問題描述（已解決）：**
 
-當 Watchdog force-fail 一個 work（`work.setException(...)`）後，
-DDP 的 `Reducer::mark_variable_ready_dense()` 最終會呼叫 `work->wait()`，
-此時 `wait()` 會 rethrow 這個 exception。
+Watchdog 清除 poisoned work 時，`ncclEndEvent_` 從未被 record（NCCL op 失敗，
+stream 沒有推進到 endEvent）。若 DDP 的 `work->wait()` 呼叫 `synchronize()` →
+`ncclEndEvent_->block(currentStream)` 時 event 尚未 record，`block()` 永久 hang。
 
-PyTorch DDP 在 rethrow exception 後的行為取決於版本和設定：
-- 新版 DDP：呼叫 `process_group_->abort()` 然後 re-raise（訓練終止）
-- 舊版 DDP：直接 re-raise（用戶的 training loop 需 try-catch）
+**修復（已套用）：**
 
-**Prototype 假設：** 用戶的 training loop 有 try-catch 保護，捕獲 exception 後
-繼續下一個 batch。若訓練 loop 在 rethrow 後終止，Shadow Ping-Pong 無法發揮作用。
+在 Watchdog 的兩個清除路徑中，都在 `setException(nullptr)` 前先 record `ncclEndEvent_`：
 
-**需要的測試配置：** 訓練腳本的 main loop 要有：
-```python
-try:
-    loss.backward()
-    optimizer.step()
-except Exception as e:
-    if "FT" in str(e) or "DistBackendError" in str(e):
-        continue  # FT handled, skip this batch
-    raise
+1. **正常故障路徑**（`if (work.exception())`，line ~2639）
+2. **Early-abort 路徑**（Fix 3，line ~2488）
+
+```cpp
+{
+    at::cuda::CUDAGuard device_guard(work.device_);
+    auto ncclStream = pg_->ncclStreams_.at(pg_->getKeyFromDevice(work.device_));
+    work.ncclEndEvent_->record(ncclStream);
+}
+work.setException(nullptr);
 ```
+
+**為什麼對 Python 完全透明（不需要 try-catch）：**
+
+1. `ncclEndEvent_->record()` 後，`synchronize()` → `block()` 立即返回
+2. `wait()` 的 `handleException(CleanUpOnlyFT)` 中，
+   `SHOULD_TEAR_DOWN_FT(CleanUpOnlyFT)` = `false` → 不 rethrow
+3. Python 從未看到任何 exception
+4. 訓練腳本無需修改
 
 ---
 
@@ -343,8 +349,8 @@ except Exception as e:
 [x] Fix 1: callback registration       — lines 4818–4841
 [x] Fix 3: Watchdog early-abort (safe) — lines 2454–2481
 [x] Gap 1: UINT64_MAX sentinel kept; no-checkpoint fast-path in REBUILD block
+[x] Gap 6: ncclEndEvent_ record before setException(nullptr) — Python-transparent
 [ ] Gap 5: 確認 ncclCommSplit on RemoteError comm          ← 待確認
-[ ] Gap 6: training loop exception 保護                    ← 待測試腳本確認
 ```
 
 ### 期望 Log 順序（故障後）
