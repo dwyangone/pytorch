@@ -2570,6 +2570,13 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
           // the same bit, so double-writes for the same device are harmless.
           pg_->local_hardware_fault_mask_.fetch_or(
               1ULL << device_idx, std::memory_order_release);
+          LOG(WARNING) << pg_->logPrefix()
+                       << "[NCCL-FT] Watchdog wrote fault bit: device="
+                       << device_idx << " new_mask=0x" << std::hex
+                       << pg_->local_hardware_fault_mask_.load(
+                              std::memory_order_relaxed)
+                       << std::dec
+                       << " (side-car should pick this up within 50ms)";
           // Clear the exception on the work object so wait() does not rethrow.
           work.setException(nullptr);
           // Erase poisoned work so the watchdog loop does not stall.
@@ -4354,9 +4361,15 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
     }
 }
 
-// Called from the NCCL fault callback (NCCL progress thread) or the Watchdog.
+// Called ONLY from the NCCL fault callback (NCCL progress thread).
 // Must return in microseconds — no TCPStore, no locks, only atomic writes.
 void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
+    // This log confirms the NCCL callback path is active.  If a fault occurs
+    // and this line never appears, the callback was not registered correctly.
+    LOG(WARNING) << logPrefix()
+                 << "[NCCL-FT-CALLBACK] !!! NCCL fault callback fired !!! "
+                 << "dev_idx=" << dev_idx;
+
     // [NCCL-FT Bug 12 fix] Use fetch_or on a bitmask instead of CAS on a
     // single int.  When multiple NICs fault simultaneously (or the callback
     // fires twice for the same device on send+recv comms), every bit is
@@ -4396,8 +4409,26 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
         // numeric value is both correct and immune to content collisions.
         uint64_t last_handled_target_op = 0;
 
+        // Heartbeat timer: emit a LOG every 5 s so we can confirm the
+        // side-car thread is alive even when no fault has occurred.
+        auto last_heartbeat = std::chrono::steady_clock::now();
+
         while (ft_negotiator_running_.load()) {
             try {
+                // Heartbeat log.
+                auto now = std::chrono::steady_clock::now();
+                if (now - last_heartbeat >= std::chrono::seconds(5)) {
+                    LOG(INFO) << logPrefix()
+                              << "[NCCL-FT] Side-car alive: fault_mask=0x"
+                              << std::hex
+                              << local_hardware_fault_mask_.load(
+                                     std::memory_order_relaxed)
+                              << std::dec
+                              << " ft_disabled=" << ft_disabled_
+                              << " is_degraded=" << is_degraded_;
+                    last_heartbeat = now;
+                }
+
                 // =========================================================
                 // Task 1: Relay Write
                 // If the watchdog (or NCCL callback) signalled one or more
@@ -4413,6 +4444,10 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                 uint64_t fault_mask = this->local_hardware_fault_mask_.exchange(
                     0, std::memory_order_acquire);
                 if (fault_mask != 0) {
+                    LOG(WARNING) << logPrefix()
+                                 << "[NCCL-FT] Side-car: drained fault_mask=0x"
+                                 << std::hex << fault_mask << std::dec
+                                 << ", building PROPOSE";
                     // [NCCL-FT Bug 4+5 fix] Use pgStatus_->lastEnqueuedSeq
                     // instead of seqCollective_ (plain uint64_t — reading it
                     // from a side-car thread is a data race).
@@ -4738,11 +4773,22 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
     // Register fault callback now that NCCL topology is stable.
     if (ft_root_comm_ == nullptr) {
       ft_root_comm_ = ncclComm;
-      ncclCommRegisterFaultCallback(
-          ncclComm->getNcclComm(), nccl_ft_global_fault_callback);
       LOG(INFO) << logPrefix()
-                << "[NCCL-FT] Fault callback registered on comm "
-                << ncclComm->repr();
+                << "[NCCL-FT] Registering fault callback on comm "
+                << ncclComm->repr()
+                << " (ncclComm_t=" << (void*)ncclComm->getNcclComm() << ")";
+      ncclResult_t reg_ret = ncclCommRegisterFaultCallback(
+          ncclComm->getNcclComm(), nccl_ft_global_fault_callback);
+      if (reg_ret != ncclSuccess) {
+        LOG(ERROR) << logPrefix()
+                   << "[NCCL-FT] ncclCommRegisterFaultCallback FAILED: "
+                   << "ret=" << reg_ret
+                   << " — fault callback NOT active, failover disabled!";
+      } else {
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT] Fault callback registered successfully on comm "
+                  << ncclComm->repr();
+      }
     }
     initLocalNvlinkComm();
   }

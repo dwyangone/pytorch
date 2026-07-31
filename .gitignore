@@ -160,6 +160,7 @@ torch/_rocm_init.py
 bob*
 nccl/
 *.html
+test.log
 
 # Editor temporaries
 *.swa
