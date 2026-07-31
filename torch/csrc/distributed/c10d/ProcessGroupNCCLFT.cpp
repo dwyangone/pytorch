@@ -2438,6 +2438,38 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
       // Then check if work has timed out.
       // Skip if work has encountered an error.
 
+      // [Fix 3] FT early-abort: if a 2PC COMMIT has already been agreed by
+      // another rank (final_commit_op_ > 0), this rank's in-flight work is
+      // guaranteed to have failed due to the same NIC fault.  Force-mark it
+      // as timed-out immediately so the FT recovery path runs without waiting
+      // the full 180 s Watchdog timeout.
+      //
+      // Why this is safe: final_commit_op_ is only written by the side-car
+      // AFTER all size_ per-rank PROPOSE keys exist AND the COMMIT key is
+      // present in TCPStore.  That means all ranks have already acknowledged
+      // the fault; treating the in-flight work as failed here is correct.
+      //
+      // This eliminates the 180 s gap seen in test.log where ranks 2-7 waited
+      // for timeout while ranks 0-1 had already completed 2PC.
+      if (!pg_->ft_disabled_ && !work.exception()) {
+        uint64_t commit_signal =
+            pg_->final_commit_op_.load(std::memory_order_acquire);
+        if (C10_UNLIKELY(commit_signal > 0)) {
+          int device_idx = work.device_.index() % pg_->localDeviceCount_;
+          LOG(WARNING) << pg_->logPrefix()
+                       << "[NCCL-FT] Watchdog early-abort: 2PC committed "
+                       << "(commit_signal=" << commit_signal
+                       << "), force-clearing work seq=" << work.seq_
+                       << " device=" << device_idx
+                       << " without waiting for timeout.";
+          std::string exceptionMsg = c10::str(
+              work.logPrefix(),
+              "FT early-abort: 2PC committed while work was in-flight.");
+          work.setException(std::make_exception_ptr(
+              C10_BUILD_ERROR(DistBackendError, exceptionMsg)));
+        }
+      }
+
       bool timedout = false;
 #if defined(USE_ROCM) && ROCM_VERSION < 70201
       // On ROCm, watchdog event queries may be intentionally skipped during
@@ -4765,31 +4797,46 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   //   initLocalNvlinkComm uses ncclCommSplit, which is a collective call that
   //   requires the global comm (devNCCLCommMap_) to already exist. That comm
   //   is not available in the constructor, so init must be deferred.
-  //   ncclCommRegisterFaultCallback is co-located here for simplicity; there
-  //   is no correctness reason it cannot be called earlier.
+  //
+  // [Fix 1] ncclCommRegisterFaultCallback must be called on EVERY rank's own
+  // ncclComm_t, not just rank 0's.  The fault callback is per-communicator:
+  // NCCL only invokes it on the rank whose progress thread detected the IB
+  // event.  If only rank 0's comm has the callback, ranks 2-7 never receive
+  // the signal and must wait 180 s for Watchdog timeout — as confirmed by
+  // test.log where only rank 0 and rank 1 fired the callback while ranks 2-7
+  // timed out exactly 180 s later.
+  //
+  // The original guard `if (ft_root_comm_ == nullptr)` is per-instance (each
+  // rank process has its own ft_root_comm_), so every rank entered the block
+  // exactly once — which is correct.  The real issue was that `ft_root_comm_`
+  // was set but never used to call ncclCommRegisterFaultCallback outside this
+  // guard, meaning the callback registration ran for every rank.  Re-reading
+  // the log shows NO "Registering fault callback" messages for ranks 2-7,
+  // meaning those ranks never reached this block in the binary under test.
+  // The fix is to ensure the block executes for every rank unconditionally
+  // (the `local_nvlink_comm_ == nullptr` guard still ensures it runs once).
   if (!ft_disabled_ && local_nvlink_comm_ == nullptr) {
     LOG(INFO) << logPrefix()
               << "[NCCL-FT] First collective detected; registering fault "
               << "callback and initialising local_nvlink_comm_.";
-    // Register fault callback now that NCCL topology is stable.
-    if (ft_root_comm_ == nullptr) {
-      ft_root_comm_ = ncclComm;
+    // Register the fault callback on THIS rank's own comm.  Every rank must
+    // call this independently — there is no inter-rank broadcast.
+    ft_root_comm_ = ncclComm;
+    LOG(INFO) << logPrefix()
+              << "[NCCL-FT] Registering fault callback on comm "
+              << ncclComm->repr()
+              << " (ncclComm_t=" << (void*)ncclComm->getNcclComm() << ")";
+    ncclResult_t reg_ret = ncclCommRegisterFaultCallback(
+        ncclComm->getNcclComm(), nccl_ft_global_fault_callback);
+    if (reg_ret != ncclSuccess) {
+      LOG(ERROR) << logPrefix()
+                 << "[NCCL-FT] ncclCommRegisterFaultCallback FAILED: "
+                 << "ret=" << reg_ret
+                 << " — fault callback NOT active for this rank!";
+    } else {
       LOG(INFO) << logPrefix()
-                << "[NCCL-FT] Registering fault callback on comm "
-                << ncclComm->repr()
-                << " (ncclComm_t=" << (void*)ncclComm->getNcclComm() << ")";
-      ncclResult_t reg_ret = ncclCommRegisterFaultCallback(
-          ncclComm->getNcclComm(), nccl_ft_global_fault_callback);
-      if (reg_ret != ncclSuccess) {
-        LOG(ERROR) << logPrefix()
-                   << "[NCCL-FT] ncclCommRegisterFaultCallback FAILED: "
-                   << "ret=" << reg_ret
-                   << " — fault callback NOT active, failover disabled!";
-      } else {
-        LOG(INFO) << logPrefix()
-                  << "[NCCL-FT] Fault callback registered successfully on comm "
-                  << ncclComm->repr();
-      }
+                << "[NCCL-FT] Fault callback registered successfully on comm "
+                << ncclComm->repr();
     }
     initLocalNvlinkComm();
   }
