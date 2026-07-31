@@ -4399,15 +4399,11 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
     ft_negotiator_thread_ = std::thread([this]() {
         c10::setThreadName("pt_nccl_ft_side");
 
-        // [NCCL-FT Bug 11 fix] De-duplicate on target_op (uint64) not the full
-        // proposal string.  Two different faults can produce the same string if
-        // the same NIC fails again with the same target_op value (e.g. a quick
-        // double-fault on the same device).  String equality would silently drop
-        // the second proposal, leaving all ranks waiting for an ACK that will
-        // never come — a permanent 2PC hang.  target_op is strictly increasing
-        // per fault round (= lastEnqueuedSeq+1 at fault time), so comparing the
-        // numeric value is both correct and immune to content collisions.
-        uint64_t last_handled_target_op = 0;
+        // [NCCL-FT Step A] Per-round de-duplication: track the last round for
+        // which this side-car has already written its per-rank PROPOSE key.
+        // Using a round counter (not target_op) avoids the Bug B dependency on
+        // target_op, and prevents the same fault from being relayed twice.
+        uint64_t last_proposed_round = UINT64_MAX; // UINT64_MAX = "never"
 
         // Heartbeat timer: emit a LOG every 5 s so we can confirm the
         // side-car thread is alive even when no fault has occurred.
@@ -4415,7 +4411,7 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
 
         while (ft_negotiator_running_.load()) {
             try {
-                // Heartbeat log.
+                // ── Heartbeat ────────────────────────────────────────────
                 auto now = std::chrono::steady_clock::now();
                 if (now - last_heartbeat >= std::chrono::seconds(5)) {
                     LOG(INFO) << logPrefix()
@@ -4425,291 +4421,296 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                                      std::memory_order_relaxed)
                               << std::dec
                               << " ft_disabled=" << ft_disabled_
-                              << " is_degraded=" << is_degraded_;
+                              << " is_degraded=" << is_degraded_
+                              << " ft_round=" << ft_round_;
                     last_heartbeat = now;
                 }
 
                 // =========================================================
-                // Task 1: Relay Write
-                // If the watchdog (or NCCL callback) signalled one or more
-                // local NIC faults via local_hardware_fault_mask_, write a
-                // PROPOSE entry to TCPStore so all ranks see it.
+                // Task 1: Relay Write  [Step A — Bug C fix]
                 //
-                // [NCCL-FT Bug 12 fix] exchange(0) atomically drains the
-                // entire bitmask in one operation.  Any new bits set by a
-                // concurrent callback after this exchange will be picked up
-                // in the next negotiator loop iteration (the next fault round
-                // starts a fresh 2PC anyway).
+                // [Bug C root cause] The old design wrote a single shared
+                // "NCCL_FT_EVENT" key.  Multiple ranks with a non-zero
+                // fault_mask would each overwrite that key with their own
+                // target_op, making the coordinator's ACK polling target a
+                // moving goal.  Fix: each rank writes its OWN per-rank key
+                // "NCCL_FT_PROPOSE_<rank>_<round>" and never overwrites
+                // another rank's key.  Rank 0 (coordinator) is the only
+                // writer of the shared COMMIT key.
+                //
+                // [Bug 12] exchange(0) atomically drains the entire bitmask
+                // so multiple simultaneous NIC faults are all captured in
+                // one PROPOSE message.
                 // =========================================================
                 uint64_t fault_mask = this->local_hardware_fault_mask_.exchange(
                     0, std::memory_order_acquire);
                 if (fault_mask != 0) {
-                    LOG(WARNING) << logPrefix()
-                                 << "[NCCL-FT] Side-car: drained fault_mask=0x"
-                                 << std::hex << fault_mask << std::dec
-                                 << ", building PROPOSE";
-                    // [NCCL-FT Bug 4+5 fix] Use pgStatus_->lastEnqueuedSeq
-                    // instead of seqCollective_ (plain uint64_t — reading it
-                    // from a side-car thread is a data race).
-                    // target_op = lastEnqueuedSeq + 1: the very next op the
-                    // main thread will try to execute is the barrier point.
-                    uint64_t target_op = static_cast<uint64_t>(
-                        this->pgStatus_->lastEnqueuedSeq) + 1;
-                    int my_node_id = this->rank_ / this->localDeviceCount_;
-                    // [NCCL-FT Bug 9 fix] UINT64_MAX is the sentinel for
-                    // "pending_shadow_seq_ not yet set by trigger_fault_proposal".
-                    uint64_t my_shadow_seq =
-                        this->pending_shadow_seq_.load(std::memory_order_acquire);
-                    if (my_shadow_seq == UINT64_MAX) {
-                        my_shadow_seq = 0;
-                    }
-                    // Protocol:
-                    //   "PROPOSE:<target_op>:<node_id>:<dev_mask_hex>:<shadow_seq>"
-                    // dev_mask_hex is a hexadecimal bitmask of all simultaneously
-                    // faulted local device indices (e.g. "0x6" = NIC 1 and NIC 2).
-                    // All receivers expand the bitmask into faulty_local_devs_.
-                    std::ostringstream oss;
-                    oss << "PROPOSE:" << target_op
-                        << ":" << my_node_id
-                        << ":0x" << std::hex << fault_mask << std::dec
-                        << ":" << my_shadow_seq;
-                    std::string proposal = oss.str();
-                    std::vector<uint8_t> vec(proposal.begin(), proposal.end());
-                    this->globalStore_->set("NCCL_FT_EVENT", vec);
-                    LOG(INFO) << logPrefix()
-                              << "[NCCL-FT] Side-car relayed proposal to "
-                              << "TCPStore: " << proposal;
-                }
-
-                // =========================================================
-                // Task 2: Listen for a global proposal and drive 2PC.
-                //
-                // 2PC protocol:
-                //   Phase 1 (PROPOSE): any rank writes NCCL_FT_EVENT.
-                //     - Every rank's side-car reads the key and writes its
-                //       own ACK key: "NCCL_FT_ACK_<rank>_<target_op>".
-                //     - Every rank sets do_not_cross_op_ locally so its
-                //       main thread stops at the barrier OP.
-                //   Phase 2 (COMMIT): rank 0's side-car polls until all
-                //     ACK keys exist, then writes NCCL_FT_COMMIT_<target_op>.
-                //     All ranks' side-cars poll for the COMMIT key and only
-                //     then set final_commit_op_, unblocking the main thread.
-                //
-                // This ensures every rank agrees on the same boundary OP
-                // before any rank's main thread crosses into degraded mode.
-                // =========================================================
-                if (this->globalStore_->check({"NCCL_FT_EVENT"})) {
-                    auto vec = this->globalStore_->get("NCCL_FT_EVENT");
-                    std::string event_str(vec.begin(), vec.end());
-
-                    if (event_str.rfind("PROPOSE:", 0) == 0) {
-                        uint64_t target_op, proposal_shadow_seq, f_mask;
-                        int failed_node;
-                        // Parse: "PROPOSE:<target_op>:<node_id>:0x<mask>:<shadow_seq>"
-                        // sscanf %lx reads the leading "0x" prefix correctly.
-                        if (sscanf(event_str.c_str(), "PROPOSE:%lu:%d:%lx:%lu",
-                                   &target_op, &failed_node, &f_mask,
-                                   &proposal_shadow_seq) == 4 &&
-                            target_op != last_handled_target_op) {
-                            last_handled_target_op = target_op;
-
-                            LOG(ERROR) << logPrefix()
-                                       << "[NCCL-FT-TRACE] Side-car intercepted "
-                                       << "proposal; fence OP=" << target_op;
-                            LOG(INFO) << logPrefix()
-                                      << "[NCCL-FT] Node " << failed_node
-                                      << " NIC mask=0x" << std::hex << f_mask
-                                      << std::dec
-                                      << " fault; fence OP=" << target_op;
-
-                            // Phase 1: set local fence so main thread stops,
-                            // and expand the bitmask into the persistent faulty
-                            // set.  Every set bit becomes a faulty local device.
-                            this->do_not_cross_op_.store(
-                                target_op, std::memory_order_release);
-                            {
-                                std::lock_guard<std::mutex> lk(
-                                    this->faulty_devs_mutex_);
-                                for (int b = 0; b < 64; ++b) {
-                                    if (f_mask & (1ULL << b)) {
-                                        this->faulty_local_devs_.insert(b);
-                                    }
-                                }
-                            }
-
-                            // Write this rank's ACK alongside its shadow_seq.
-                            // The shadow_seq from the PROPOSE message is used
-                            // (not the local pending_shadow_seq_) so all ranks
-                            // report the proposer's snapshot, which is correct:
-                            // the faulty rank is the one that knows the true
-                            // checkpoint seq.
-                            std::string ack_key =
-                                "NCCL_FT_ACK_" +
-                                std::to_string(this->rank_) + "_" +
-                                std::to_string(target_op);
-                            std::string ack_val = "1";
-                            this->globalStore_->set(
-                                ack_key,
-                                std::vector<uint8_t>(
-                                    ack_val.begin(), ack_val.end()));
-
-                            // [NCCL-FT] Sub-Task 4: write this rank's shadow_seq.
-                            // Use our own pending_shadow_seq_ if we have one
-                            // (this rank may also be the faulty rank), otherwise
-                            // fall back to the proposer's value from the message.
-                            // [NCCL-FT Bug 9 fix] sentinel is UINT64_MAX, not 0.
-                            // Using 0 as sentinel was wrong because seq 0 is a valid
-                            // checkpoint (first op failure). UINT64_MAX means "this
-                            // rank has not set pending_shadow_seq_ yet".
-                            uint64_t my_ss = this->pending_shadow_seq_.load(
-                                std::memory_order_acquire);
-                            if (my_ss == UINT64_MAX) {
-                                my_ss = proposal_shadow_seq;
-                            }
-                            std::string ss_key =
-                                "NCCL_FT_SHADOW_SEQ_" +
-                                std::to_string(this->rank_) + "_" +
-                                std::to_string(target_op);
-                            std::string ss_val = std::to_string(my_ss);
-                            this->globalStore_->set(
-                                ss_key,
-                                std::vector<uint8_t>(
-                                    ss_val.begin(), ss_val.end()));
-
-                            // Phase 2a: rank 0 polls until all ACKs arrive,
-                            // then writes the COMMIT key.
-                            std::string commit_key =
-                                "NCCL_FT_COMMIT_" +
-                                std::to_string(target_op);
-                            if (this->rank_ == 0) {
-                                bool all_acked = false;
-                                while (!all_acked &&
-                                       this->ft_negotiator_running_.load()) {
-                                    all_acked = true;
-                                    for (int r = 0; r < this->size_; ++r) {
-                                        std::string rkey =
-                                            "NCCL_FT_ACK_" +
-                                            std::to_string(r) + "_" +
-                                            std::to_string(target_op);
-                                        if (!this->globalStore_->check({rkey})) {
-                                            all_acked = false;
-                                            break;
-                                        }
-                                    }
-                                    if (!all_acked) {
-                                        std::this_thread::sleep_for(
-                                            std::chrono::milliseconds(10));
-                                    }
-                                }
-                                if (all_acked) {
-                                    // [NCCL-FT] Sub-Task 4: collect all ranks'
-                                    // shadow_seq values, verify consensus, write
-                                    // the agreed value before COMMIT so every
-                                    // rank reads the same checkpoint seq.
-                                    uint64_t agreed_ss = UINT64_MAX;
-                                    bool ss_mismatch = false;
-                                    for (int r = 0; r < this->size_; ++r) {
-                                        std::string rss_key =
-                                            "NCCL_FT_SHADOW_SEQ_" +
-                                            std::to_string(r) + "_" +
-                                            std::to_string(target_op);
-                                        if (this->globalStore_->check({rss_key})) {
-                                            auto ssv = this->globalStore_->get(rss_key);
-                                            std::string ss_str(ssv.begin(), ssv.end());
-                                            uint64_t r_ss = std::stoull(ss_str);
-                                            if (agreed_ss == UINT64_MAX) {
-                                                agreed_ss = r_ss;
-                                            } else if (r_ss != agreed_ss) {
-                                                ss_mismatch = true;
-                                                // Take min: use the most conservative
-                                                // (oldest) checkpoint. Replaying an
-                                                // op that already succeeded is safe.
-                                                agreed_ss = std::min(agreed_ss, r_ss);
-                                            }
-                                        }
-                                    }
-                                    if (ss_mismatch) {
-                                        LOG(WARNING) << logPrefix()
-                                                     << "[NCCL-FT] shadow_seq mismatch "
-                                                     << "across ranks; using min="
-                                                     << agreed_ss;
-                                    }
-                                    if (agreed_ss == UINT64_MAX) {
-                                        agreed_ss = proposal_shadow_seq;
-                                    }
-                                    std::string agreed_key =
-                                        "NCCL_FT_SHADOW_SEQ_AGREED_" +
-                                        std::to_string(target_op);
-                                    std::string agreed_val = std::to_string(agreed_ss);
-                                    this->globalStore_->set(
-                                        agreed_key,
-                                        std::vector<uint8_t>(
-                                            agreed_val.begin(), agreed_val.end()));
-
-                                    std::string cv = "1";
-                                    this->globalStore_->set(
-                                        commit_key,
-                                        std::vector<uint8_t>(
-                                            cv.begin(), cv.end()));
-                                    LOG(INFO) << logPrefix()
-                                              << "[NCCL-FT] All ranks ACKed; "
-                                              << "COMMIT written for OP "
-                                              << target_op
-                                              << " agreed_shadow_seq=" << agreed_ss;
-                                }
-                            }
-
-                            // Phase 2b: every rank waits for COMMIT before
-                            // setting final_commit_op_ to unblock main thread.
-                            while (this->ft_negotiator_running_.load()) {
-                                if (this->globalStore_->check({commit_key})) {
-                                    break;
-                                }
-                                std::this_thread::sleep_for(
-                                    std::chrono::milliseconds(10));
-                            }
-                            // [NCCL-FT] Sub-Task 4: read the agreed shadow_seq
-                            // from TCPStore and store it so the main thread
-                            // knows which checkpoint to replay.
-                            std::string agreed_key =
-                                "NCCL_FT_SHADOW_SEQ_AGREED_" +
-                                std::to_string(target_op);
-                            if (this->globalStore_->check({agreed_key})) {
-                                auto av = this->globalStore_->get(agreed_key);
-                                std::string astr(av.begin(), av.end());
-                                uint64_t agreed_ss = std::stoull(astr);
-                                this->committed_shadow_seq_.store(
-                                    agreed_ss, std::memory_order_release);
-                                LOG(INFO) << logPrefix()
-                                          << "[NCCL-FT] committed_shadow_seq_="
-                                          << agreed_ss;
-                            }
-
-                            this->final_commit_op_.store(
-                                target_op, std::memory_order_release);
-                            // [NCCL-FT Bug 9 fix] Reset pending_shadow_seq_ to
-                            // sentinel so the next fault round starts clean.
-                            this->pending_shadow_seq_.store(
-                                UINT64_MAX, std::memory_order_release);
-                            LOG(INFO) << logPrefix()
-                                      << "[NCCL-FT] final_commit_op_ set to "
-                                      << target_op
-                                      << "; main thread will proceed. "
-                                      << "pending_shadow_seq_ reset to sentinel.";
-                        }
-                        // Anti-spam sleep after processing a new proposal.
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(200));
-                    } else {
-                        // Same key as last time; nothing new to process.
+                    // ft_round_ is written by the main thread after each
+                    // committed rollback; read here on the side-car.  A
+                    // plain load is safe because:
+                    //   - the main thread resets final_commit_op_ (release)
+                    //     at the end of the barrier block, which the side-car
+                    //     only polls after the COMMIT round completes — so
+                    //     the side-car always sees the updated ft_round_ by
+                    //     the time it could start a new round.
+                    uint64_t cur_round = ft_round_;
+                    if (cur_round == last_proposed_round) {
+                        // Already relayed for this round (e.g., callback
+                        // fires twice for send+recv on the same NIC).
+                        // Re-OR the bits back so they are not lost.
+                        this->local_hardware_fault_mask_.fetch_or(
+                            fault_mask, std::memory_order_release);
                         std::this_thread::sleep_for(
                             std::chrono::milliseconds(50));
+                    } else {
+                        LOG(WARNING) << logPrefix()
+                                     << "[NCCL-FT] Side-car: drained fault_mask=0x"
+                                     << std::hex << fault_mask << std::dec
+                                     << " for round=" << cur_round;
+                        int my_node_id = this->rank_ / this->localDeviceCount_;
+                        uint64_t my_shadow_seq =
+                            this->pending_shadow_seq_.load(
+                                std::memory_order_acquire);
+                        if (my_shadow_seq == UINT64_MAX) {
+                            my_shadow_seq = 0;
+                        }
+                        // Protocol (per-rank key):
+                        //   "PROPOSE:<round>:<node_id>:0x<dev_mask_hex>:<shadow_seq>"
+                        // Rank 0 coordinator aggregates all per-rank keys.
+                        std::ostringstream oss;
+                        oss << "PROPOSE:" << cur_round
+                            << ":" << my_node_id
+                            << ":0x" << std::hex << fault_mask << std::dec
+                            << ":" << my_shadow_seq;
+                        std::string proposal = oss.str();
+                        std::string propose_key =
+                            "NCCL_FT_PROPOSE_" +
+                            std::to_string(this->rank_) + "_" +
+                            std::to_string(cur_round);
+                        std::vector<uint8_t> vec(proposal.begin(),
+                                                 proposal.end());
+                        this->globalStore_->set(propose_key, vec);
+                        last_proposed_round = cur_round;
+                        LOG(INFO) << logPrefix()
+                                  << "[NCCL-FT] Side-car wrote per-rank "
+                                  << "propose key: " << propose_key
+                                  << " val=" << proposal;
                     }
-                } else {
-                    // No event key; sleep to avoid busy-spinning.
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(50));
                 }
+
+                // =========================================================
+                // Task 2: Drive 2PC — coordinator collects all per-rank
+                // PROPOSE keys, computes agreed shadow_seq (min strategy),
+                // writes COMMIT.  All ranks poll for COMMIT and set
+                // committed_shadow_seq_ + final_commit_op_ to unblock the
+                // main thread.
+                //
+                // Key namespace for round R:
+                //   NCCL_FT_PROPOSE_<rank>_<R>   — one per rank, any rank
+                //   NCCL_FT_COMMIT_<R>            — written by rank 0 only
+                // =========================================================
+                uint64_t cur_round = ft_round_;
+                std::string commit_key =
+                    "NCCL_FT_COMMIT_" + std::to_string(cur_round);
+
+                // Check whether ANY rank has proposed for this round yet.
+                // This avoids an O(size_) store check on every loop iteration
+                // in the steady-state (no-fault) path.
+                bool any_proposed = false;
+                for (int r = 0; r < this->size_; ++r) {
+                    std::string pk = "NCCL_FT_PROPOSE_" +
+                                     std::to_string(r) + "_" +
+                                     std::to_string(cur_round);
+                    if (this->globalStore_->check({pk})) {
+                        any_proposed = true;
+                        break;
+                    }
+                }
+
+                if (!any_proposed) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    continue;
+                }
+
+                // A fault round has started.  If this rank has not yet written
+                // its own PROPOSE key (e.g., it had no local NIC fault), write a
+                // "no-fault" placeholder now so the coordinator does not wait
+                // forever.  Format is the same as a normal PROPOSE but with
+                // fault_mask=0x0, which the coordinator ignores for faulty-dev
+                // aggregation but counts toward the "all proposed" check.
+                if (last_proposed_round != cur_round) {
+                    std::string my_propose_key =
+                        "NCCL_FT_PROPOSE_" +
+                        std::to_string(this->rank_) + "_" +
+                        std::to_string(cur_round);
+                    if (!this->globalStore_->check({my_propose_key})) {
+                        int my_node_id = this->rank_ / this->localDeviceCount_;
+                        uint64_t my_shadow_seq =
+                            this->pending_shadow_seq_.load(
+                                std::memory_order_acquire);
+                        if (my_shadow_seq == UINT64_MAX) {
+                            my_shadow_seq = 0;
+                        }
+                        std::ostringstream oss;
+                        oss << "PROPOSE:" << cur_round
+                            << ":" << my_node_id
+                            << ":0x0"    // no local fault
+                            << ":" << my_shadow_seq;
+                        std::string proposal = oss.str();
+                        std::vector<uint8_t> vec(proposal.begin(),
+                                                 proposal.end());
+                        this->globalStore_->set(my_propose_key, vec);
+                        last_proposed_round = cur_round;
+                        LOG(INFO) << logPrefix()
+                                  << "[NCCL-FT] Side-car wrote no-fault propose "
+                                  << "key: " << my_propose_key;
+                    }
+                }
+
+                // ── Phase 1: collect all per-rank PROPOSE keys ───────────
+                // Aggregate faulty device mask and shadow_seq (min strategy)
+                // across all ranks.  We wait until ALL size_ PROPOSE keys
+                // exist so the coordinator has a complete view before writing
+                // COMMIT.
+                bool all_proposed = false;
+                uint64_t agg_fault_mask  = 0;
+                int      agg_failed_node = -1; // first faulty node seen
+                uint64_t agreed_ss       = UINT64_MAX;
+
+                while (!all_proposed && this->ft_negotiator_running_.load()) {
+                    all_proposed = true;
+                    agg_fault_mask = 0;
+                    agreed_ss      = UINT64_MAX;
+                    for (int r = 0; r < this->size_; ++r) {
+                        std::string pk = "NCCL_FT_PROPOSE_" +
+                                         std::to_string(r) + "_" +
+                                         std::to_string(cur_round);
+                        if (!this->globalStore_->check({pk})) {
+                            all_proposed = false;
+                            break;
+                        }
+                        auto pv = this->globalStore_->get(pk);
+                        std::string ps(pv.begin(), pv.end());
+                        uint64_t p_round, p_ss, p_fmask;
+                        int p_node;
+                        if (sscanf(ps.c_str(),
+                                   "PROPOSE:%lu:%d:%lx:%lu",
+                                   &p_round, &p_node,
+                                   &p_fmask, &p_ss) == 4) {
+                            agg_fault_mask |= p_fmask;
+                            if (agg_failed_node < 0) agg_failed_node = p_node;
+                            if (p_ss != UINT64_MAX) {
+                                agreed_ss = (agreed_ss == UINT64_MAX)
+                                    ? p_ss
+                                    : std::min(agreed_ss, p_ss);
+                            }
+                        }
+                    }
+                    if (!all_proposed) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(10));
+                    }
+                }
+
+                if (!all_proposed) {
+                    // Shutdown requested while waiting.
+                    continue;
+                }
+
+                LOG(INFO) << logPrefix()
+                          << "[NCCL-FT] All " << this->size_
+                          << " per-rank proposals received for round="
+                          << cur_round
+                          << " agg_fault_mask=0x" << std::hex << agg_fault_mask
+                          << std::dec
+                          << " agreed_ss=" << agreed_ss;
+
+                // ── Phase 1b: expand aggregated fault mask into local set ─
+                {
+                    std::lock_guard<std::mutex> lk(this->faulty_devs_mutex_);
+                    for (int b = 0; b < 64; ++b) {
+                        if (agg_fault_mask & (1ULL << b)) {
+                            this->faulty_local_devs_.insert(b);
+                        }
+                    }
+                }
+
+                // ── Phase 2: rank 0 writes COMMIT; all ranks wait for it ─
+                if (this->rank_ == 0) {
+                    if (agreed_ss == UINT64_MAX) agreed_ss = 0;
+                    std::string agreed_key =
+                        "NCCL_FT_SS_AGREED_" + std::to_string(cur_round);
+                    std::string agreed_val = std::to_string(agreed_ss);
+                    this->globalStore_->set(
+                        agreed_key,
+                        std::vector<uint8_t>(agreed_val.begin(),
+                                             agreed_val.end()));
+
+                    std::string cv = "1";
+                    this->globalStore_->set(
+                        commit_key,
+                        std::vector<uint8_t>(cv.begin(), cv.end()));
+                    LOG(INFO) << logPrefix()
+                              << "[NCCL-FT] (rank 0) COMMIT written for "
+                              << "round=" << cur_round
+                              << " agreed_shadow_seq=" << agreed_ss;
+                }
+
+                // All ranks: wait for COMMIT key.
+                while (this->ft_negotiator_running_.load()) {
+                    if (this->globalStore_->check({commit_key})) {
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+
+                // Read the agreed shadow_seq written by rank 0.
+                {
+                    std::string agreed_key =
+                        "NCCL_FT_SS_AGREED_" + std::to_string(cur_round);
+                    if (this->globalStore_->check({agreed_key})) {
+                        auto av = this->globalStore_->get(agreed_key);
+                        std::string astr(av.begin(), av.end());
+                        uint64_t final_ss = std::stoull(astr);
+                        // Write committed_shadow_seq_ BEFORE final_commit_op_
+                        // so that when the main thread reads final_commit_op_
+                        // (acquire), the store-release on committed_shadow_seq_
+                        // is already visible (release/acquire ordering).
+                        this->committed_shadow_seq_.store(
+                            final_ss, std::memory_order_release);
+                        LOG(INFO) << logPrefix()
+                                  << "[NCCL-FT] committed_shadow_seq_=" << final_ss
+                                  << " for round=" << cur_round;
+                    }
+                }
+
+                // Signal the main thread: any non-zero value unblocks it.
+                // Using cur_round+1 makes the value strictly increasing and
+                // gives the main thread the round number for cleanup.
+                this->final_commit_op_.store(
+                    cur_round + 1, std::memory_order_release);
+
+                // Reset pending_shadow_seq_ sentinel for the next round.
+                this->pending_shadow_seq_.store(
+                    UINT64_MAX, std::memory_order_release);
+
+                LOG(INFO) << logPrefix()
+                          << "[NCCL-FT] final_commit_op_ set to "
+                          << cur_round + 1
+                          << "; main thread will proceed.";
+
+                // Wait for the main thread to advance ft_round_ (by reading
+                // final_commit_op_ being reset to 0 after the barrier block).
+                // This prevents the side-car from re-processing the same
+                // round if it loops again before the main thread commits.
+                while (this->ft_negotiator_running_.load()) {
+                    if (this->final_commit_op_.load(
+                            std::memory_order_acquire) == 0) {
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+
             } catch (const std::exception& e) {
                 LOG(WARNING) << logPrefix()
                              << "[NCCL-FT] Side-car thread exception: "
@@ -4879,78 +4880,137 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   }
 
   /* ===================================================================== */
-  /* --- [NCCL-FT: 條件式防死結煞車與拓撲切換] --- */
-  // [NCCL-FT Bug 2 fix] The 2PC barrier check MUST come before pre().
+  /* --- [NCCL-FT: Commit-Aware Drain + Shadow-Seq Rollback Barrier] --- */
   //
-  // pre() for AllReduce is the shadow_pre lambda: it checkpoints the current
-  // tensor into shadow_buf_ and records shadow_seq_. If a fault happened on
-  // the previous op, the Watchdog already restored shadow_buf_ to the clean
-  // pre-fault gradient and set shadow_replay_pending_=true. If we call pre()
-  // first, shadow_pre will overwrite that restored checkpoint with the tensor
-  // in its current (possibly partially-modified) state — corrupting the replay
-  // input. The shadow_pre lambda already has a guard (shadow_replay_pending_)
-  // to skip the checkpoint in that case, but the guard is only correct if
-  // the 2PC barrier has already run (because shadow_replay_pending_ is set by
-  // the Watchdog which runs concurrently with the main thread up to the barrier).
+  // [Step B] The old barrier used `current_op == boundary` (exact match on
+  // target_op) which could never fire: DDP asyncOp=true pre-enqueues multiple
+  // buckets, so seqCollective_ is already past target_op by the time the main
+  // thread checks.
   //
-  // Correct order:
-  //   1. shadow_restore_event_ wait (GPU-side fence — stream ordering)
-  //   2. 2PC barrier spin (CPU — ensures topology is rebuilt before replay)
+  // New design: the barrier checks final_commit_op_ (any non-zero value =
+  // "COMMIT happened").  The response depends on where we are relative to
+  // agreed_shadow_seq (agreed_ss, the last safely checkpointed op seq):
+  //
+  //   current_op > agreed_ss + 1  → DRAIN:  this op was enqueued after the
+  //     fault.  Return a completed NullWork without executing any NCCL kernel.
+  //     seqCollective_ is decremented to undo the bump, keeping seq consistent.
+  //
+  //   current_op == agreed_ss + 1 → REPLAY: this is the first new op after
+  //     rollback.  Execute topology rebuild here, set seqCollective_ = agreed_ss
+  //     so the replay path's seqCollective_-- lands on exactly agreed_ss.
+  //
+  // [Step E] rollback_done_ prevents re-entering the rebuild block once per
+  // fault round.  Reset at the end so the next fault round starts clean.
+  //
+  // Correct order (unchanged from Bug 2 fix):
+  //   1. shadow_restore_event_ wait (GPU-side stream fence)
+  //   2. This barrier block  (CPU: drain or rebuild)
   //   3. pre(ncclStream, work)  ← shadow_pre skips if replay_pending
   //   4. fn() or shadow replay
-  uint64_t current_op = this->seqCollective_;
-  uint64_t boundary = this->do_not_cross_op_.load(std::memory_order_relaxed);
 
-  if (!this->ft_disabled_ && C10_UNLIKELY(boundary > 0 && current_op == boundary)) {
-      LOG(INFO) << logPrefix()
-                << "[NCCL-FT] 抵達警戒線 OP: " << current_op << "，等待 2PC COMMIT";
+  uint64_t current_op = this->seqCollective_;  // already bumped above
 
-      // [NCCL-FT Bug 3 fix] Spin until the negotiator sets final_commit_op_
-      // equal to the SPECIFIC op we are waiting for. Using != current_op is
-      // more precise than == 0: it handles the edge case where a prior round's
-      // cleanup reset the atomic to 0 races with the new commit being written.
-      while (this->final_commit_op_.load(std::memory_order_relaxed) != current_op) {
-          std::this_thread::yield();
-      }
+  if (!this->ft_disabled_ && !this->rollback_done_) {
+      uint64_t commit_signal =
+          this->final_commit_op_.load(std::memory_order_acquire);
+      if (C10_UNLIKELY(commit_signal > 0)) {
+          uint64_t agreed_ss =
+              this->committed_shadow_seq_.load(std::memory_order_acquire);
 
-      LOG(INFO) << logPrefix()
-                << "[NCCL-FT] 2PC committed for OP=" << current_op
-                << "; rebuilding proxy topology (may be second/Nth fault).";
-
-      rebuild_shadow_ping_pong_topology();
-      this->is_degraded_ = true;
-
-      // Clean up TCPStore keys for this fault round so they do not accumulate
-      // over a long training run. Each rank deletes its own ACK and SHADOW_SEQ
-      // keys (no contention). Rank 0 deletes the shared keys last, after
-      // everyone has read them (safe because all ranks are past the barrier).
-      try {
-          std::string op_str = std::to_string(current_op);
-          std::string my_ack =
-              "NCCL_FT_ACK_" + std::to_string(this->rank_) + "_" + op_str;
-          std::string my_ss =
-              "NCCL_FT_SHADOW_SEQ_" + std::to_string(this->rank_) + "_" + op_str;
-          this->globalStore_->deleteKey(my_ack);
-          this->globalStore_->deleteKey(my_ss);
           LOG(INFO) << logPrefix()
-                    << "[NCCL-FT] TCPStore: deleted per-rank keys for OP=" << current_op;
-          if (this->rank_ == 0) {
-              this->globalStore_->deleteKey("NCCL_FT_EVENT");
-              this->globalStore_->deleteKey("NCCL_FT_COMMIT_" + op_str);
-              this->globalStore_->deleteKey(
-                  "NCCL_FT_SHADOW_SEQ_AGREED_" + op_str);
-              LOG(INFO) << logPrefix()
-                        << "[NCCL-FT] TCPStore: deleted shared keys for OP=" << current_op;
-          }
-      } catch (const std::exception& e) {
-          LOG(WARNING) << logPrefix()
-                       << "[NCCL-FT] TCPStore key cleanup failed (non-fatal): "
-                       << e.what();
-      }
+                    << "[NCCL-FT] Commit 感知: commit_signal=" << commit_signal
+                    << " agreed_ss=" << agreed_ss
+                    << " current_op=" << current_op;
 
-      // Reset 2PC control atomics so the next fault round can reuse them.
-      this->do_not_cross_op_.store(0, std::memory_order_release);
-      this->final_commit_op_.store(0, std::memory_order_release);
+          if (current_op > agreed_ss + 1) {
+              // ── DRAIN path ──────────────────────────────────────────
+              // This is an op that DDP already enqueued while the NIC was
+              // failing.  Do not execute it: just return a NullWork so
+              // DDP's wait() completes immediately.
+              //
+              // [Step C] Undo the seq bump so the counter stays consistent.
+              if (!coalescing_state_) {
+                  seqCollective_--;
+              }
+              LOG(INFO) << logPrefix()
+                        << "[NCCL-FT] 排水多餘 op current_op=" << current_op
+                        << " (agreed_ss=" << agreed_ss
+                        << "); seqCollective_ restored to " << seqCollective_;
+
+              // [Step D] Record ncclEndEvent_ so work->wait() returns
+              // immediately (finishedGPUExecutionInternal() queries this
+              // event).  The event was not yet recorded (no kernel was
+              // launched), but recording it now on an otherwise-empty
+              // stream segment signals it instantly.
+              work->ncclEndEvent_->record(ncclStream);
+
+              // Set up future_ so DDP's getFuture() does not crash.
+              // Mirror the normal path (lines ~5149-5165) exactly.
+              {
+                  c10::cuda::CUDAMultiStreamGuard sg(ncclStream);
+                  std::vector<at::Device> devs{device};
+                  work->future_ = c10::make_intrusive<at::ivalue::Future>(
+                      c10::ListType::create(c10::TensorType::get()), devs);
+                  work->future_->markCompleted(at::IValue(*work->outputs_));
+              }
+              return work;
+          }
+
+          // ── REBUILD path (current_op == agreed_ss + 1) ──────────────
+          LOG(INFO) << logPrefix()
+                    << "[NCCL-FT] 抵達重播點 OP=" << current_op
+                    << " (agreed_ss=" << agreed_ss
+                    << ")，執行拓撲重建";
+
+          rebuild_shadow_ping_pong_topology();
+          this->is_degraded_ = true;
+
+          // [Step C] Align seqCollective_ to agreed_ss so the replay path's
+          // seqCollective_-- (line ~5038) returns it to exactly agreed_ss,
+          // and the op is recorded under the correct seq.
+          seqCollective_ = agreed_ss;
+
+          this->rollback_done_ = true;
+
+          // Advance the fault-round counter so the side-car's next iteration
+          // uses a fresh key namespace and does not re-process this round.
+          this->ft_round_++;
+
+          // Clean up TCPStore keys for this fault round.
+          try {
+              uint64_t committed_round = commit_signal - 1; // cur_round
+              std::string round_str = std::to_string(committed_round);
+              std::string my_propose =
+                  "NCCL_FT_PROPOSE_" +
+                  std::to_string(this->rank_) + "_" + round_str;
+              this->globalStore_->deleteKey(my_propose);
+              LOG(INFO) << logPrefix()
+                        << "[NCCL-FT] TCPStore: deleted per-rank propose key "
+                        << "for round=" << committed_round;
+              if (this->rank_ == 0) {
+                  this->globalStore_->deleteKey(
+                      "NCCL_FT_COMMIT_" + round_str);
+                  this->globalStore_->deleteKey(
+                      "NCCL_FT_SS_AGREED_" + round_str);
+                  LOG(INFO) << logPrefix()
+                            << "[NCCL-FT] TCPStore: deleted shared keys for "
+                            << "round=" << committed_round;
+              }
+          } catch (const std::exception& e) {
+              LOG(WARNING) << logPrefix()
+                           << "[NCCL-FT] TCPStore key cleanup failed "
+                           << "(non-fatal): " << e.what();
+          }
+
+          // Reset 2PC control atomics.  Resetting final_commit_op_ to 0 also
+          // unblocks the side-car's wait loop so it advances to the next round.
+          this->do_not_cross_op_.store(0, std::memory_order_release);
+          this->final_commit_op_.store(0, std::memory_order_release);
+
+          // rollback_done_ is intentionally left true here.  It is reset at
+          // the end of this block (after the shadow restore fence and replay)
+          // so the next fault round starts with it false.  See [Step E].
+      }
   }
   /* ===================================================================== */
 
@@ -5027,6 +5087,23 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 // calculation will be off by one. Fix: undo the bump before replay and restore
 // it after, so seqCollective_ stays at N (the replayed op) when collective()
 // returns, matching what DDP expects for the next bucket.
+  // [Step E] Safety reset: if rebuild happened (rollback_done_=true) but there
+  // is no replay pending (e.g., fault was detected before any AllReduce ran, so
+  // no checkpoint was made), reset rollback_done_ so the next round is not
+  // blocked.  The normal reset is inside the ran_shadow_replay block below.
+  if (!ft_disabled_ && C10_UNLIKELY(rollback_done_)) {
+      bool pending;
+      {
+          std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+          pending = shadow_replay_pending_;
+      }
+      if (!pending) {
+          rollback_done_ = false;
+          LOG(INFO) << logPrefix()
+                    << "[NCCL-FT] rollback_done_ reset (no replay pending).";
+      }
+  }
+
   bool ran_shadow_replay = false;
   if (!ft_disabled_ && C10_UNLIKELY(shadow_replay_pending_) &&
       opType == OpType::ALLREDUCE &&
@@ -5049,6 +5126,10 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
           shadow_replay_pending_ = false;
       }
       ran_shadow_replay = true;
+      // [Step E] Replay is complete — the barrier for this fault round has
+      // fully executed.  Reset rollback_done_ so the next fault round can
+      // use the barrier again.  This is the only place it is reset.
+      rollback_done_ = false;
   }
 
   if (C10_UNLIKELY(this->is_degraded_) && !ran_shadow_replay) {

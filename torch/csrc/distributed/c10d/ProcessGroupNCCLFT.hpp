@@ -1080,6 +1080,21 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   bool is_degraded_ = false;
   bool ft_disabled_ = false;
 
+  // Monotonically increasing fault-round counter.  Bumped by the main thread
+  // each time it commits a rollback.  Used as a namespace for TCPStore keys
+  // so keys from previous rounds do not pollute the current round.
+  // Written only by the main thread (under the barrier block); read by the
+  // side-car to construct COMMIT key names.  No atomic needed: the main
+  // thread writes before unlocking the barrier, side-car reads after COMMIT
+  // (there is a TCPStore-mediated happens-before relationship).
+  uint64_t ft_round_{0};
+
+  // Prevents the main thread from executing the barrier/rebuild block more
+  // than once per fault round.  Set to true when a rollback is committed;
+  // reset to false at the end of the same barrier block (after cleanup)
+  // so the next fault round starts fresh.
+  bool rollback_done_{false};
+
   // Pending fault signal from NCCL callback / Watchdog.
   // Bitmask: bit i is set when local device i has a pending NIC fault.
   // 0 means no pending fault.
