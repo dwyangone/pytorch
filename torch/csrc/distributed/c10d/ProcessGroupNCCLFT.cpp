@@ -2526,14 +2526,14 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
       if (work.exception()) {
         // [NCCL-FT] Recoverable path: when FT is enabled, clear the exception
         // so training can continue. The fault signal to the negotiator thread
-        // is driven by the NCCL callback path:
+        // is driven exclusively by the NCCL callback path:
         //   nccl_ft_trigger_fault -> nccl_ft_global_fault_callback
         //   -> trigger_fault_proposal -> local_hardware_fault_mask_ (fetch_or)
         //
-        // Fallback: if the NCCL callback path is not yet registered, the
-        // Watchdog also writes to local_hardware_fault_mask_ via fetch_or so
-        // the negotiator can still start the proposal. Both paths are safe to
-        // call concurrently because fetch_or is atomic.
+        // The Watchdog does NOT write local_hardware_fault_mask_ here (Fix A).
+        // ncclRemoteError propagates to all ranks' comms even when only one NIC
+        // failed, so device_idx here is this rank's GPU index, not the faulty
+        // NIC's index.  Writing it would corrupt agg_fault_mask in the side-car.
         if (!pg_->ft_disabled_) {
           int device_idx = work.device_.index() % pg_->localDeviceCount_;
           LOG(WARNING) << pg_->logPrefix()
@@ -2622,20 +2622,22 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
             }
           }
 
-          // [NCCL-FT Bug 12 fix] Use fetch_or so this Watchdog fallback never
-          // races with the NCCL callback path.  Both may fire concurrently
-          // (callback for the send comm, Watchdog for the recv comm of the same
-          // NIC), and both should be recorded.  fetch_or is idempotent for
-          // the same bit, so double-writes for the same device are harmless.
-          pg_->local_hardware_fault_mask_.fetch_or(
-              1ULL << device_idx, std::memory_order_release);
-          LOG(WARNING) << pg_->logPrefix()
-                       << "[NCCL-FT] Watchdog wrote fault bit: device="
-                       << device_idx << " new_mask=0x" << std::hex
-                       << pg_->local_hardware_fault_mask_.load(
-                              std::memory_order_relaxed)
-                       << std::dec
-                       << " (side-car should pick this up within 50ms)";
+          // [NCCL-FT Fix A] Do NOT write local_hardware_fault_mask_ here.
+          //
+          // The Watchdog sees ncclRemoteError on every rank's comm because
+          // AllReduce is collective: one NIC failure propagates the error to
+          // all 16 participants.  device_idx here is this rank's local GPU
+          // index, NOT the index of the NIC that actually failed.  Writing
+          // it would cause every rank to record a different bit, making
+          // agg_fault_mask = 0xFF and collapsing proxy_comm_size_ to 0.
+          //
+          // fault_mask is written exclusively by trigger_fault_proposal(),
+          // which is called from the NCCL fault callback and receives the
+          // correct faulty dev_idx directly from NCCL.  The callback already
+          // fired on rank 1 (confirmed in test.log line 58-63).  This
+          // Watchdog path is responsible only for clearing the exception and
+          // recording ncclEndEvent_ so DDP's wait() returns cleanly.
+
           // Record ncclEndEvent_ before clearing the exception.
           // If DDP's wait() is concurrently executing synchronize(), it calls
           // ncclEndEvent_->block() which spins until the event is signalled.
