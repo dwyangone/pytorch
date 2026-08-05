@@ -1122,6 +1122,11 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // triggered. Initialised lazily on the first collective() call.
   // Uses NCCLFTComm RAII so no manual ncclCommDestroy is needed.
   std::shared_ptr<NCCLFTComm> local_nvlink_comm_{nullptr};
+  // Set to true once the lazy-init block has attempted ncclCommSplit for the
+  // NVLink comm.  Prevents the block from firing on every subsequent
+  // collective if initLocalNvlinkComm() throws (e.g., NIC failed before the
+  // first collective completed).
+  bool nvlink_init_attempted_{false};
 
   // Reduced cross-node communicator built after each fault round is confirmed.
   // Only ranks whose local_rank is NOT in faulty_local_devs_ participate.

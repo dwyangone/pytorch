@@ -4872,7 +4872,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   // meaning those ranks never reached this block in the binary under test.
   // The fix is to ensure the block executes for every rank unconditionally
   // (the `local_nvlink_comm_ == nullptr` guard still ensures it runs once).
-  if (!ft_disabled_ && local_nvlink_comm_ == nullptr) {
+  if (!ft_disabled_ && local_nvlink_comm_ == nullptr && !nvlink_init_attempted_) {
+    nvlink_init_attempted_ = true;
     LOG(INFO) << logPrefix()
               << "[NCCL-FT] First collective detected; registering fault "
               << "callback and initialising local_nvlink_comm_.";
@@ -4895,7 +4896,19 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
                 << "[NCCL-FT] Fault callback registered successfully on comm "
                 << ncclComm->repr();
     }
-    initLocalNvlinkComm();
+    try {
+      initLocalNvlinkComm();
+    } catch (const std::exception& e) {
+      // If initLocalNvlinkComm throws (e.g., the global comm entered
+      // ncclRemoteError before the first collective completed), log and
+      // continue.  local_nvlink_comm_ will remain null; the FT path will
+      // attempt to rebuild it on the next fault round.
+      LOG(WARNING) << logPrefix()
+                   << "[NCCL-FT] initLocalNvlinkComm failed at lazy-init "
+                   << "(NIC may have faulted during first collective): "
+                   << e.what()
+                   << " -- local_nvlink_comm_ remains null.";
+    }
   }
 
   if (coalescing_state_ & CoalActive) {
@@ -5298,16 +5311,66 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
       }
   } else {
       /* --- [原生 NCCL 執行路徑] --- */
+      // [NCCL-FT] Catch synchronous NCCL errors thrown by the fn() call.
+      //
+      // When a NIC fault fires during or before the first collective (e.g.,
+      // during DDP init's _verify_param_shape_across_processes), the NCCL
+      // error propagates here as NCCLFaultToleranceError thrown from
+      // C10D_NCCL_FT_CHECK_TIMEOUT.  If we let it escape, it reaches Python
+      // as DistBackendError and crashes the training script.
+      //
+      // Swallow the exception here, record ncclEndEvent_, and return a
+      // complete-looking work object.  The NCCL fault callback
+      // (trigger_fault_proposal) fires independently and drives 2PC recovery
+      // via the side-car thread.  DDP's wait() on the returned work sees no
+      // stored exception and returns cleanly.
+      try {
 #ifndef NCCL_HAS_COMM_NONBLOCKING
-    C10D_NCCL_FT_CHECK(
-        fn(inputs[0], outputs[0], comm, ncclStream),
-        ncclComm->getNcclCommFailureReason());
+        C10D_NCCL_FT_CHECK(
+            fn(inputs[0], outputs[0], comm, ncclStream),
+            ncclComm->getNcclCommFailureReason());
 #else
-    C10D_NCCL_FT_CHECK_TIMEOUT(
-        fn(inputs[0], outputs[0], comm, ncclStream),
-        ncclComm,
-        ncclComm->getNcclCommFailureReason());
+        C10D_NCCL_FT_CHECK_TIMEOUT(
+            fn(inputs[0], outputs[0], comm, ncclStream),
+            ncclComm,
+            ncclComm->getNcclCommFailureReason());
 #endif // NCCL_HAS_COMM_NONBLOCKING
+      } catch (const ::c10::NCCLFaultToleranceError& e) {
+        if (!ft_disabled_) {
+          LOG(WARNING) << logPrefix()
+                       << "[NCCL-FT] Synchronous NCCL error caught in "
+                       << "collective() native path (seq=" << seqCollective_
+                       << "): " << e.what()
+                       << " -- swallowing, fault callback drives 2PC recovery.";
+          // Record end event so wait()->synchronize()->block() returns.
+          // The NCCL fault callback (trigger_fault_proposal) has already fired
+          // (or will fire) and will drive the 2PC recovery via the side-car
+          // thread.  We must NOT rethrow here -- that would crash Python before
+          // the 2PC has a chance to rebuild the topology.
+          //
+          // Do NOT set exception on work: DDP will call wait() which calls
+          // handleException(asyncErrorHandling_).  With the default
+          // SkipCleanUpFT mode, handleException rethrows any stored exception.
+          // Leaving exception_ null makes wait() return cleanly.
+          work->ncclEndEvent_->record(ncclStream);
+          work->ncclComm_ = ncclComm;
+          {
+            c10::cuda::CUDAMultiStreamGuard sg(ncclStream);
+            std::vector<at::Device> devs{device};
+            work->future_ = c10::make_intrusive<at::ivalue::Future>(
+                c10::ListType::create(c10::TensorType::get()), devs);
+            work->future_->markCompleted(at::IValue(*work->outputs_));
+          }
+          work->blockingWait_ = blockingWait_;
+          work->store_ = store_;
+          assignTimeoutToWork(work, options_);
+          if (enqueue) {
+            workEnqueue(work);
+          }
+          return work;
+        }
+        throw; // ft_disabled_: surface error normally
+      }
   }
 
   post(ncclStream, work);

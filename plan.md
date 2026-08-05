@@ -265,7 +265,33 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 
 ## 七、待修復項目（有序）
 
-### Fix A（P0）：移除 Watchdog fallback 的 fault_mask 寫入
+### Fix D（P0, 已完成 2026-08-03）：阻止 collective() 的同步錯誤傳播到 Python
+
+**問題（來自 test.log 2026-08-03）：**
+NIC 在 DDP init 的第一個 collective（`_verify_param_shape_across_processes`）期間發生故障。
+`C10D_NCCL_FT_CHECK_TIMEOUT` 在 `collective()` 的原生執行路徑中同步拋出
+`NCCLFaultToleranceError`，直接傳播到 Python，訓練崩潰。
+
+**根本原因：**
+- `NCCL_FT_CHECK_TIMEOUT` 在 `fn()` 呼叫中丟出 → 跳過了 FT 的 Work exception 路徑
+- 沒有任何 catch 攔截，exception 直接傳到 Python callstack → `DistBackendError`
+
+**修復（已套用）：**
+1. 在 `collective()` 原生路徑（lines ~5311-5376）的 `fn()` 呼叫外加 try-catch：
+   - 捕獲 `::c10::NCCLFaultToleranceError`
+   - 記錄 `ncclEndEvent_` 讓 `wait()->block()` 立即返回
+   - 設定 `work->ncclComm_`、`work->future_`、`blockingWait_`、`store_` 等必要欄位
+   - 不設定 exception（避免 `handleException(SkipCleanUpFT)` 再次丟出）
+   - Watchdog FT 路徑由 NCCL fault callback 的 2PC 機制驅動
+
+2. 在 `initLocalNvlinkComm()` 呼叫（lines ~4899-4911）外加 try-catch：
+   - 防止 NVLink comm 初始化失敗時傳播異常
+   - `local_nvlink_comm_` 保持 null，等下次故障 round 重試
+
+3. 新增 `nvlink_init_attempted_` flag（HPP line ~1125）：
+   - 防止 lazy-init block 在初始化失敗後每次 collective 都重試
+
+### Fix A（P0, 已完成）：移除 Watchdog fallback 的 fault_mask 寫入
 
 **位置：** `ProcessGroupNCCLFT.cpp` lines ~2625-2637
 
@@ -343,10 +369,13 @@ Watchdog 只負責清除 exception 和觸發 shadow restore，不寫 fault mask�
 [x] execute_shadow_allreduce() 四步驟
 [x] Step A–E barrier 機制
 [x] Fix 1, Fix 3, Gap 1, Gap 6
-[ ] Fix A: 移除 Watchdog fallback 的 fault_mask 寫入
+[x] Fix A: 移除 Watchdog fallback 的 fault_mask 寫入
+[x] Fix D: collective() 原生路徑同步錯誤攔截（try-catch NCCLFaultToleranceError）
+[x] Fix D2: initLocalNvlinkComm() 加 try-catch，新增 nvlink_init_attempted_ flag
 [ ] Fix B: 確認 NCCL fork 的 ncclCommBanNic scope 和 topo cache 行為
 [ ] Fix C: 替換 rebuild_shadow_ping_pong_topology() 為 reinit 方案
-[ ] 第一次 end-to-end 測試：注入單張 NIC 故障，觀察 proxy_global_comm_ ready log
+[ ] end-to-end 測試：NIC 在 DDP init 期間故障，確認訓練繼續（no DistBackendError 傳 Python）
+[ ] end-to-end 測試：NIC 在訓練中途故障，確認 2PC + Shadow Ping-Pong 完整流程
 ```
 
 ---
