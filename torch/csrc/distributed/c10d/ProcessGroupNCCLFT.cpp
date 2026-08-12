@@ -5202,13 +5202,24 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 
           /* ========================================================= */
           /* [移轉機制]：在這裡安全地將 CPU Pinned Memory 的乾淨資料倒回 GPU */
-          if (this->shadow_buf_.has_value()) {
-              LOG(INFO) << logPrefix() << "[NCCL-FT] 執行 Shadow Buffer 恢復作業";
+          at::Tensor restore_tensor;
+          bool has_restore_tensor = false;
+          {
+              std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+              auto it = in_flight_shadow_bufs_.find(agreed_ss);
+              if (it != in_flight_shadow_bufs_.end()) {
+                  restore_tensor = it->second;
+                  has_restore_tensor = true;
+              }
+          }
+
+          if (has_restore_tensor) {
+              LOG(INFO) << logPrefix() << "[NCCL-FT] 執行 Shadow Buffer 恢復作業 (seq=" << agreed_ss << ")";
               auto prev_stream = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
               at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
               
               // 此時 GPU 完全安靜，倒回資料保證不會被污染
-              inputs[0].copy_(shadow_buf_->narrow(0, 0, inputs[0].numel()), /*non_blocking=*/true);
+              inputs[0].copy_(restore_tensor.narrow(0, 0, inputs[0].numel()), /*non_blocking=*/true);
               shadow_restore_event_.record(shadow_copy_stream_);
               at::cuda::setCurrentCUDAStream(prev_stream);
               
@@ -5216,6 +5227,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
               shadow_restore_event_.block(ncclStream);
               
               this->shadow_replay_pending_ = true;
+          } else {
+              LOG(WARNING) << logPrefix() << "[NCCL-FT] 警告：找不到對應 seq=" << agreed_ss << " 的 Shadow Buffer!";
           }
           /* ========================================================= */
 
@@ -6185,41 +6198,6 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_sparse(
 #endif // IS_NCCLX
 }
 
-// [NCCL-FT] Allocate or grow the shadow buffer to hold at least t.numel()
-// elements with the same dtype and device as t. Called on the main thread
-// before every AllReduce; is a branch-not-taken no-op once the buffer is
-// large enough.
-void ProcessGroupNCCLFT::ensure_shadow_buffer(const at::Tensor& t) {
-    // Caller must hold shadow_buf_mutex_ or be on the single main thread
-    // path where no concurrent writer exists yet (before first pre lambda).
-    if (!shadow_buf_.has_value() || t.numel() > shadow_buf_->numel()) {
-        // Allocate shadow_buf_ in PINNED CPU memory, not GPU memory.
-        //
-        // Rationale: the shadow buffer checkpoints the pre-AllReduce gradient
-        // tensor so it can be restored if a NIC fault aborts the op mid-way.
-        // During normal (fault-free) training it sits idle.  Allocating it on
-        // the GPU wastes precious HBM and pushes large-model workloads into OOM
-        // (for a 16 GiB gradient this adds a full 16 GiB of permanent GPU
-        // overhead).
-        //
-        // Pinned (page-locked) CPU memory allows cudaMemcpyAsync H2D at close
-        // to PCIe peak bandwidth (~25-50 GB/s on modern systems), which is fast
-        // enough for a fault-recovery restore that happens at most once per NIC
-        // failure.  The normal-path checkpoint (shadow_pre) copies GPU->CPU
-        // with non_blocking=true, so it runs asynchronously on the NCCL stream
-        // and does not block the forward pass.
-        //
-        // Layout: flat 1-D tensor with the same dtype as the gradient, pinned.
-        auto cpu_opts = t.options()
-                         .device(at::kCPU)
-                         .memory_format(at::MemoryFormat::Contiguous);
-        shadow_buf_ = at::empty({t.numel()}, cpu_opts).pin_memory();
-        LOG(INFO) << logPrefix()
-                  << "[NCCL-FT] shadow_buf_ allocated in PINNED CPU memory, numel="
-                  << t.numel() << " dtype=" << t.scalar_type()
-                  << " size_bytes=" << t.nbytes();
-    }
-}
 
 c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
     at::Tensor& tensor,
@@ -6229,12 +6207,6 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
   // the correct op to execute_shadow_allreduce instead of defaulting to SUM.
   current_shadow_reduce_op_ = opts.reduceOp;
 
-  // [NCCL-FT] Sub-Task 1: ensure a shadow buffer large enough for this tensor
-  // exists. No mutex needed here: the main thread is the only writer before
-  // the pre lambda runs, and the Watchdog only reads after this point.
-  if (!ft_disabled_) {
-      ensure_shadow_buffer(tensor);
-  }
 
   // [NCCL-FT] Sub-Task 2: pre lambda — checkpoint tensor into ring shadow buffer (in_flight_shadow_bufs_).
   //
