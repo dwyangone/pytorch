@@ -2575,7 +2575,7 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
                     << " outputs_null=" << (work.outputs_ == nullptr)
                     << " outputs_empty="
                     << (work.outputs_ == nullptr || work.outputs_->empty());
-
+          /** 【刪除】以下這整段從 Watchdog 移除，不要在這裡做 H2D copy
           if (work.opType_ == OpType::ALLREDUCE) {
             std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
             // [NCCL-FT Bug A fix] Guard against nullptr work.outputs_ before
@@ -2608,7 +2608,7 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
                 at::cuda::setCurrentCUDAStream(pg_->shadow_copy_stream_);
                 out.copy_(
                     pg_->shadow_buf_->narrow(0, 0, numel),
-                    /*non_blocking=*/true);
+                    true);
                 pg_->shadow_restore_event_.record(pg_->shadow_copy_stream_);
                 at::cuda::setCurrentCUDAStream(prev);
               }
@@ -2627,6 +2627,7 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
                         << "); op did not corrupt the gradient buffer.";
             }
           }
+           **/ 
 
           // [NCCL-FT Fix A] Do NOT write local_hardware_fault_mask_ here.
           //
@@ -5154,6 +5155,11 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
                     << "[NCCL-FT] 抵達重播點 OP=" << current_op
                     << " (agreed_ss=" << agreed_ss
                     << ")，執行拓撲重建";
+          /* ========================================================= */
+              /* [新增安全機制]：確保垂死的舊 GPU Kernel 完全停止寫入 */
+              // 因為只有發生錯誤才會進來這裡，所以這裡的 Synchronize 絕對不影響正常訓練效能！
+              ncclStream.synchronize(); 
+          /* ========================================================= */          
 
           rebuild_shadow_ping_pong_topology();
           this->is_degraded_ = true;
@@ -5162,6 +5168,27 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
           // seqCollective_-- (line ~5038) returns it to exactly agreed_ss,
           // and the op is recorded under the correct seq.
           seqCollective_ = agreed_ss;
+
+          /* ========================================================= */
+          /* [移轉機制]：在這裡安全地將 CPU Pinned Memory 的乾淨資料倒回 GPU */
+          if (this->shadow_buf_.has_value()) {
+              LOG(INFO) << logPrefix() << "[NCCL-FT] 執行 Shadow Buffer 恢復作業";
+              auto prev_stream = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
+              at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
+              
+              // 此時 GPU 完全安靜，倒回資料保證不會被污染
+              inputs[0].copy_(shadow_buf_->narrow(0, 0, inputs[0].numel()), /*non_blocking=*/true);
+              shadow_restore_event_.record(shadow_copy_stream_);
+              at::cuda::setCurrentCUDAStream(prev_stream);
+              
+              // 讓接下來的 replay allreduce 乖乖等待資料倒完
+              shadow_restore_event_.block(ncclStream);
+              
+              this->shadow_replay_pending_ = true;
+          }
+          /* ========================================================= */
+
+
 
           this->rollback_done_ = true;
 
