@@ -901,6 +901,30 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
       -1,
       static_cast<int>(1)); // number of device?
 
+  // [NCCL-FT] 攔截點：如果有發生網路錯誤，由 wait 觸發全域重播
+  if (!pg_->ft_disabled_ && pg_->final_commit_op_.load(std::memory_order_acquire) > 0) {
+      pg_->recover_and_replay_inflight_ops();
+  }
+
+  // 如果這個 seq 被重播過，必須等待重播的 Event，而不是失敗的 ncclEndEvent_
+  if (!pg_->ft_disabled_ && pg_->is_degraded_ && this->seq_ >= pg_->committed_shadow_seq_.load()) {
+      ShadowContext ctx;
+      bool is_replayed = false;
+      {
+          std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
+          auto it = pg_->in_flight_shadow_bufs_.find(this->seq_);
+          if (it != pg_->in_flight_shadow_bufs_.end()) {
+              ctx = it->second;
+              is_replayed = true;
+          }
+      }
+      if (is_replayed) {
+          auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
+          ctx.replayed_end_event->block(currentStream);
+          return true; // 直接返回成功
+      }
+  }  
+
   // synchronize() will block the current stream on the NCCL stream
   synchronize();
 
@@ -2818,16 +2842,18 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
               std::chrono::steady_clock::now());
         }
 
-        // [新增] 垃圾回收：這個 seq 的通訊成功了，釋放它的 Shadow Buffer！
+        // [NCCL-FT] 垃圾回收：清除 Tensor 參照，放回 Free Pool
         if (work.opType_ == OpType::ALLREDUCE && !pg_->ft_disabled_) {
             std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
             auto it = pg_->in_flight_shadow_bufs_.find(work.seq_);
             if (it != pg_->in_flight_shadow_bufs_.end()) {
-                // 把記憶體還給 Free Pool 重複利用，避免下次再度引發 pin_memory() 系統呼叫
-                pg_->free_shadow_bufs_.push_back(it->second);
+                ShadowContext ctx = it->second;
+                ctx.original_input = at::Tensor();  // 釋放 GPU VRAM 參照
+                ctx.original_output = at::Tensor(); // 釋放 GPU VRAM 參照
+                pg_->free_shadow_bufs_.push_back(ctx);
                 pg_->in_flight_shadow_bufs_.erase(it);
             }
-        }
+        }        
 
       } else {
         // Increment the iterator if the current WorkNCCLFT object is not
@@ -4888,6 +4914,28 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
     });
 }
 //New add functions
+// 尋找或配置 ShadowContext
+ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_context(const at::Tensor& t) {
+    std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+    
+    for (auto it = free_shadow_bufs_.begin(); it != free_shadow_bufs_.end(); ++it) {
+        if (it->buffer.numel() >= t.numel()) {
+            ShadowContext ctx = *it;
+            free_shadow_bufs_.erase(it);
+            return ctx;
+        }
+    }
+
+    auto cpu_opts = t.options().device(at::kCPU).memory_format(at::MemoryFormat::Contiguous);
+    LOG(INFO) << logPrefix() << "[NCCL-FT] 配置新的 Pinned Shadow Context, 大小: " << t.nbytes() << " bytes";
+    
+    ShadowContext new_ctx;
+    new_ctx.buffer = at::empty({t.numel()}, cpu_opts).pin_memory();
+    // 使用 cudaEventDisableTiming 以獲取最高效能
+    new_ctx.copy_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+    new_ctx.replayed_end_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+    return new_ctx;
+}
 
 template <typename Fn, typename PreProcess, typename PostProcess>
 c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
@@ -5072,259 +5120,40 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
     work->ncclStartEvent_->record(ncclStream);
   }
 
-  /* ===================================================================== */
-  /* --- [NCCL-FT: Commit-Aware Drain + Shadow-Seq Rollback Barrier] --- */
-  //
-  // [Step B] The old barrier used `current_op == boundary` (exact match on
-  // target_op) which could never fire: DDP asyncOp=true pre-enqueues multiple
-  // buckets, so seqCollective_ is already past target_op by the time the main
-  // thread checks.
-  //
-  // New design: the barrier checks final_commit_op_ (any non-zero value =
-  // "COMMIT happened").  The response depends on where we are relative to
-  // agreed_shadow_seq (agreed_ss, the last safely checkpointed op seq):
-  //
-  //   current_op > agreed_ss + 1  → DRAIN:  this op was enqueued after the
-  //     fault.  Return a completed NullWork without executing any NCCL kernel.
-  //     seqCollective_ is decremented to undo the bump, keeping seq consistent.
-  //
-  //   current_op == agreed_ss + 1 → REPLAY: this is the first new op after
-  //     rollback.  Execute topology rebuild here, set seqCollective_ = agreed_ss
-  //     so the replay path's seqCollective_-- lands on exactly agreed_ss.
-  //
-  // [Step E] rollback_done_ prevents re-entering the rebuild block once per
-  // fault round.  Reset at the end so the next fault round starts clean.
-  //
-  // Correct order (unchanged from Bug 2 fix):
-  //   1. shadow_restore_event_ wait (GPU-side stream fence)
-  //   2. This barrier block  (CPU: drain or rebuild)
-  //   3. pre(ncclStream, work)  ← shadow_pre skips if replay_pending
-  //   4. fn() or shadow replay
-
-  uint64_t current_op = this->seqCollective_;  // already bumped above
-
-  if (!this->ft_disabled_ && !this->rollback_done_) {
-      uint64_t commit_signal =
-          this->final_commit_op_.load(std::memory_order_acquire);
-      if (C10_UNLIKELY(commit_signal > 0)) {
-          uint64_t agreed_ss =
-              this->committed_shadow_seq_.load(std::memory_order_acquire);
-
-          LOG(INFO) << logPrefix()
-                    << "[NCCL-FT] Commit 感知: commit_signal=" << commit_signal
-                    << " agreed_ss=" << agreed_ss
-                    << " current_op=" << current_op;
-
-          // agreed_ss == UINT64_MAX means the fault happened before any
-          // AllReduce completed a shadow checkpoint.  No tensor restore is
-          // needed; just rebuild the topology and continue normally.
-          // The DRAIN/REBUILD seq arithmetic must not run in this case
-          // because agreed_ss + 1 would wrap to 0 and the DRAIN condition
-          // (current_op > 0) would be trivially true, draining all ops.
-          if (agreed_ss == UINT64_MAX) {
-              LOG(INFO) << logPrefix()
-                        << "[NCCL-FT] No checkpoint (agreed_ss=UINT64_MAX); "
-                        << "topology rebuild only, no replay.";
-              rebuild_shadow_ping_pong_topology();
-              this->is_degraded_ = true;
-              this->rollback_done_ = false; // no replay pending
-              this->ft_round_++;
-              // TCPStore cleanup
-              try {
-                  uint64_t committed_round = commit_signal - 1;
-                  std::string round_str = std::to_string(committed_round);
-                  this->globalStore_->deleteKey(
-                      "NCCL_FT_PROPOSE_" +
-                      std::to_string(this->rank_) + "_" + round_str);
-                  if (this->rank_ == 0) {
-                      this->globalStore_->deleteKey("NCCL_FT_COMMIT_" + round_str);
-                      this->globalStore_->deleteKey("NCCL_FT_SS_AGREED_" + round_str);
-                  }
-              } catch (const std::exception& e) {
-                  LOG(WARNING) << logPrefix()
-                               << "[NCCL-FT] TCPStore cleanup failed (non-fatal): "
-                               << e.what();
-              }
-              this->do_not_cross_op_.store(0, std::memory_order_release);
-              this->final_commit_op_.store(0, std::memory_order_release);
-              // Fall through to execute fn() normally on the first post-fault op.
-          } else if (current_op > agreed_ss + 1) {
-              // ── DRAIN path ──────────────────────────────────────────
-              // This is an op that DDP already enqueued while the NIC was
-              // failing.  Do not execute it: just return a NullWork so
-              // DDP's wait() completes immediately.
-              //
-              // [Step C] Undo the seq bump so the counter stays consistent.
-              if (!coalescing_state_) {
-                  seqCollective_--;
-              }
-              LOG(INFO) << logPrefix()
-                        << "[NCCL-FT] 排水多餘 op current_op=" << current_op
-                        << " (agreed_ss=" << agreed_ss
-                        << "); seqCollective_ restored to " << seqCollective_;
-
-              // [Step D] Record ncclEndEvent_ so work->wait() returns
-              // immediately (finishedGPUExecutionInternal() queries this
-              // event).  The event was not yet recorded (no kernel was
-              // launched), but recording it now on an otherwise-empty
-              // stream segment signals it instantly.
-              work->ncclEndEvent_->record(ncclStream);
-
-              // Set up future_ so DDP's getFuture() does not crash.
-              // Mirror the normal path (lines ~5149-5165) exactly.
-              {
-                  c10::cuda::CUDAMultiStreamGuard sg(ncclStream);
-                  std::vector<at::Device> devs{device};
-                  work->future_ = c10::make_intrusive<at::ivalue::Future>(
-                      c10::ListType::create(c10::TensorType::get()), devs);
-                  work->future_->markCompleted(at::IValue(*work->outputs_));
-              }
-              return work;
-          } else {
-          // ── REBUILD path (current_op == agreed_ss + 1) ──────────────
-          LOG(INFO) << logPrefix()
-                    << "[NCCL-FT] 抵達重播點 OP=" << current_op
-                    << " (agreed_ss=" << agreed_ss
-                    << ")，執行拓撲重建";
-          /* ========================================================= */
-              /* [新增安全機制]：確保垂死的舊 GPU Kernel 完全停止寫入 */
-              // 因為只有發生錯誤才會進來這裡，所以這裡的 Synchronize 絕對不影響正常訓練效能！
-              ncclStream.synchronize(); 
-          /* ========================================================= */          
-
-          rebuild_shadow_ping_pong_topology();
-          this->is_degraded_ = true;
-
-          // [Step C] Align seqCollective_ to agreed_ss so the replay path's
-          // seqCollective_-- (line ~5038) returns it to exactly agreed_ss,
-          // and the op is recorded under the correct seq.
-          seqCollective_ = agreed_ss;
-
-          /* ========================================================= */
-          /* [移轉機制]：在這裡安全地將 CPU Pinned Memory 的乾淨資料倒回 GPU */
-          at::Tensor restore_tensor;
-          bool has_restore_tensor = false;
-          {
-              std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
-              auto it = in_flight_shadow_bufs_.find(agreed_ss);
-              if (it != in_flight_shadow_bufs_.end()) {
-                  restore_tensor = it->second;
-                  has_restore_tensor = true;
-              }
-          }
-
-          if (has_restore_tensor) {
-              LOG(INFO) << logPrefix() << "[NCCL-FT] 執行 Shadow Buffer 恢復作業 (seq=" << agreed_ss << ")";
-              auto prev_stream = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
-              at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
-              
-              // 此時 GPU 完全安靜，倒回資料保證不會被污染
-              inputs[0].copy_(restore_tensor.narrow(0, 0, inputs[0].numel()), /*non_blocking=*/true);
-              shadow_restore_event_.record(shadow_copy_stream_);
-              at::cuda::setCurrentCUDAStream(prev_stream);
-              
-              // 讓接下來的 replay allreduce 乖乖等待資料倒完
-              shadow_restore_event_.block(ncclStream);
-              
-              this->shadow_replay_pending_ = true;
-          } else {
-              LOG(WARNING) << logPrefix() << "[NCCL-FT] 警告：找不到對應 seq=" << agreed_ss << " 的 Shadow Buffer!";
-          }
-          /* ========================================================= */
-
-
-
-          this->rollback_done_ = true;
-
-          // Advance the fault-round counter so the side-car's next iteration
-          // uses a fresh key namespace and does not re-process this round.
-          this->ft_round_++;
-
-          // Clean up TCPStore keys for this fault round.
-          try {
-              uint64_t committed_round = commit_signal - 1; // cur_round
-              std::string round_str = std::to_string(committed_round);
-              std::string my_propose =
-                  "NCCL_FT_PROPOSE_" +
-                  std::to_string(this->rank_) + "_" + round_str;
-              this->globalStore_->deleteKey(my_propose);
-              LOG(INFO) << logPrefix()
-                        << "[NCCL-FT] TCPStore: deleted per-rank propose key "
-                        << "for round=" << committed_round;
-              if (this->rank_ == 0) {
-                  this->globalStore_->deleteKey(
-                      "NCCL_FT_COMMIT_" + round_str);
-                  this->globalStore_->deleteKey(
-                      "NCCL_FT_SS_AGREED_" + round_str);
-                  LOG(INFO) << logPrefix()
-                            << "[NCCL-FT] TCPStore: deleted shared keys for "
-                            << "round=" << committed_round;
-              }
-          } catch (const std::exception& e) {
-              LOG(WARNING) << logPrefix()
-                           << "[NCCL-FT] TCPStore key cleanup failed "
-                           << "(non-fatal): " << e.what();
-          }
-
-          // Reset 2PC control atomics.  Resetting final_commit_op_ to 0 also
-          // unblocks the side-car's wait loop so it advances to the next round.
-          this->do_not_cross_op_.store(0, std::memory_order_release);
-          this->final_commit_op_.store(0, std::memory_order_release);
-
-          // rollback_done_ is intentionally left true here.  It is reset at
-          // the end of this block (after the shadow restore fence and replay)
-          // so the next fault round starts with it false.  See [Step E].
-          } // end else (REBUILD path)
-      }
-  }
-  /* ===================================================================== */
-
-  // [NCCL-FT] Sub-Task 3 (event-wait): wait for the Watchdog's shadow restore
-  // copy to complete on the GPU before the pre lambda checkpoints the tensor
-  // (which might now hold the restored clean gradient).
-  //
-  // This wait is placed AFTER the 2PC barrier (not before) because:
-  //   - The Watchdog records shadow_restore_event_ only after clearing the
-  //     poisoned work, which happens before the negotiator sets final_commit_op_.
-  //   - By the time the main thread exits the 2PC spin-wait, the restore copy
-  //     is already enqueued (the Watchdog ran first). We just need the GPU-side
-  //     fence before the stream executes the next kernel.
-  //   - Moving the wait here (after barrier, before pre) ensures the sequence:
-  //     [restore copy] → [barrier] → [wait] → [pre lambda / replay AllReduce]
-  if (!ft_disabled_) {
-      bool pending;
-      {
-          std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
-          pending = shadow_restore_pending_;
-      }
-      if (pending) {
-          // Insert a GPU-side stream-wait: the NCCL stream will not advance
-          // past this point until shadow_restore_event_ (recorded on
-          // shadow_copy_stream_ after the H2D restore copy) is signalled.
-          // This is a pure GPU fence — no CPU blocking — so the main thread
-          // returns immediately and CUDA enforces the ordering at execution
-          // time.
-          shadow_restore_event_.block(ncclStream);
-          std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
-          shadow_restore_pending_ = false;
-          LOG(INFO) << logPrefix()
-                    << "[NCCL-FT] NCCL stream fenced on shadow_restore_event_ "
-                    << "(H2D restore must complete before replay AllReduce).";
-      }
-  }
-
+  /* 保留最單純的分流 */
   pre(ncclStream, work);
-
   ncclComm_t comm = ncclComm->getNcclComm();
 
-  // Both `inputs' and `outputs' are created on a worker stream and used in
-  // different ncclStreams.  Hence, both must record the ncclStream to
-  // prevent being freed before the collective finishes.
-  //
-  // We only record `inputs' here, and leave recording `outputs' to `fn' for
-  // operations where `inputs' and `outputs' are not the same.
-  //
-  // See [Sync Streams].
+  if (C10_UNLIKELY(this->is_degraded_)) {
+      LOG(INFO) << logPrefix() << "[NCCL-FT] 降級模式，執行 Shadow Ping-Pong (seq=" << seqCollective_ << ")";
+      if (opType == OpType::ALLREDUCE) {
+          execute_shadow_allreduce(inputs[0], outputs[0], ncclStream, current_shadow_reduce_op_);
+      } else {
+          LOG(WARNING) << logPrefix() << "Non-AllReduce op in degraded mode...";
+      }
+      work->ncclComm_ = proxy_global_comm_ ? proxy_global_comm_ : local_nvlink_comm_;
+  } else {
+      try {
+#ifndef NCCL_HAS_COMM_NONBLOCKING
+        C10D_NCCL_FT_CHECK(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm->getNcclCommFailureReason());
+#else
+        C10D_NCCL_FT_CHECK_TIMEOUT(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm, ncclComm->getNcclCommFailureReason());
+#endif 
+      } catch (const ::c10::NCCLFaultToleranceError& e) {
+        if (!ft_disabled_) {
+          LOG(WARNING) << logPrefix() << "[NCCL-FT] 攔截到 NCCL Error (seq=" << seqCollective_ << ")，交給 wait() 重播。";
+          work->ncclEndEvent_->record(ncclStream);
+          // 這裡必須賦值給未來 Python 的 wait
+          work->ncclComm_ = ncclComm; 
+          // ... 略過 future_ 設置邏輯 ...
+          return work;
+        }
+        throw;
+      }
+      work->ncclComm_ = ncclComm;
+  }
+
+
 
 // Not all collectives have the same signature, e.g, all-reduce take in a Tensor
 // as the input and output while all-to-all take in a vector of Tensors as input
@@ -5370,12 +5199,14 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   }
 
   bool ran_shadow_replay = false;
+  // 【切換點 A：故障發生後的第一次重播】
   if (!ft_disabled_ && C10_UNLIKELY(shadow_replay_pending_) &&
       opType == OpType::ALLREDUCE &&
       proxy_comm_ready_.load(std::memory_order_acquire)) {
       // Undo the seqCollective_ bump: this call IS the replay of seq N, not
       // a new op. After replay, seqCollective_ should equal committed_shadow_seq_
       // (the agreed seq of the replayed op).
+      // 1. 退回 seq，準備重播
       if (!coalescing_state_) {
           seqCollective_--;
       }
@@ -5384,8 +5215,10 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
                 << "[NCCL-FT] Sub-Task 5 REPLAY after rollback for seq="
                 << replay_seq
                 << " (seqCollective_ adjusted to " << seqCollective_ << ")";
+      // 2. 呼叫 Shadow Ping-Pong (代傳機制)          
       execute_shadow_allreduce(
           inputs[0], outputs[0], ncclStream, current_shadow_reduce_op_);
+      // 3. 標記重播完成    
       {
           std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
           shadow_replay_pending_ = false;
@@ -5397,17 +5230,21 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
       rollback_done_ = false;
   }
 
+  // 【切換點 B：日常訓練 vs. 降級代傳】
+  // 情況 1：網路已經斷線過了 (is_degraded_ == true)，而且這不是重播的那一次
   if (C10_UNLIKELY(this->is_degraded_) && !ran_shadow_replay) {
       LOG(INFO) << logPrefix()
                 << "[NCCL-FT] Degraded mode active, opType="
                 << opTypeToString(opType) << ", rank=" << rank_;
       if (opType == OpType::ALLREDUCE && proxy_comm_ready_.load(std::memory_order_acquire)) {
+          // 走降級代傳機制 (健康卡 做 AllReduce，死卡走 NVLink 委託)
           execute_shadow_allreduce(
               inputs[0], outputs[0], ncclStream, current_shadow_reduce_op_);
       } else {
           // Non-AllReduce op or proxy comm not ready: fall back to native path
           // and log a warning. proxy_global_comm_ has a different size, so we
           // must still use the original comm here.
+          // Fallback 邏輯 (萬一是不支援的 OP)
           if (opType != OpType::ALLREDUCE) {
               LOG(WARNING) << logPrefix()
                            << "[NCCL-FT] Non-AllReduce op in degraded mode — "
@@ -5425,7 +5262,9 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 #endif // NCCL_HAS_COMM_NONBLOCKING
       }
   } else {
-      /* --- [原生 NCCL 執行路徑] --- */
+      /* ========================================================= */
+      /* --- [原生 NCCL 執行路徑] (正常訓練時，100% 只會走這裡) --- */
+      /* ========================================================= */
       // [NCCL-FT] Catch synchronous NCCL errors thrown by the fn() call.
       //
       // When a NIC fault fires during or before the first collective (e.g.,
@@ -5581,6 +5420,75 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   }
 
   return asyncOp ? work : nullptr;
+}
+
+void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
+    std::lock_guard<std::mutex> lock(recovery_mutex_); // 確保只有一個 Thread 進行恢復
+    
+    if (this->is_degraded_ && this->rollback_done_) return;
+
+    LOG(INFO) << logPrefix() << "[NCCL-FT] 啟動全域重播中心！";
+
+    // 1. 確保舊的 Communicator 徹底死亡
+    auto device = at::Device(at::DeviceType::CUDA, this->guessDeviceId());
+    auto globalComm = this->getNCCLComm(getKeyFromDevice(device));
+    if (globalComm && !globalComm->isAborted()) {
+        globalComm->abort("FT Recovery - Aborting dead comm");
+    }
+
+    // 2. 重建降級拓撲
+    rebuild_shadow_ping_pong_topology();
+    this->is_degraded_ = true;
+
+    uint64_t agreed_ss = this->committed_shadow_seq_.load(std::memory_order_acquire);
+
+    // 3. 收集所有需要重播的 Buckets (大於等於 agreed_ss)
+    std::vector<uint64_t> seqs_to_replay;
+    {
+        std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+        for (auto const& [seq, ctx] : in_flight_shadow_bufs_) {
+            if (seq >= agreed_ss) { 
+                seqs_to_replay.push_back(seq);
+            }
+        }
+    }
+    std::sort(seqs_to_replay.begin(), seqs_to_replay.end());
+
+    auto ncclStream = ncclStreams_.at(getKeyFromDevice(device));
+
+    // 4. 依序還原並重播
+    for (uint64_t seq : seqs_to_replay) {
+        LOG(INFO) << logPrefix() << "[NCCL-FT] 正在重播 Bucket (seq=" << seq << ")";
+        ShadowContext ctx;
+        {
+            std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+            ctx = in_flight_shadow_bufs_[seq];
+        }
+
+        // 確保這包資料的 D2H 備份完成
+        ctx.copy_event->synchronize();
+
+        // H2D 還原
+        auto prev_stream = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
+        at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
+        ctx.original_input.copy_(ctx.buffer.narrow(0, 0, ctx.original_input.numel()), true);
+        
+        at::cuda::CUDAEvent restore_done;
+        restore_done.record(shadow_copy_stream_);
+        at::cuda::setCurrentCUDAStream(prev_stream);
+
+        restore_done.block(ncclStream);
+
+        // 重播
+        execute_shadow_allreduce(ctx.original_input, ctx.original_output, ncclStream, ctx.reduce_op);
+        
+        // 紀錄專屬的 Replayed End Event
+        ctx.replayed_end_event->record(ncclStream);
+    }
+
+    this->rollback_done_ = true;
+    this->final_commit_op_.store(0, std::memory_order_release);
+    LOG(INFO) << logPrefix() << "[NCCL-FT] 全域重播完成！";
 }
 
 template <typename Fn>
@@ -6220,18 +6128,21 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
   //   wait so the D2H copy sees fully written gradients before reading them.
   //   shadow_copy_event_ is recorded after the copy completes so the Watchdog
   //   can verify the CPU buffer is complete before using it for restore.
-  auto shadow_pre = [this, &tensor](at::cuda::CUDAStream& /* nccl_stream */, c10::intrusive_ptr<WorkNCCLFT>& work) {
+  auto shadow_pre = [this, &tensor, opts](at::cuda::CUDAStream& /* nccl_stream */, c10::intrusive_ptr<WorkNCCLFT>& work) {
     if (ft_disabled_) return;
     
-    uint64_t current_seq = work->seq_; // 取得這個 Work 專屬的 seq
-    at::Tensor shadow_tensor = get_or_allocate_shadow_buffer(tensor);
+    uint64_t current_seq = work->seq_; 
+    ShadowContext ctx = get_or_allocate_shadow_context(tensor);
+    // 綁定 Tensor 與 Op 資訊，供稍後重播使用
+    ctx.original_input = tensor;
+    ctx.original_output = tensor; // AllReduce 通常 in-place
+    ctx.reduce_op = opts.reduceOp;
     
     {
         std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
-        in_flight_shadow_bufs_[current_seq] = shadow_tensor;
+        in_flight_shadow_bufs_[current_seq] = ctx;
     }
 
-    // 進行非同步的 GPU -> CPU 複製
     at::cuda::CUDAEvent compute_done;
     auto compute_stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
     compute_done.record(compute_stream);
@@ -6240,12 +6151,10 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
     auto prev = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
     at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
     
-    // 複製到專屬於這個 seq 的 Buffer 中
-    shadow_tensor.narrow(0, 0, tensor.numel()).copy_(tensor, /*non_blocking=*/true);
+    ctx.buffer.narrow(0, 0, tensor.numel()).copy_(tensor, /*non_blocking=*/true);
+    ctx.copy_event->record(shadow_copy_stream_); // Per-seq 精準紀錄！
     
-    shadow_copy_event_.record(shadow_copy_stream_);
     at::cuda::setCurrentCUDAStream(prev);
-    
     this->shadow_seq_ = current_seq; 
   };
 

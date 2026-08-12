@@ -1177,40 +1177,27 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // by trigger_fault_proposal and the negotiator thread respectively, and
   // read by the negotiator and main threads — no mutex needed for them.
   // -----------------------------------------------------------------------
+  // [NCCL-FT] Per-seq Shadow Context: 綁定 CPU 備份、Event 與原始 Tensor 參照
+  struct ShadowContext {
+      at::Tensor buffer;                                  // Pinned CPU Memory
+      std::shared_ptr<at::cuda::CUDAEvent> copy_event;    // D2H 備份完成的 Event
+      std::shared_ptr<at::cuda::CUDAEvent> replayed_end_event; // 重播完成的 Event
+      at::Tensor original_input;                          // 用於 H2D 還原的 GPU Tensor
+      at::Tensor original_output;
+      ReduceOp reduce_op;                                 // 每個 Bucket 可能有不同的 ReduceOp
+  };
 
-  // Pinned CPU buffer sized to the largest gradient tensor seen.
-  // nullopt until the first allreduce. Reallocated if a larger tensor arrives.
-  //std::optional<at::Tensor> shadow_buf_;
-  std::unordered_map<uint64_t, at::Tensor> in_flight_shadow_bufs_;
-  std::vector<at::Tensor> free_shadow_bufs_; // 用來重複利用已分配的記憶體
+  std::unordered_map<uint64_t, ShadowContext> in_flight_shadow_bufs_;
+  std::vector<ShadowContext> free_shadow_bufs_; 
   std::mutex shadow_buf_mutex_;
 
-  // seqCollective_ value of the AllReduce whose input was last checkpointed.
-  uint64_t shadow_seq_{0};
+  std::mutex recovery_mutex_; // 保護全域重播中心，確保只有一個 thread 執行重播
+  void recover_and_replay_inflight_ops();
+  ShadowContext get_or_allocate_shadow_context(const at::Tensor& t);
 
-  // Dedicated low-priority CUDA stream for shadow buffer D2H and H2D copies.
-  // Kept separate from the NCCL stream so checkpoint copies run in parallel
-  // with AllReduce and do not add latency to the normal training path.
+  uint64_t shadow_seq_{0};
   at::cuda::CUDAStream shadow_copy_stream_{
       at::cuda::getStreamFromPool(/*isHighPriority=*/false)};
-
-  // Recorded on shadow_copy_stream_ immediately after each D2H checkpoint
-  // copy.  The Watchdog waits for this event before enqueuing the H2D restore,
-  // ensuring the CPU buffer holds a complete, un-torn checkpoint.
-  at::cuda::CUDAEvent shadow_copy_event_;
-
-  // Recorded on shadow_copy_stream_ after the Watchdog enqueues the H2D
-  // restore copy.  The main thread inserts a stream-wait on the NCCL stream
-  // so the replay AllReduce starts only after the restore is complete.
-  at::cuda::CUDAEvent shadow_restore_event_;
-
-  // Set by Watchdog when a restore has been enqueued; cleared by main thread
-  // after shadow_restore_event_.block() returns.
-  bool shadow_restore_pending_{false};
-
-  // Set by Watchdog alongside shadow_restore_pending_; tells collective() to
-  // run the Shadow Ping-Pong replay instead of the normal fn() path.
-  bool shadow_replay_pending_{false};
 
   // shadow_seq_ captured at the moment trigger_fault_proposal fires.
   // Read by the negotiator thread to include in the PROPOSE message.
@@ -1223,8 +1210,10 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // The shadow_seq value agreed by all ranks via TCPStore consensus.
   // Written by the negotiator thread after COMMIT; read by main thread at replay.
   std::atomic<uint64_t> committed_shadow_seq_{0};
+  
 
   // -----------------------------------------------------------------------
+
 
   // 獨立的側車執行緒，專門負責 2PC 協商，絕對不干擾原生 Watchdog
   std::thread ft_negotiator_thread_;
