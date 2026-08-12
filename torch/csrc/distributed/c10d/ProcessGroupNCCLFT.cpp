@@ -340,6 +340,12 @@ extern "C" void nccl_ft_global_fault_callback(int dev_idx) {
         pg->trigger_fault_proposal(dev_idx);
     }
 }
+
+/* --- [NCCL-FT: C API 到 C++ 實體的全域橋樑] --- */
+extern "C" {
+    // 宣告我們在 NCCL src/init.cc 中新增的黑名單 API
+    ncclResult_t ncclCommBanNic(int dev_idx);
+}
 /* ========================================================================= */
 
 } // namespace
@@ -4023,75 +4029,70 @@ float ProcessGroupNCCLFT::endTimeEstimate() {
 #endif
 }
 
-// [NCCL-FT] Build the intra-node NVLink communicator via ncclCommSplit.
+// [NCCL-FT] Build the intra-node NVLink communicator independently from scratch.
 //
-// Why ncclCommSplit instead of ncclCommInitRank:
-//   ncclCommInitRank always re-runs full hardware topology discovery, which
-//   scans cross-node NICs. In a setup where each GPU has a dedicated NIC,
-//   NCCL may fail with "Could not find any local path from gpu N to net" for
-//   GPUs whose NICs are not visible from that rank's NUMA context.
-//   ncclCommSplit inherits the already-validated topology from the global comm
-//   and avoids the NIC scan entirely.
+// Why NCCLFTComm::create instead of ncclCommSplit:
+//   Previously, we used ncclCommSplit to derive the local comm from the global comm.
+//   However, if a NIC faults during the FIRST collective, the global comm is
+//   aborted before the local comm can be split. This creates a chicken-and-egg
+//   deadlock where the FT recovery needs the local comm to execute Shadow Ping-Pong,
+//   but cannot build it because the parent global comm is already dead.
 //
-// Collective semantics: ncclCommSplit is a collective call — ALL 16 ranks must
-// call it simultaneously. Each node uses its own color (= node_id), so each
-// node gets an independent sub-communicator of size=localDeviceCount_.
-//
-// This function must be called lazily (on the first collective), not in the
-// constructor, because the global comm does not exist until the first
-// initNCCLComm() call.
+// Solution:
+//   Completely decouple the local_nvlink_comm_. We use TCPStore with a node-specific
+//   key to share a fresh ncclUniqueId only among the ranks on the same node.
+//   Since this is built during the very first collective (before any NIC faults
+//   typically bring down the system), NCCL will successfully discover the local 
+//   PCIe/NVLink topology and create an indestructible intra-node communicator.
 void ProcessGroupNCCLFT::initLocalNvlinkComm() {
-#ifndef NCCL_HAS_COMM_SPLIT
-    LOG(WARNING) << logPrefix()
-                 << "[NCCL-FT] NCCL version does not support ncclCommSplit "
-                 << "(requires >= 2.14). local_nvlink_comm_ will remain null. "
-                 << "Shadow Ping-Pong failover will not work.";
-    return;
-#else
     int node_id    = rank_ / localDeviceCount_;
     int local_rank = rank_ % localDeviceCount_;
 
-    // Obtain the global communicator for the device this rank is bound to.
-    // It must exist at this point because initLocalNvlinkComm() is called
-    // only after the first initNCCLComm() has succeeded.
-    auto device = at::Device(at::DeviceType::CUDA, guessDeviceId());
-    const auto key = getKeyFromDevice(device);
-    std::shared_ptr<NCCLFTComm> globalComm;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = devNCCLCommMap_.find(key);
-        if (it == devNCCLCommMap_.end() || it->second == nullptr) {
-            LOG(WARNING) << logPrefix()
-                         << "[NCCL-FT] initLocalNvlinkComm: global comm not found "
-                         << "for device key=" << key
-                         << ". local_nvlink_comm_ will remain null.";
-            return;
-        }
-        globalComm = it->second;
+    LOG(INFO) << logPrefix()
+              << "[NCCL-FT] initLocalNvlinkComm: Building independent NVLink communicator "
+              << "from scratch (node_id=" << node_id 
+              << ", local_rank=" << local_rank << ")";
+
+    // 1. Generate or retrieve the NCCL Unique ID for this specific node
+    ncclUniqueId localId;
+    std::string local_id_key = "NCCL_FT_LOCAL_COMM_ID_NODE_" + std::to_string(node_id);
+
+    if (local_rank == 0) {
+        // 本機的 GPU 0 負責產生這台機器的專屬 ID
+        C10D_NCCL_FT_CHECK(ncclGetUniqueId(&localId), std::nullopt);
+        auto vec = std::vector<uint8_t>(
+            reinterpret_cast<uint8_t*>(&localId),
+            reinterpret_cast<uint8_t*>(&localId) + NCCL_UNIQUE_ID_BYTES);
+        this->globalStore_->set(local_id_key, vec);
+        
+        LOG(INFO) << logPrefix() 
+                  << "[NCCL-FT] Local rank 0 generated and stored NVLink Comm ID for Node " 
+                  << node_id;
+    } else {
+        // 本機的其他 GPU 等待 GPU 0 將 ID 寫入 TCPStore
+        this->globalStore_->wait({local_id_key}, std::chrono::seconds(30));
+        auto vec = this->globalStore_->get(local_id_key);
+        std::memcpy(&localId, vec.data(), vec.size());
     }
 
-    LOG(INFO) << logPrefix()
-              << "[NCCL-FT] initLocalNvlinkComm: splitting from global comm "
-              << globalComm->repr()
-              << " (node_id=" << node_id
-              << ", local_rank=" << local_rank
-              << ", color=" << node_id << ")";
-
-    // color = node_id: all ranks on the same node get the same color, so
-    // ncclCommSplit groups them into one sub-communicator per node.
-    // The new rank within the sub-comm is determined by NCCL ordering
-    // (consistent with local_rank because all global ranks are ordered 0..N-1
-    // and ranks on the same node are contiguous).
+    // 2. Initialize the local communicator
+    // 使用 blocking 模式，確保建立失敗時能立刻捕捉到錯誤
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
-    config.blocking = 1;  // blocking init to detect errors synchronously
-    local_nvlink_comm_ = NCCLFTComm::split(
-        globalComm.get(), node_id, rank_, config);
+    config.blocking = 1;
+
+    // 取得當前綁定的 CUDA Device
+    auto device = at::Device(at::DeviceType::CUDA, guessDeviceId());
+
+    LOG(INFO) << logPrefix() << "[NCCL-FT] Calling NCCLFTComm::create for local_nvlink_comm_...";
+
+    // 從頭建立全新的 Communicator
+    // 參數: (總數=localDeviceCount_, 內部排行=local_rank, ID, GPU index, config)
+    local_nvlink_comm_ = NCCLFTComm::create(
+        localDeviceCount_, local_rank, localId, device.index(), config);
 
     if (local_nvlink_comm_ == nullptr) {
-        LOG(ERROR) << logPrefix()
-                   << "[NCCL-FT] initLocalNvlinkComm: NCCLFTComm::split returned "
-                   << "nullptr. Shadow Ping-Pong failover will not work.";
-        return;
+        C10_THROW_ERROR(DistBackendError, 
+            c10::str(logPrefix(), "[NCCL-FT] Failed to create local_nvlink_comm_ via NCCLFTComm::create!"));
     }
 
     LOG(INFO) << logPrefix()
@@ -4100,7 +4101,6 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm() {
               << " (node=" << node_id
               << ", local_rank=" << local_rank
               << ", sub-comm size=" << localDeviceCount_ << ")";
-#endif // NCCL_HAS_COMM_SPLIT
 }
 
 // [NCCL-FT] Build a reduced cross-node communicator that excludes the failed
@@ -4186,7 +4186,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     // 在 rebuild_shadow_ping_pong_topology() 中加診斷 log
     LOG(INFO) << "[NCCL-FT] globalComm isAborted=" 
               << globalComm->isAborted()
-              << " before ncclCommSplit";
+              << " before NCCLFTComm::create";
 
     LOG(INFO) << logPrefix()
               << "[NCCL-FT] rebuild_shadow_ping_pong_topology: "
@@ -4196,20 +4196,52 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
               << " proxy_comm_size=" << proxy_comm_size_
               << " proxy_comm_rank=" << proxy_comm_rank_;
 
-    proxy_global_comm_ = NCCLFTComm::split(
-        globalComm.get(), color, rank_, config);
+    /* ===================================================================== */
+    /* --- [NCCL-FT: 執行對稱物理黑名單遮蔽] --- */
+    // 不論本機是否為 faulty，所有節點的 faulty_devs 內容都是 2PC 對齊後的結果。
+    // 讓所有節點共同將這些 dev_idx 加入 NCCL 底層的黑名單，確保 Topology 完全對稱！
+    for (int d : faulty_devs) {
+        LOG(INFO) << logPrefix() << "[NCCL-FT] 呼叫底層 API ncclCommBanNic，將 NIC " << d << " 徹底遮蔽";
+        ncclCommBanNic(d);
+    }
+    /* ===================================================================== */
 
+    // 刪除原本的 NCCLFTComm::split，改為以下全新建立的邏輯：
     if (!is_faulty) {
-        TORCH_CHECK(
-            proxy_global_comm_ != nullptr,
-            logPrefix(),
-            "[NCCL-FT] NCCLFTComm::split returned nullptr for healthy rank. "
-            "Cannot build proxy_global_comm_.");
-        LOG(INFO) << logPrefix()
-                  << "[NCCL-FT] proxy_global_comm_ ready: "
-                  << proxy_global_comm_->repr()
-                  << " (proxy_rank=" << proxy_comm_rank_
-                  << ", proxy_size=" << proxy_comm_size_ << ")";
+        /* 
+         * 【極度重要提醒】
+         * 在這裡，你必須確保 NCCL 底層已經實作了動態黑名單 API
+         * 否則 NCCL 重新 Init 時，Topology Cache 會去讀壞掉的網卡導致再次 Hang 死！
+         */
+        for (int d : faulty_devs) {
+             ncclCommBanNic(d); // 呼叫你在 NCCL 開的後門 API
+        }
+
+        // 重新分配一個 Unique ID 給新的降級群組
+        ncclUniqueId proxyId;
+        std::string proxy_id_key = "NCCL_FT_PROXY_ID_" + std::to_string(ft_round_);
+
+        if (proxy_comm_rank_ == 0) {
+            ncclGetUniqueId(&proxyId);
+            auto vec = std::vector<uint8_t>(
+                reinterpret_cast<uint8_t*>(&proxyId),
+                reinterpret_cast<uint8_t*>(&proxyId) + NCCL_UNIQUE_ID_BYTES);
+            this->globalStore_->set(proxy_id_key, vec);
+        } else {
+            // 其他健康節點等待 Rank 0 廣播的 ID
+            this->globalStore_->wait({proxy_id_key}, std::chrono::seconds(30));
+            auto vec = this->globalStore_->get(proxy_id_key);
+            std::memcpy(&proxyId, vec.data(), vec.size());
+        }
+
+        LOG(INFO) << logPrefix() << "[NCCL-FT] 建立全新的 proxy_global_comm_ (Size=" 
+                  << proxy_comm_size_ << " Rank=" << proxy_comm_rank_ << ")";
+        
+        // 從頭建立全新的降級群組 (Re-Init)
+        // 此時 NCCL 底層的 ncclTopoGetSystem 會掃描網卡，但會因為前面的 ncclCommBanNic 而跳過壞卡！
+        proxy_global_comm_ = NCCLFTComm::create(proxy_comm_size_, proxy_comm_rank_, proxyId, device.index(), config);
+        
+        LOG(INFO) << logPrefix() << "[NCCL-FT] proxy_global_comm_ ready!";
     } else {
         proxy_global_comm_.reset();
         LOG(INFO) << logPrefix()
@@ -4772,6 +4804,18 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                                   << " for round=" << cur_round;
                     }
                 }
+
+                /* ========================================================= */
+                /* [新增] 暴力砍斷全域通訊，解救卡死的主執行緒！               */
+                {
+                    auto device = at::Device(at::DeviceType::CUDA, this->guessDeviceId());
+                    auto globalComm = this->getNCCLComm(getKeyFromDevice(device));
+                    if (globalComm && !globalComm->isAborted()) {
+                        LOG(WARNING) << logPrefix() << "[NCCL-FT] 2PC 達成共識，側車強制 Abort 全域 Communicator 以喚醒主執行緒！";
+                        globalComm->abort("FT 2PC Committed - Wake up main thread");
+                    }
+                }
+                /* ========================================================= */                
 
                 // Signal the main thread: any non-zero value unblocks it.
                 // Using cur_round+1 makes the value strictly increasing and
