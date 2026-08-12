@@ -2817,6 +2817,18 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
           pg_->heartbeatMonitor_->setLastWorkListUpdateTime(
               std::chrono::steady_clock::now());
         }
+
+        // [新增] 垃圾回收：這個 seq 的通訊成功了，釋放它的 Shadow Buffer！
+        if (work.opType_ == OpType::ALLREDUCE && !pg_->ft_disabled_) {
+            std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
+            auto it = pg_->in_flight_shadow_bufs_.find(work.seq_);
+            if (it != pg_->in_flight_shadow_bufs_.end()) {
+                // 把記憶體還給 Free Pool 重複利用，避免下次再度引發 pin_memory() 系統呼叫
+                pg_->free_shadow_bufs_.push_back(it->second);
+                pg_->in_flight_shadow_bufs_.erase(it);
+            }
+        }
+
       } else {
         // Increment the iterator if the current WorkNCCLFT object is not
         // completed.
@@ -4501,6 +4513,25 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
               << this->local_hardware_fault_mask_.load(std::memory_order_relaxed)
               << std::dec
               << " pending_shadow_seq=" << this->shadow_seq_;
+}
+
+//ring buffer 緩衝區的智慧分配與複用
+at::Tensor ProcessGroupNCCLFT::get_or_allocate_shadow_buffer(const at::Tensor& t) {
+    std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+    
+    // 尋找是否有足夠大的空閒 Buffer 可以直接拿來用
+    for (auto it = free_shadow_bufs_.begin(); it != free_shadow_bufs_.end(); ++it) {
+        if (it->numel() >= t.numel()) {
+            at::Tensor reused_tensor = *it;
+            free_shadow_bufs_.erase(it);
+            return reused_tensor;
+        }
+    }
+
+    // 如果沒有可用的，才向 OS 申請新的 Pinned Memory
+    auto cpu_opts = t.options().device(at::kCPU).memory_format(at::MemoryFormat::Contiguous);
+    LOG(INFO) << logPrefix() << "[NCCL-FT] 配置新的 Pinned Shadow Buffer, 大小: " << t.nbytes() << " bytes";
+    return at::empty({t.numel()}, cpu_opts).pin_memory();
 }
 
 
@@ -6205,7 +6236,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
       ensure_shadow_buffer(tensor);
   }
 
-  // [NCCL-FT] Sub-Task 2: pre lambda — checkpoint tensor into shadow_buf_.
+  // [NCCL-FT] Sub-Task 2: pre lambda — checkpoint tensor into ring shadow buffer (in_flight_shadow_bufs_).
   //
   // The checkpoint runs on shadow_copy_stream_ (NOT the NCCL stream) so that
   // the D2H copy runs in parallel with ncclAllReduce without adding any
@@ -6217,42 +6248,33 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
   //   wait so the D2H copy sees fully written gradients before reading them.
   //   shadow_copy_event_ is recorded after the copy completes so the Watchdog
   //   can verify the CPU buffer is complete before using it for restore.
-  auto shadow_pre = [this, &tensor](
-      at::cuda::CUDAStream& /* nccl_stream */,
-      c10::intrusive_ptr<WorkNCCLFT>& /* work */) {
-    if (ft_disabled_ || !shadow_buf_.has_value()) return;
-    std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
-    // [NCCL-FT Bug 1 fix] Do not overwrite the already-restored shadow buffer
-    // when a replay is pending. The Watchdog restored shadow_buf_ to the clean
-    // pre-fault gradient; overwriting it now (with possibly the same or a
-    // different bucket's data) would corrupt the replay input.
-    if (shadow_replay_pending_) {
-      LOG(INFO) << logPrefix()
-                << "[NCCL-FT] shadow_pre: skipping checkpoint because "
-                << "shadow_replay_pending_=true (seq=" << seqCollective_ << ")";
-      return;
+  auto shadow_pre = [this, &tensor](at::cuda::CUDAStream& /* nccl_stream */, c10::intrusive_ptr<WorkNCCLFT>& work) {
+    if (ft_disabled_) return;
+    
+    uint64_t current_seq = work->seq_; // 取得這個 Work 專屬的 seq
+    at::Tensor shadow_tensor = get_or_allocate_shadow_buffer(tensor);
+    
+    {
+        std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+        in_flight_shadow_bufs_[current_seq] = shadow_tensor;
     }
-    int64_t numel = tensor.numel();
-    // Cross-stream dependency: shadow_copy_stream_ must not read `tensor`
-    // until the compute stream (which ran backward() and wrote the gradients)
-    // has finished.  The correct PyTorch idiom is:
-    //   1. Record an event on the producer stream (compute stream).
-    //   2. Call event.block(consumer_stream) to insert a cudaStreamWaitEvent
-    //      on the consumer, making it wait for the event before proceeding.
-    // This is a pure GPU-side fence — no CPU stalling.
+
+    // 進行非同步的 GPU -> CPU 複製
     at::cuda::CUDAEvent compute_done;
     auto compute_stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
     compute_done.record(compute_stream);
     compute_done.block(shadow_copy_stream_);
-    // Now enqueue the D2H copy on shadow_copy_stream_.  ATen dispatches
-    // copy_(CPU_dst, CUDA_src, non_blocking=true) as cudaMemcpyAsync(D2H)
-    // on the currently set stream, so we switch temporarily.
+
     auto prev = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
     at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
-    shadow_buf_->narrow(0, 0, numel).copy_(tensor, /*non_blocking=*/true);
+    
+    // 複製到專屬於這個 seq 的 Buffer 中
+    shadow_tensor.narrow(0, 0, tensor.numel()).copy_(tensor, /*non_blocking=*/true);
+    
     shadow_copy_event_.record(shadow_copy_stream_);
     at::cuda::setCurrentCUDAStream(prev);
-    shadow_seq_ = seqCollective_;  // already bumped by collective()
+    
+    this->shadow_seq_ = current_seq; 
   };
 
   return collective(

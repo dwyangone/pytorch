@@ -1180,7 +1180,9 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
 
   // Pinned CPU buffer sized to the largest gradient tensor seen.
   // nullopt until the first allreduce. Reallocated if a larger tensor arrives.
-  std::optional<at::Tensor> shadow_buf_;
+  //std::optional<at::Tensor> shadow_buf_;
+  std::unordered_map<uint64_t, at::Tensor> in_flight_shadow_bufs_;
+  std::vector<at::Tensor> free_shadow_bufs_; // 用來重複利用已分配的記憶體
   std::mutex shadow_buf_mutex_;
 
   // seqCollective_ value of the AllReduce whose input was last checkpointed.
