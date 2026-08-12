@@ -901,12 +901,16 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
       -1,
       static_cast<int>(1)); // number of device?
 
-  // [NCCL-FT] 攔截點：如果有發生網路錯誤，由 wait 觸發全域重播
+  // =========================================================================
+  // [NCCL-FT] 攔截點 1：如果有發生網路錯誤，由 wait 觸發全域重播
+  // =========================================================================
   if (!pg_->ft_disabled_ && pg_->final_commit_op_.load(std::memory_order_acquire) > 0) {
       pg_->recover_and_replay_inflight_ops();
   }
 
-  // 如果這個 seq 被重播過，必須等待重播的 Event，而不是失敗的 ncclEndEvent_
+  // =========================================================================
+  // [NCCL-FT] 攔截點 2：如果這個 seq 被重播過，必須等待重播的 Event 並安全撤退
+  // =========================================================================
   if (!pg_->ft_disabled_ && pg_->is_degraded_ && this->seq_ >= pg_->committed_shadow_seq_.load()) {
       ShadowContext ctx;
       bool is_replayed = false;
@@ -919,13 +923,26 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
           }
       }
       if (is_replayed) {
+          // 1. 確保目前 Compute Stream 等待重播的 Kernel 執行完畢
           auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
           ctx.replayed_end_event->block(currentStream);
-          return true; // 直接返回成功
+          
+          // 2. [修正] 釋放被扣留的 Tensor 參照，防止 VRAM Leak！
+          this->stashed_for_allocator_safety_->unstash();
+          
+          // 3. [修正] 清除可能被 Watchdog 標記的 exception，完美掩蓋錯誤
+          this->setException(nullptr);
+
+          return true; // 欺騙 DDP，直接返回成功
       }
   }  
 
-  // synchronize() will block the current stream on the NCCL stream
+  // =========================================================================
+  // --- [原生 NCCL 執行路徑] (若未發生容錯重播，則維持原本行為) ---
+  // =========================================================================
+
+  // synchronize() will block the current stream on the NCCL stream 
+  // and trigger stashed_for_allocator_safety_->unstash() internally.
   synchronize();
 
   // In case of blockingWait or a timeout value is specified by the user, we
@@ -960,8 +977,6 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
 
   // If exception is detected, throw it from the main CPU thread
   if (exception()) {
-    //Do not abort for FT
-
     // Throw exception (from main thread here)
     handleException(CleanUpOnlyFT);
   }
