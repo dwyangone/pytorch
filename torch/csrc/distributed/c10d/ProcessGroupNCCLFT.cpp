@@ -2510,19 +2510,12 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
                          << "), 無差別清除受死掉的 Comm 影響的 work seq=" << work.seq_
                          << " device=" << device_idx;
             
-            at::cuda::CUDAGuard device_guard(work.device_);
-            auto ncclStream = pg_->ncclStreams_.at(getKeyFromDevice(work.device_));
-            
-            // 提早發出 EndEvent，解鎖可能正在等待的 DDP
-            work.ncclEndEvent_->record(ncclStream);
-            
             // 標記異常，讓 wait() 知道它必須被重播
             std::string exceptionMsg = c10::str(work.logPrefix(), "FT early-abort: Comm dead.");
             work.setException(std::make_exception_ptr(C10_BUILD_ERROR(DistBackendError, exceptionMsg)));
             
-            // 【注意】：這裡不呼叫 erase，因為外層本來就有一個 work.exception() 的 IF 區塊
-            // 它會在下一個 check 時自動觸發我們寫好的「Watchdog: clearing poisoned work」邏輯，
-            // 並安全地從 workMetaList_ 中移除。
+            // 設定完例外後，程式會順順地往下走，
+            // 進入下方的 if (work.exception()) 區塊統一執行 record 與 erase！
         }
       }
 
@@ -5253,8 +5246,9 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         // H2D 還原
         auto prev_stream = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
         at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
-        ctx.original_input.copy_(ctx.buffer.narrow(0, 0, ctx.original_input.numel()), true);
-        
+        // 加上 .flatten() 確保 1D buffer 的資料能正確倒回多維的 GPU 記憶體中
+        ctx.original_input.flatten().copy_(ctx.buffer.narrow(0, 0, ctx.original_input.numel()), true);
+
         at::cuda::CUDAEvent restore_done;
         restore_done.record(shadow_copy_stream_);
         at::cuda::setCurrentCUDAStream(prev_stream);
@@ -5949,7 +5943,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
     auto prev = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
     at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
     
-    ctx.buffer.narrow(0, 0, tensor.numel()).copy_(tensor, /*non_blocking=*/true);
+    // 加上 .flatten() 確保多維梯度可以安全寫入 1D buffer
+    ctx.buffer.narrow(0, 0, tensor.numel()).copy_(tensor.flatten(), /*non_blocking=*/true);
     ctx.copy_event->record(shadow_copy_stream_); // Per-seq 精準紀錄！
     
     at::cuda::setCurrentCUDAStream(prev);
