@@ -2496,63 +2496,33 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
 
       // Then check if work has timed out.
       // Skip if work has encountered an error.
-
-      // [Fix 3] FT early-abort: if a 2PC COMMIT has already been agreed by
-      // another rank (final_commit_op_ > 0), this rank's in-flight work is
-      // guaranteed to have failed due to the same NIC fault.  Force-mark it
-      // as timed-out immediately so the FT recovery path runs without waiting
-      // the full 180 s Watchdog timeout.
-      //
-      // Why this is safe: final_commit_op_ is only written by the side-car
-      // AFTER all size_ per-rank PROPOSE keys exist AND the COMMIT key is
-      // present in TCPStore.  That means all ranks have already acknowledged
-      // the fault; treating the in-flight work as failed here is correct.
-      //
-      // This eliminates the 180 s gap seen in test.log where ranks 2-7 waited
-      // for timeout while ranks 0-1 had already completed 2PC.
+      // [Fix 3 改良版] FT early-abort: 
+      // 只要 2PC 達成共識 (commit_signal > 0)，代表底層的 globalComm 已經宣告死亡。
+      // 我們必須將所有還在 workMetaList_ 裡面的飛行中任務全部標記為異常並清除。
+      // 這樣才不會讓它們卡在 Watchdog 裡導致 Timeout。後續拯救工作交給 wait() 的重播中心。
       if (!pg_->ft_disabled_ && !work.exception()) {
-        uint64_t commit_signal =
-            pg_->final_commit_op_.load(std::memory_order_acquire);
+        uint64_t commit_signal = pg_->final_commit_op_.load(std::memory_order_acquire);
         if (C10_UNLIKELY(commit_signal > 0)) {
-          uint64_t ckpt_seq =
-              pg_->committed_shadow_seq_.load(std::memory_order_acquire);
-          // Only abort work that predates or is at the checkpoint seq.
-          // work.seq_ > ckpt_seq means it was submitted after the rollback
-          // point — it is a post-fault op that must NOT be force-failed.
-          if (work.seq_ <= ckpt_seq) {
             int device_idx = work.device_.index() % pg_->localDeviceCount_;
             LOG(WARNING) << pg_->logPrefix()
                          << "[NCCL-FT] Watchdog early-abort: 2PC committed "
                          << "(commit_signal=" << commit_signal
-                         << " ckpt_seq=" << ckpt_seq
-                         << "), force-clearing work seq=" << work.seq_
-                         << " device=" << device_idx
-                         << " without waiting for timeout.";
-            // Record ncclEndEvent_ NOW so that any concurrent DDP wait()
-            // call's synchronize() -> ncclEndEvent_->block() returns
-            // immediately instead of hanging forever.
-            //
-            // Why this is necessary: early-abort fires while the kernel is
-            // still in-flight (or never completed).  ncclEndEvent_ has not
-            // been recorded on the NCCL stream yet.  block() on an
-            // un-recorded event spins indefinitely.  Recording it here on
-            // the stream with no kernel after it signals the event instantly.
-            //
-            // handleException(CleanUpOnlyFT) in wait() does NOT rethrow
-            // (SHOULD_TEAR_DOWN_FT(CleanUpOnlyFT) == false), so the
-            // exception is silently dropped and Python never sees it.
-            // The next Watchdog iteration then calls setException(nullptr)
-            // and erases the work — fully transparent to Python.
+                         << "), 無差別清除受死掉的 Comm 影響的 work seq=" << work.seq_
+                         << " device=" << device_idx;
+            
             at::cuda::CUDAGuard device_guard(work.device_);
-            auto ncclStream = pg_->ncclStreams_.at(
-                getKeyFromDevice(work.device_));
+            auto ncclStream = pg_->ncclStreams_.at(getKeyFromDevice(work.device_));
+            
+            // 提早發出 EndEvent，解鎖可能正在等待的 DDP
             work.ncclEndEvent_->record(ncclStream);
-            std::string exceptionMsg = c10::str(
-                work.logPrefix(),
-                "FT early-abort: 2PC committed while work was in-flight.");
-            work.setException(std::make_exception_ptr(
-                C10_BUILD_ERROR(DistBackendError, exceptionMsg)));
-          }
+            
+            // 標記異常，讓 wait() 知道它必須被重播
+            std::string exceptionMsg = c10::str(work.logPrefix(), "FT early-abort: Comm dead.");
+            work.setException(std::make_exception_ptr(C10_BUILD_ERROR(DistBackendError, exceptionMsg)));
+            
+            // 【注意】：這裡不呼叫 erase，因為外層本來就有一個 work.exception() 的 IF 區塊
+            // 它會在下一個 check 時自動觸發我們寫好的「Watchdog: clearing poisoned work」邏輯，
+            // 並安全地從 workMetaList_ 中移除。
         }
       }
 
