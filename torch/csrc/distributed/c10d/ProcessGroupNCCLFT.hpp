@@ -1189,6 +1189,10 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   std::vector<ShadowContext> free_shadow_bufs_; 
   std::mutex shadow_buf_mutex_;
 
+  // 用於監控 Pinned Memory 的總用量與區塊數
+  std::atomic<size_t> total_pinned_bytes_{0};
+  std::atomic<size_t> total_pinned_buffers_{0};
+
   std::mutex recovery_mutex_; // 保護全域重播中心，確保只有一個 thread 執行重播
   void recover_and_replay_inflight_ops();
   ShadowContext get_or_allocate_shadow_context(const at::Tensor& t);

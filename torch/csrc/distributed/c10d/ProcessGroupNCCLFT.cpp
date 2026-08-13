@@ -1039,6 +1039,23 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
         "output", opTypeToString(opType_), numel, hashValue);
   }
 #endif // PGNCCL_ENABLE_HASH
+
+  // =========================================================================
+  // 正常完成路徑下的強制 GC 回收！
+  // 確保在 Python 進入下一個 Batch 前，這個 Bucket 的 Pinned Memory 已經還給 Free Pool。
+  // 這將 Pinned Memory 總量嚴格封頂在「模型單一 Step 的 Bucket 總數」，徹底杜絕 OOM！
+  // =========================================================================
+  if (!pg_->ft_disabled_) {
+      std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
+      auto it = pg_->in_flight_shadow_bufs_.find(this->seq_);
+      if (it != pg_->in_flight_shadow_bufs_.end()) {
+          ShadowContext recycle_ctx = it->second;
+          recycle_ctx.original_input = at::Tensor();  // 斷開 GPU VRAM 參照
+          recycle_ctx.original_output = at::Tensor(); 
+          pg_->free_shadow_bufs_.push_back(recycle_ctx); // 歸還給資源池
+          pg_->in_flight_shadow_bufs_.erase(it);
+      }
+  }
   // Always return true, because abort API is not implemented.
   return true;
 }
@@ -4878,33 +4895,51 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
 // 尋找或配置 ShadowContext
 ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_context(const at::Tensor& t) {
     // ---------------------------------------------------------
-    // 1. 臨界區 (Critical Section)：只負責極速檢查與取出
+    // 1. 臨界區：使用 Best-Fit (最佳適配) 尋找最適合的 Buffer
     // ---------------------------------------------------------
     {
         std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
         
+        auto best_it = free_shadow_bufs_.end();
+        size_t min_diff = std::numeric_limits<size_t>::max();
+
         for (auto it = free_shadow_bufs_.begin(); it != free_shadow_bufs_.end(); ++it) {
             if (it->buffer.numel() >= t.numel()) {
-                ShadowContext ctx = *it;
-                free_shadow_bufs_.erase(it);
-                return ctx; // 找到可用 Buffer，直接返回
+                size_t diff = it->buffer.numel() - t.numel();
+                if (diff < min_diff) {
+                    min_diff = diff;
+                    best_it = it;
+                }
+                if (diff == 0) break; // 完美命中 (Exact Match)，提早結束尋找！
             }
         }
-    } // ⚠️ 注意這裡：離開這個括號時，lk 會被解構，Mutex 就解鎖了！
+
+        if (best_it != free_shadow_bufs_.end()) {
+            ShadowContext ctx = *best_it;
+            free_shadow_bufs_.erase(best_it);
+            return ctx; 
+        }
+    } // 離開括號，Mutex 解鎖
 
     // ---------------------------------------------------------
-    // 2. 非鎖區 (Lock-free Section)：執行昂貴的 OS 與 CUDA 呼叫
+    // 2. 非鎖區：執行昂貴的 OS 呼叫並印出統計 Log
     // ---------------------------------------------------------
-    // 此時主執行緒沒有持有任何鎖，Watchdog 可以自由進行 GC 回收
     auto cpu_opts = t.options().device(at::kCPU).memory_format(at::MemoryFormat::Contiguous);
-    LOG(INFO) << logPrefix() << "[NCCL-FT] Cache Miss: 配置新的 Pinned Shadow Context, 大小: " << t.nbytes() << " bytes";
     
     ShadowContext new_ctx;
-    new_ctx.buffer = at::empty({t.numel()}, cpu_opts).pin_memory(); // 昂貴的 cudaHostAlloc
-    // 昂貴的 cudaEventCreate
+    new_ctx.buffer = at::empty({t.numel()}, cpu_opts).pin_memory(); 
     new_ctx.copy_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
     new_ctx.replayed_end_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
     new_ctx.compute_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+    
+    // 更新統計數據
+    total_pinned_bytes_ += new_ctx.buffer.nbytes();
+    total_pinned_buffers_++;
+    
+    LOG(INFO) << logPrefix() << "[NCCL-FT] Cache Miss: 配置新的 Pinned Shadow Context. "
+              << "本次大小: " << (new_ctx.buffer.nbytes() / 1024.0 / 1024.0) << " MB. "
+              << "目前總共分配區塊數: " << total_pinned_buffers_.load() 
+              << ", 總 Pinned Memory: " << (total_pinned_bytes_.load() / 1024.0 / 1024.0) << " MB";
     
     return new_ctx;
 }
