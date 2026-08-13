@@ -64,10 +64,20 @@
 | `ShadowContext` struct（含 per-seq copy_event / replayed_end_event / reduce_op） | hpp ~1181 | ✅ |
 | findProxy()：round-robin 尋找下一個健康 proxy（支援多 faulty） | ~4259 | ✅ |
 | my_wards vector：proxy 可代理多個 faulty rank | execute_shadow_allreduce ~4297 | ✅ |
+| **多維 Tensor Shape Mismatch fix**：shadow_pre D2H copy + H2D restore 均加 `.flatten()` | shadow_pre ~5954, recover_and_replay ~5259 | ✅ |
+| **迴圈內 CUDAEvent 效能 fix**：recover_and_replay 迴圈外宣告 `restore_done`，迴圈內重複 record | recover_and_replay ~5241 | ✅ |
+| **Watchdog 例外清除後 GC 保底**：clearing path 將非空 stash push 到 shelvesToUnstash_ | Watchdog runLoop ~2630 | ✅ |
 
 ---
 
 ## 三、待確認與待修復項目
+
+### P0：高危 Bug（應優先修復）
+
+| Bug | 位置 | 說明 | 修復方向 |
+|-----|------|------|---------|
+| `shadow_seq_` 資料競爭 | `trigger_fault_proposal` ~4480, `shadow_pre` ~5958 | `shadow_seq_` 是普通 `uint64_t`，主執行緒寫（shadow_pre）、NCCL callback thread 讀，屬 undefined behavior | 改為 `std::atomic<uint64_t>`，讀寫用 `load(acquire)` / `store(release)` |
+| `WorkNCCLFT::logPrefix()` static Bug | ~717 | function-local static string 以第一個呼叫者的 `rank_` 初始化後固定不變，後續不同 rank 的 Work 拿到錯誤前綴 | 移除 `static` 關鍵字 |
 
 ### P0：確認 NCCL Fork 行為
 
@@ -77,6 +87,21 @@
 
 **問題 2：** `NCCLFTComm::create`（即 `ncclCommInitRank`）是否每次都重新執行 topo discovery？
 - 需要實驗確認：呼叫 `ncclCommBanNic(0)` 後再建立新 comm，確認新 comm 不使用 mlx5_0。
+
+### P1：中危修復
+
+| 項目 | 位置 | 說明 |
+|------|------|------|
+| `ncclCommBanNic` 重複呼叫 | `rebuild_shadow_ping_pong_topology` ~4188, ~4201 | 健康 rank 被呼叫兩次；移除 `if (!is_faulty)` 區塊中重複的迴圈 |
+| `shadow_pre` 每次 AllReduce create `compute_done` event | `allreduce_impl` ~5945 | 每個 bucket 都觸發 `cudaEventCreate`；應升為 PG 成員（`shadow_compute_done_event_`）並複用 |
+
+### P1：低危清理
+
+| 項目 | 位置 | 說明 |
+|------|------|------|
+| `get_or_allocate_shadow_buffer` 殭屍函式 | ~4491 | 舊版函式，邏輯錯誤（以 `at::Tensor` 迭代 `ShadowContext` list），永遠不被呼叫；應刪除 |
+| `initLocalNvlinkComm` TCPStore key 殘留 | ~4059 | 成功讀取後不 `deleteKey`；在 Store 不自動清除的場景中可能讀到舊值 |
+| `sscanf` 格式字串可移植性 | side-car ~4707 | `%lu`/`%lx` 在 Windows 是 32-bit；改用 `SCNu64`/`SCNx64` |
 
 ### P0：端對端測試
 
@@ -95,7 +120,7 @@
       預期：ft_round_ 遞增，第二輪 2PC 完整流程，faulty_local_devs_ 累積兩個故障
 ```
 
-### P1：後續工作
+### P2：後續工作
 
 | 項目 | 說明 |
 |------|------|

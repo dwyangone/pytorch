@@ -642,13 +642,23 @@ T6: 後續所有 AllReduce 走降級路徑
 | Bug A | ft_round_ 從未遞增 | recover_and_replay 末尾 ft_round_++ |
 | Bug B | rollback_done_ 永遠不重置 | 改用 final_commit_op_ == 0 判斷 |
 | Bug C | faulty_local_devs_ 第二輪不更新 | side-car Phase 1b OR 累積更新 |
+| 多維 Tensor copy_ Shape Mismatch | recover_and_replay 的 H2D 還原及 shadow_pre 的 D2H copy 對多維 tensor 直接操作造成 shape 不符 | 兩處均加 `.flatten()` 後再 copy_，再用 `narrow(0,0,numel)` 存入 1D buffer（行 4259/5954） |
+| 迴圈內 CUDAEvent 重複 create/destroy | recover_and_replay 每次迭代原本建立新 `restore_done` event | 迴圈外宣告一個 `at::cuda::CUDAEvent restore_done`，迴圈內 `record()` 重複使用（行 5241） |
+| Watchdog 例外清除後無 GC 保底 | FT clearing path 清除 exception 後 stash 未必能在 wait() 攔截點 2 被回收（faulty rank 的 wait() 可能走不到正確分支） | 加入保底 GC：clearing path 發現 stash 非空時直接 push 到 `shelvesToUnstash_`（行 2630-2633） |
 
-### ❓ 待確認
+### ❓ 待確認 / 待修復
 
-| 項目 | 說明 |
-|------|------|
-| `ncclCommBanNic` 作用域 | Process-level global 還是 per-comm？影響是否需要在 reinit 前重複呼叫 |
-| `NCCLFTComm::create` topo discovery | 呼叫後是否確實跳過被 ban 的 NIC？需要實驗確認 |
+| 項目 | 嚴重性 | 說明 |
+|------|--------|------|
+| `shadow_seq_` 資料競爭 | **高危** | `shadow_seq_` 是普通 `uint64_t`，在主執行緒（shadow_pre）寫、NCCL callback thread 讀（trigger_fault_proposal 行 5480），缺乏 atomic 或 mutex 保護；屬 undefined behavior。應改為 `std::atomic<uint64_t>` 或以 `shadow_buf_mutex_` 保護讀寫。 |
+| `WorkNCCLFT::logPrefix()` static 局部變數 Bug | **高危** | 行 717：`static std::string prefix = c10::str("[Rank ", rank_, "] ")` 是 function-local static，**第一次呼叫時以呼叫者的 rank_ 初始化後就固定不變**，所有後續 WorkNCCLFT 物件（不論其 rank_）都會拿到同一個錯誤前綴。應移除 `static`。 |
+| `ncclCommBanNic` 在 `rebuild_shadow_ping_pong_topology` 中被呼叫兩次 | **中危** | 行 4188-4191 的主迴圈對所有 rank 呼叫一次，行 4201-4203 的 `if (!is_faulty)` 區塊對健康 rank 又呼叫一次，導致健康 rank 執行兩次 `ncclCommBanNic`。應移除內層 `if (!is_faulty)` 區塊中重複的呼叫。 |
+| `shadow_pre` lambda 的 `compute_done` event 每次 AllReduce 都 create/destroy | **中危（效能）** | 行 5945：`at::cuda::CUDAEvent compute_done;` 在 `shadow_pre` 每次執行時建立，呼叫 `cudaEventCreate`。每個 AllReduce bucket 都有一次 CUDA API 建立開銷。應考慮將 `compute_done` 升為 PG 成員並複用，或改用 CUDAEventCache。 |
+| `get_or_allocate_shadow_buffer` 殭屍函式 | **低危** | 行 4491-4507：舊版函式，嘗試以 `at::Tensor` 迭代 `free_shadow_bufs_`（現為 `ShadowContext` list），邏輯錯誤且永遠不被呼叫。應刪除。 |
+| `initLocalNvlinkComm` TCPStore key 不清除 | **低危** | `"NCCL_FT_LOCAL_COMM_ID_NODE_<id>"` key 在 Store 中永久殘留；多次 `init_process_group` 時若 Store 不清除可能讀到舊值。可在成功讀取後 `deleteKey`，或改用帶 TTL 的 key。 |
+| `sscanf` 格式字串可移植性 | **低危** | 行 4707：`%lu`/`%lx` 在 Windows 上對應 32-bit `unsigned long` 而非 64-bit `uint64_t`。應改用 `SCNu64`/`SCNx64`（`<cinttypes>`）。 |
+| `ncclCommBanNic` 作用域 | **待確認** | Process-level global 還是 per-comm？影響是否需要在 reinit 前重複呼叫。 |
+| `NCCLFTComm::create` topo discovery | **待確認** | 呼叫後是否確實跳過被 ban 的 NIC？需要實驗確認。 |
 
 ### 遺留效能注意事項
 
@@ -656,3 +666,5 @@ T6: 後續所有 AllReduce 走降級路徑
 |------|------|------|
 | early-abort 的 ncclEndEvent_ 被 record 兩次 | 低 | 行 2517（early-abort）和 2633（FT clearing path）；多一次 CUDA API 呼叫，無害 |
 | 降級後仍執行 D2H copy | 輕微額外記憶體頻寬 | 刻意設計，為二次故障準備 |
+| shadow_pre compute_done event per-call create | 中等 | 每個 AllReduce bucket 都呼叫 cudaEventCreate；見「待修復」清單 |
+| proxy step 2 每次 at::empty_like | 輕微 GPU allocator 呼叫 | 降級後每次 AllReduce 都配置 ward_bufs；可考慮預配置加入 ShadowContext pool |

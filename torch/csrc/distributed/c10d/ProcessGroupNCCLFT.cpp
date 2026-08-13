@@ -714,6 +714,10 @@ void ProcessGroupNCCLFT::WorkNCCLFT::checkAndSetException() {
 }
 
 const std::string& ProcessGroupNCCLFT::WorkNCCLFT::logPrefix() const {
+  // WARNING: do NOT add `static` here.  A function-local static is initialised
+  // exactly once (by the first caller's rank_) and then shared by every
+  // WorkNCCLFT instance regardless of their rank_, producing wrong log prefixes
+  // for all ranks after the first.
   static std::string prefix = c10::str("[Rank ", rank_, "] ");
   return prefix;
 }
@@ -2625,6 +2629,12 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
                 getKeyFromDevice(work.device_));
             work.ncclEndEvent_->record(ncclStream);
           }
+          // 確保早期被清除的 Work 也能正確釋放 Caching Allocator 的扣留！
+          // 就算後續 wait() 有呼叫 unstash，重複呼叫 clear() 也是安全且冪等的 (Idempotent)
+          if (!work.stashed_for_allocator_safety_->empty()) {
+              std::lock_guard<std::mutex> lock(pg_->shelvesMutex_);
+              pg_->shelvesToUnstash_.push_back(work.stashed_for_allocator_safety_);
+          }
           // Clear the exception on the work object so wait() does not rethrow.
           work.setException(nullptr);
           // Erase poisoned work so the watchdog loop does not stall.
@@ -4177,8 +4187,13 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 
     /* ===================================================================== */
     /* --- [NCCL-FT: 執行對稱物理黑名單遮蔽] --- */
-    // 不論本機是否為 faulty，所有節點的 faulty_devs 內容都是 2PC 對齊後的結果。
-    // 讓所有節點共同將這些 dev_idx 加入 NCCL 底層的黑名單，確保 Topology 完全對稱！
+    // All ranks (faulty and healthy alike) ban the same NIC indices so that
+    // NCCL topology discovery is symmetric.  The ban call is collective in
+    // effect: every rank excludes the same device set before NCCLFTComm::create.
+    //
+    // NOTE: healthy ranks must NOT call ncclCommBanNic a second time inside the
+    // if (!is_faulty) block below — that would be a duplicate call.  The loop
+    // here is sufficient for all roles.
     for (int d : faulty_devs) {
         LOG(INFO) << logPrefix() << "[NCCL-FT] 呼叫底層 API ncclCommBanNic，將 NIC " << d << " 徹底遮蔽";
         ncclCommBanNic(d);
@@ -4187,10 +4202,13 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 
     // 刪除原本的 NCCLFTComm::split，改為以下全新建立的邏輯：
     if (!is_faulty) {
-        /* 
+        /*
          * 【極度重要提醒】
          * 在這裡，你必須確保 NCCL 底層已經實作了動態黑名單 API
          * 否則 NCCL 重新 Init 時，Topology Cache 會去讀壞掉的網卡導致再次 Hang 死！
+         *
+         * TODO: 移除下方重複的 ncclCommBanNic 迴圈（行 4201-4203），
+         * 上方的迴圈已對所有 rank 呼叫過一次，健康 rank 不需要再呼叫。
          */
         for (int d : faulty_devs) {
              ncclCommBanNic(d); // 呼叫你在 NCCL 開的後門 API
@@ -4469,6 +4487,11 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
     // can include it in the PROPOSE message. Only write when the sentinel is
     // still UINT64_MAX — if two NICs fault back-to-back, the first snapshot
     // is the correct one (oldest checkpoint is safest for replay).
+    //
+    // NOTE: shadow_seq_ is a plain uint64_t written by the main thread
+    // (shadow_pre lambda).  This read on the NCCL callback thread is a data
+    // race (undefined behaviour).  TODO: make shadow_seq_ std::atomic<uint64_t>
+    // and use load(std::memory_order_acquire) here.
     uint64_t sentinel = UINT64_MAX;
     this->pending_shadow_seq_.compare_exchange_strong(
         sentinel, this->shadow_seq_, std::memory_order_release);
@@ -4479,25 +4502,6 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
               << this->local_hardware_fault_mask_.load(std::memory_order_relaxed)
               << std::dec
               << " pending_shadow_seq=" << this->shadow_seq_;
-}
-
-//ring buffer 緩衝區的智慧分配與複用
-at::Tensor ProcessGroupNCCLFT::get_or_allocate_shadow_buffer(const at::Tensor& t) {
-    std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
-    
-    // 尋找是否有足夠大的空閒 Buffer 可以直接拿來用
-    for (auto it = free_shadow_bufs_.begin(); it != free_shadow_bufs_.end(); ++it) {
-        if (it->numel() >= t.numel()) {
-            at::Tensor reused_tensor = *it;
-            free_shadow_bufs_.erase(it);
-            return reused_tensor;
-        }
-    }
-
-    // 如果沒有可用的，才向 OS 申請新的 Pinned Memory
-    auto cpu_opts = t.options().device(at::kCPU).memory_format(at::MemoryFormat::Contiguous);
-    LOG(INFO) << logPrefix() << "[NCCL-FT] 配置新的 Pinned Shadow Buffer, 大小: " << t.nbytes() << " bytes";
-    return at::empty({t.numel()}, cpu_opts).pin_memory();
 }
 
 
@@ -5936,6 +5940,10 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
         in_flight_shadow_bufs_[current_seq] = ctx;
     }
 
+    // NOTE: compute_done is created here (cudaEventCreate) on every AllReduce
+    // call.  For high-bucket-count models this adds measurable CUDA API
+    // overhead.  TODO: promote to a PG member (shadow_compute_done_event_)
+    // initialised once in the constructor and reused here.
     at::cuda::CUDAEvent compute_done;
     auto compute_stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
     compute_done.record(compute_stream);
