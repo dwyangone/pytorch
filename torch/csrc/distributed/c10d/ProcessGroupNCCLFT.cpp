@@ -5231,6 +5231,9 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
 
     auto ncclStream = ncclStreams_.at(getKeyFromDevice(device));
 
+    // 把 CUDAEvent 提早宣告在迴圈外，重複利用！
+    at::cuda::CUDAEvent restore_done(cudaEventDisableTiming);
+
     // 4. 依序還原並重播
     for (uint64_t seq : seqs_to_replay) {
         LOG(INFO) << logPrefix() << "[NCCL-FT] 正在重播 Bucket (seq=" << seq << ")";
@@ -5249,10 +5252,8 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         // 加上 .flatten() 確保 1D buffer 的資料能正確倒回多維的 GPU 記憶體中
         ctx.original_input.flatten().copy_(ctx.buffer.narrow(0, 0, ctx.original_input.numel()), true);
 
-        at::cuda::CUDAEvent restore_done;
-        restore_done.record(shadow_copy_stream_);
+        restore_done.record(shadow_copy_stream_); // 重複使用同一個 Event
         at::cuda::setCurrentCUDAStream(prev_stream);
-
         restore_done.block(ncclStream);
 
         // 重播
