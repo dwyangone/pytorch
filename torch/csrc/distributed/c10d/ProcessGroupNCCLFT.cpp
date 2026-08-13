@@ -5217,9 +5217,14 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     std::lock_guard<std::mutex> lock(recovery_mutex_); // 確保只有一個 Thread 進行恢復
     
-    if (this->is_degraded_ && this->rollback_done_) return;
+    // [Bug B 修正] 不再依賴 rollback_done_。
+    // 改用 final_commit_op_ 判斷。如果為 0，代表這個 Round 已經被其他 Bucket (Thread) 恢復過了
+    uint64_t commit_signal = this->final_commit_op_.load(std::memory_order_acquire);
+    if (commit_signal == 0) {
+        return; 
+    }
 
-    LOG(INFO) << logPrefix() << "[NCCL-FT] 啟動全域重播中心！";
+    LOG(INFO) << logPrefix() << "[NCCL-FT] 啟動全域重播中心！ (容錯回合 Round=" << this->ft_round_ << ")";
 
     // 1. 確保舊的 Communicator 徹底死亡
     auto device = at::Device(at::DeviceType::CUDA, this->guessDeviceId());
@@ -5239,7 +5244,8 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     {
         std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
         for (auto const& [seq, ctx] : in_flight_shadow_bufs_) {
-            if (seq > agreed_ss) { 
+            // [修正] 必須是 >=，因為 agreed_ss 也就是發生錯誤的那一個 Bucket 本身也必須被重播！
+            if (seq >= agreed_ss) { 
                 seqs_to_replay.push_back(seq);
             }
         }
@@ -5278,9 +5284,25 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         ctx.replayed_end_event->record(ncclStream);
     }
 
-    this->rollback_done_ = true;
+    // 5. [Bug A 修正] 推進容錯回合，並清理 TCPStore
+    uint64_t cur_round = commit_signal - 1; 
+    this->ft_round_++; // 推進 Round，側車才會更新 key namespace 進入下一輪 2PC！
+    
+    try {
+        std::string round_str = std::to_string(cur_round);
+        this->globalStore_->deleteKey("NCCL_FT_PROPOSE_" + std::to_string(this->rank_) + "_" + round_str);
+        if (this->rank_ == 0) {
+            this->globalStore_->deleteKey("NCCL_FT_COMMIT_" + round_str);
+            this->globalStore_->deleteKey("NCCL_FT_SS_AGREED_" + round_str);
+        }
+        LOG(INFO) << logPrefix() << "[NCCL-FT] TCPStore keys cleaned for round=" << cur_round;
+    } catch (const std::exception& e) {
+        LOG(WARNING) << logPrefix() << "[NCCL-FT] TCPStore cleanup failed (non-fatal): " << e.what();
+    }
+
+    // 6. 重置 2PC 狀態，解除側車執行緒的等待
     this->final_commit_op_.store(0, std::memory_order_release);
-    LOG(INFO) << logPrefix() << "[NCCL-FT] 全域重播完成！";
+    LOG(INFO) << logPrefix() << "[NCCL-FT] 全域重播完成！系統準備進入下一回合: " << this->ft_round_;
 }
 
 template <typename Fn>

@@ -1089,12 +1089,6 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // (there is a TCPStore-mediated happens-before relationship).
   uint64_t ft_round_{0};
 
-  // Prevents the main thread from executing the barrier/rebuild block more
-  // than once per fault round.  Set to true when a rollback is committed;
-  // reset to false at the end of the same barrier block (after cleanup)
-  // so the next fault round starts fresh.
-  bool rollback_done_{false};
-
   // Pending fault signal from NCCL callback / Watchdog.
   // Bitmask: bit i is set when local device i has a pending NIC fault.
   // 0 means no pending fault.

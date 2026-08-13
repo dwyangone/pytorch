@@ -525,7 +525,7 @@ t=10: 主執行緒 WorkNCCLFT::wait() 感知 final_commit_op_ ≠ 0
         → recover_and_replay_inflight_ops()
             → abort 舊 globalComm
             → rebuild_shadow_ping_pong_topology() → proxy_global_comm_ 就緒
-            → 收集 seq > agreed_ss 的所有 in-flight shadow bufs（Bug 3 已修復）
+            → 收集 seq >= agreed_ss 的所有 in-flight shadow bufs（agreed_ss 本身狀態未知，必須重播）
             → 依序 H2D restore + execute_shadow_allreduce() + record replayed_end_event
             → rollback_done_ = true, final_commit_op_.store(0)
 t=11: 同一 wait() call：攔截點 2
@@ -548,9 +548,26 @@ t=12: 後續 AllReduce：collective() 前置分流 is_degraded_=true
 
 **修復：** catch block（行 5200-5214）現在正確設置 `work->future_`、`blockingWait_`、`store_`、`assignTimeoutToWork`，並呼叫 `workEnqueue(work)`，再 `return work`。
 
-### ✅ Bug 3（已修復）：recover_and_replay_inflight_ops seq 邊界
+### ✅ Bug 3（設計確認）：recover_and_replay_inflight_ops seq 邊界應為 `>=`
 
-**修復：** 行 5294 改為 `if (seq > agreed_ss)`，只 replay 在故障時尚未完成的 ops，不再 replay 已成功完成的 agreed_ss 本身。
+**結論：原始的 `>= agreed_ss` 是正確設計，已還原（行 5242）。**
+
+**`agreed_ss` 語義精確追蹤：**
+
+```
+shadow_pre（在 ncclAllReduce 啟動之前執行）：
+  ① D2H copy 排入 shadow_copy_stream_
+  ② ctx.copy_event->record()
+  ③ shadow_seq_ = current_seq   ← D2H 已排入，ncclAllReduce 尚未執行
+
+故障瞬間 trigger_fault_proposal（行 4496）：
+  pending_shadow_seq_.compare_exchange(UINT64_MAX, shadow_seq_)
+  → agreed_ss = 最後一個「D2H 備份已完成、跨節點 AllReduce 狀態未知」的 seq
+```
+
+`agreed_ss` 對應的 bucket：梯度已備份到 CPU，但其 `ncclAllReduce` 是否完成**完全未知**（故障可能恰在它執行期間）。若用 `>` 跳過 agreed_ss，該 bucket 梯度永遠不被全域 reduce，所有 rank 梯度不一致，訓練發散。
+
+**`>=` 的正確性：** 即使 agreed_ss 的 AllReduce 碰巧已成功，重播一次的代價是多做一次語義正確的 reduce（shadow buffer 備份的是故障前原始梯度，replay 結果等同於正常執行），不影響訓練數值。
 
 ### ✅ Bug 4（已修復）：get_or_allocate_shadow_context 在鎖內呼叫 pin_memory()
 
