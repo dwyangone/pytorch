@@ -4492,22 +4492,20 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
     // still UINT64_MAX — if two NICs fault back-to-back, the first snapshot
     // is the correct one (oldest checkpoint is safest for replay).
     //
-    // NOTE: shadow_seq_ is a plain uint64_t written by the main thread
-    // (shadow_pre lambda).  This read on the NCCL callback thread is a data
-    // race (undefined behaviour).  TODO: make shadow_seq_ std::atomic<uint64_t>
-    // and use load(std::memory_order_acquire) here.
+    // [修正]: 安全地使用 Acquire 語意讀取 atomic shadow_seq_
+    uint64_t current_shadow_seq = this->shadow_seq_.load(std::memory_order_acquire);
+    
     uint64_t sentinel = UINT64_MAX;
     this->pending_shadow_seq_.compare_exchange_strong(
-        sentinel, this->shadow_seq_, std::memory_order_release);
+        sentinel, current_shadow_seq, std::memory_order_release);
 
     LOG(INFO) << logPrefix()
               << "[NCCL-FT] 瞬間攔截本地網卡故障，標記 dev_idx: " << dev_idx
               << " mask=0x" << std::hex
               << this->local_hardware_fault_mask_.load(std::memory_order_relaxed)
               << std::dec
-              << " pending_shadow_seq=" << this->shadow_seq_;
+              << " pending_shadow_seq=" << current_shadow_seq; // 使用同一個區域變數印出
 }
-
 
 void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
     ft_negotiator_running_.store(true);
@@ -5957,7 +5955,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
     ctx.copy_event->record(shadow_copy_stream_); // Per-seq 精準紀錄！
     
     at::cuda::setCurrentCUDAStream(prev);
-    this->shadow_seq_ = current_seq; 
+    this->shadow_seq_.store(current_seq, std::memory_order_release);
   };
 
   return collective(

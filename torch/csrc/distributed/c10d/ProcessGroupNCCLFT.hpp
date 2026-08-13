@@ -1193,7 +1193,7 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   void recover_and_replay_inflight_ops();
   ShadowContext get_or_allocate_shadow_context(const at::Tensor& t);
 
-  uint64_t shadow_seq_{0};
+  std::atomic<uint64_t> shadow_seq_{0};
   at::cuda::CUDAStream shadow_copy_stream_{
       at::cuda::getStreamFromPool(/*isHighPriority=*/false)};
 
