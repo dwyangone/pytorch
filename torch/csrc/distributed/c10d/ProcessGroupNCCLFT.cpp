@@ -716,7 +716,7 @@ void ProcessGroupNCCLFT::WorkNCCLFT::checkAndSetException() {
   }
 }
 
-const std::string& ProcessGroupNCCLFT::WorkNCCLFT::logPrefix() const {
+std::string& ProcessGroupNCCLFT::WorkNCCLFT::logPrefix() const {
   // WARNING: do NOT add `static` here.  A function-local static is initialised
   // exactly once (by the first caller's rank_) and then shared by every
   // WorkNCCLFT instance regardless of their rank_, producing wrong log prefixes

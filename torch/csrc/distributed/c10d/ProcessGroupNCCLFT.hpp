@@ -390,7 +390,7 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
 
     uint64_t getSequencenumber() const override;
 
-    const std::string& logPrefix() const;
+    std::string& logPrefix() const;
 
     // Helper function that sets an exception_ptr on the WorkNCCLFT object.
     void setException(std::exception_ptr exception_ptr);
