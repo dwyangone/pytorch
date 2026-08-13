@@ -2614,59 +2614,7 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
                     << " outputs_null=" << (work.outputs_ == nullptr)
                     << " outputs_empty="
                     << (work.outputs_ == nullptr || work.outputs_->empty());
-          /** 【刪除】以下這整段從 Watchdog 移除，不要在這裡做 H2D copy
-          if (work.opType_ == OpType::ALLREDUCE) {
-            std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
-            // [NCCL-FT Bug A fix] Guard against nullptr work.outputs_ before
-            // dereferencing. When multiple AllReduces are in-flight and the comm
-            // fails, all of them land here. Ops that were submitted via the
-            // coalescing path or that lost their outputs ref can have a null
-            // (or empty) outputs_ shared_ptr. Dereferencing it was the cause of
-            // the SIGSEGV (signal 11) crash seen in test.log:2154.
-            if (pg_->shadow_buf_.has_value() &&
-                work.seq_ == pg_->shadow_seq_ &&
-                work.outputs_ != nullptr &&
-                !work.outputs_->empty()) {
-              at::Tensor& out = (*work.outputs_)[0];
-              int64_t numel = out.numel();
-              // Before trusting the CPU buffer, ensure the D2H checkpoint
-              // copy that ran on shadow_copy_stream_ has fully completed.
-              // shadow_copy_event_ was recorded by shadow_pre immediately
-              // after the copy; synchronizing here on the CPU is safe because
-              // the Watchdog is a background thread — it does not block the
-              // main training thread.
-              pg_->shadow_copy_event_.synchronize();
-              // Enqueue H2D restore (pinned CPU -> GPU) on shadow_copy_stream_.
-              // Using the same stream as the D2H copy avoids introducing a
-              // second stream into the picture and keeps the ordering simple.
-              // shadow_restore_event_ is recorded after so the main thread
-              // can insert a stream-wait on the NCCL stream before replay.
-              {
-                auto prev = at::cuda::getCurrentCUDAStream(
-                    pg_->shadow_copy_stream_.device_index());
-                at::cuda::setCurrentCUDAStream(pg_->shadow_copy_stream_);
-                out.copy_(
-                    pg_->shadow_buf_->narrow(0, 0, numel),
-                    true);
-                pg_->shadow_restore_event_.record(pg_->shadow_copy_stream_);
-                at::cuda::setCurrentCUDAStream(prev);
-              }
-              pg_->shadow_restore_pending_ = true;
-              pg_->shadow_replay_pending_  = true;
-              LOG(INFO) << pg_->logPrefix()
-                        << "[NCCL-FT] Shadow restore enqueued for seq="
-                        << work.seq_ << " on stream.";
-            } else if (pg_->shadow_buf_.has_value() &&
-                       work.seq_ != pg_->shadow_seq_) {
-              // Secondary failed op: seq does not match the checkpoint.
-              // No restore needed; the tensor was not yet written by this op.
-              LOG(INFO) << pg_->logPrefix()
-                        << "[NCCL-FT] Skipping shadow restore for seq="
-                        << work.seq_ << " (shadow_seq=" << pg_->shadow_seq_
-                        << "); op did not corrupt the gradient buffer.";
-            }
-          }
-           **/ 
+          
 
           // [NCCL-FT Fix A] Do NOT write local_hardware_fault_mask_ here.
           //
