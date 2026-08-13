@@ -342,67 +342,50 @@ WorkNCCLFT::wait() 攔截點 2：
 
 ---
 
-## 七、collective() 中的執行路徑（四條，含舊邏輯）
+## 七、collective() 中的執行路徑（已清理為兩條）
 
-`collective()` 內部目前**有兩套邏輯並存**，理解其順序非常重要：
+Bug 1-4 修復後，舊的切換點 A/B 和 2PC barrier 邏輯全部移除，現在是乾淨的二分支設計：
 
-### 7.1 前置分流（行 5138-5169）：最新路徑
-
-這是目前**主要的執行路徑切換點**，位於 `pre()` 和 `fn()` 之間：
+### 7.1 分流設計（行 5148-5220）
 
 ```cpp
-pre(ncclStream, work);  // shadow_pre：D2H 快照
+pre(ncclStream, work);  // shadow_pre：D2H 快照（is_degraded_ 時也執行）
 ncclComm_t comm = ncclComm->getNcclComm();
 
 // 分流 1：降級模式
 if (C10_UNLIKELY(this->is_degraded_)) {
-    if (opType == OpType::ALLREDUCE) {
+    if (opType == OpType::ALLREDUCE && proxy_comm_ready_) {
         execute_shadow_allreduce(inputs[0], outputs[0], ncclStream,
                                  current_shadow_reduce_op_);
     } else {
-        // Non-AllReduce in degraded mode：fallback（可能失敗）
+        // Non-AllReduce 或 proxy 尚未就緒：fallback fn()（可能失敗）
+        fn(inputs[0], outputs[0], comm, ncclStream);
     }
-    work->ncclComm_ = proxy_global_comm_ ? proxy_global_comm_ : local_nvlink_comm_;
+    // [Bug 10 fix] work->ncclComm_ 指向實際使用的 comm
+    // faulty rank → local_nvlink_comm_；proxy/healthy rank → proxy_global_comm_
+    work->ncclComm_ = is_faulty_rank ? local_nvlink_comm_
+                    : (proxy_global_comm_ ? proxy_global_comm_ : ncclComm);
 } else {
-    // 分流 2：正常訓練路徑
+    // 分流 2：正常訓練路徑（100% 正常訓練走這裡）
     try {
         fn(inputs[0], outputs[0], comm, ncclStream);
     } catch (const ::c10::NCCLFaultToleranceError& e) {
         if (!ft_disabled_) {
-            // 吞掉同步錯誤，設定 work 欄位，return work
-            // 注意：future_ 在這裡未設置（Bug 2，見待確認項目）
+            // 吞掉同步錯誤，補齊 work 所有欄位（Bug 2 已修復），return work
             work->ncclEndEvent_->record(ncclStream);
             work->ncclComm_ = ncclComm;
+            work->future_ = ...;  // 完整設置
+            workEnqueue(work);
             return work;
         }
         throw;
     }
     work->ncclComm_ = ncclComm;
 }
+// fall-through: post() → ncclEndEvent_->record() → future_ → workEnqueue()
 ```
 
-### 7.2 舊的 2PC barrier + 切換點 A/B（行 5203-5343）：仍然存在，但路徑已被前置分流攔截
-
-**注意：** 由於 `is_degraded_ = true` 的情況在行 5138-5169 已被處理（`execute_shadow_allreduce` 完成後繼續往下），而 `recover_and_replay_inflight_ops()` 設定 `rollback_done_ = true`，這段舊邏輯的行為如下：
-
-```
-行 5203：if (!ft_disabled_ && C10_UNLIKELY(rollback_done_)) { ... }
-  ├── rollback_done_ = true 時（由 recover_and_replay_inflight_ops 設定）
-  │     → 若無 shadow_replay_pending_，重置 rollback_done_ = false
-  │     → 目前架構下 shadow_replay_pending_ 通常為 false，所以此處立刻重置
-
-行 5218：if (!ft_disabled_ && C10_UNLIKELY(shadow_replay_pending_) && ...) { ... }
-  ├── shadow_replay_pending_ 由舊的 REBUILD path 設定，目前架構下不會被設定
-  │     → 這個切換點 A（Replay 路徑）在目前架構下不會觸發
-
-行 5250：if (C10_UNLIKELY(this->is_degraded_) && !ran_shadow_replay) { ... }
-  ├── is_degraded_ = true 時，這裡也會呼叫 execute_shadow_allreduce
-  │     → 與行 5142-5148 的前置分流形成**重複執行**（Bug 1，見待確認項目）
-  │     → ran_shadow_replay 在前置分流中沒有設定，此處 !ran_shadow_replay = true
-  └── 這是目前架構的已知問題
-```
-
-### 7.3 完整流程圖
+### 7.2 完整流程圖
 
 ```
 collective()
@@ -412,39 +395,31 @@ collective()
   │      ├── ncclCommRegisterFaultCallback(comm, callback)
   │      └── initLocalNvlinkComm() [try-catch]
   │
-  ├─ 3. pre(ncclStream, work)  ← shadow_pre lambda（D2H 快照）
+  ├─ 3. pre(ncclStream, work)  ← shadow_pre lambda（D2H 快照，is_degraded_ 時仍執行）
   │
-  ├─ 4. [前置分流，行 5138-5169]
-  │      ├── is_degraded_ = true  → execute_shadow_allreduce()
-  │      │     work->ncclComm_ = proxy_global_comm_ ?: local_nvlink_comm_
+  ├─ 4. [分流，行 5153-5220]
+  │      ├── is_degraded_ = true
+  │      │     ALLREDUCE & proxy_ready → execute_shadow_allreduce()
+  │      │     其他 → fn() on orig comm（fallback）
+  │      │     work->ncclComm_ = faulty ? local_nvlink_comm_ : proxy_global_comm_
   │      └── is_degraded_ = false → fn() with try-catch(NCCLFaultToleranceError)
-  │            → 吞掉例外，記錄 end event，return work（不執行後續邏輯）
+  │            catch: work 完整設置（future_/blockingWait_/store_），enqueue，return
   │
-  ├─ 5. [舊邏輯，行 5203-5343，仍存在但已不是主路徑]
-  │      ├── [切換點 A] shadow_replay_pending_（目前通常不觸發）
-  │      ├── [切換點 B] is_degraded_ && !ran_shadow_replay（與步驟 4 重複！）
-  │      └── [Normal else] 若步驟 4 已處理，此處 is_degraded_=false → 再執行 fn()
-  │           → 正常訓練時此處才是真正執行 fn() 的地方
-  │
-  ├─ 6. post(ncclStream, work)
-  ├─ 7. ncclEndEvent_->record(ncclStream)
-  ├─ 8. [Bug 10 fix] work->ncclComm_ 指向實際使用的 comm
-  └─ 9. workEnqueue(work) → Watchdog 監控
+  ├─ 5. post(ncclStream, work)
+  ├─ 6. ncclEndEvent_->record(ncclStream)
+  ├─ 7. future_ 設置 + recordFunctionEndCallback_
+  ├─ 8. workEnqueue(work) → Watchdog 監控
+  └─ 9. return asyncOp ? work : nullptr
 ```
-
-**⚠ 重要說明：** 步驟 4 的前置分流（行 5138-5169）目前是**提前 return** 還是 **fall-through** 到步驟 5，取決於：
-- 正常路徑（`is_degraded_ = false`）：若 `fn()` 無 exception，fall-through 到步驟 5（舊邏輯 else 分支）執行原生 fn()。**兩段 fn() 都不執行是不對的**，實際上步驟 4 的 else 分支只有 try-catch wrapper，fn() 本身在步驟 5 的 else 分支執行。
-- 降級路徑（`is_degraded_ = true`）：步驟 4 執行 `execute_shadow_allreduce`，fall-through 到步驟 5（切換點 B）**再次執行** `execute_shadow_allreduce`（Bug 1）。
 
 ---
 
 ## 八、狀態變數對照表
 
-| 變數 | 類型 | Normal | Replay/Degraded | 說明 |
-|------|------|--------|-----------------|------|
+| 變數 | 類型 | Normal | Degraded | 說明 |
+|------|------|--------|----------|------|
 | `is_degraded_` | `bool` | false | true | 拓撲已降級，一旦設為 true 不回到 false（除非重啟） |
-| `rollback_done_` | `atomic<bool>` | false | true（recover 後） | 防止 recover_and_replay 重入 |
-| `shadow_replay_pending_` | `bool` | false | 通常 false | 舊 REBUILD path 設定，目前架構下通常不觸發 |
+| `rollback_done_` | `bool` | false | true（recover 後）| 防止 recover_and_replay 重入 |
 | `final_commit_op_` | `atomic<uint64_t>` | 0 | 非 0（side-car 設） | wait() 攔截點 1 的觸發訊號，recover 完成後重置為 0 |
 | `proxy_comm_ready_` | `atomic<bool>` | false | true（rebuild 後） | rebuild_shadow_ping_pong_topology 完成後設為 true |
 | `committed_shadow_seq_` | `atomic<uint64_t>` | UINT64_MAX | agreed_ss | 2PC 協商出的最後安全 checkpoint seq |
@@ -453,16 +428,19 @@ collective()
 
 ## 九、Bug 10 修正：work->ncclComm_ 的正確對應
 
-執行路徑確定後，`work->ncclComm_` 必須指向**實際使用的 comm**，否則 Watchdog 的 `checkAndSetException()` 會查詢已死亡的 comm 造成誤報：
+執行路徑確定後，`work->ncclComm_` 必須指向**實際使用的 comm**，否則 Watchdog 的 `checkAndSetException()` 會查詢已死亡的 comm 造成誤報。Bug 10 修正現在整合在分流的 is_degraded_ 分支內（行 5167-5182）：
 
 ```
-ran_shadow_replay || (is_degraded_ && ALLREDUCE)（行 5369-5394）：
+is_degraded_ && ALLREDUCE（行 5167-5182）：
   ├── is_faulty_rank == true  → work->ncclComm_ = local_nvlink_comm_
   ├── is_faulty_rank == false → work->ncclComm_ = proxy_global_comm_
   └── fallback（comm 為 null） → work->ncclComm_ = ncclComm  [warning]
 
-其他情況（normal 或 non-AllReduce degraded）：
-  └── work->ncclComm_ = ncclComm  [原始 comm]
+is_degraded_ && 非 ALLREDUCE（fallback fn() 路徑）：
+  └── work->ncclComm_ = ncclComm（原始 comm，fallback 使用）
+
+正常路徑：
+  └── work->ncclComm_ = ncclComm
 ```
 
 ---
@@ -547,7 +525,7 @@ t=10: 主執行緒 WorkNCCLFT::wait() 感知 final_commit_op_ ≠ 0
         → recover_and_replay_inflight_ops()
             → abort 舊 globalComm
             → rebuild_shadow_ping_pong_topology() → proxy_global_comm_ 就緒
-            → 收集 seq >= agreed_ss 的所有 in-flight shadow bufs
+            → 收集 seq > agreed_ss 的所有 in-flight shadow bufs（Bug 3 已修復）
             → 依序 H2D restore + execute_shadow_allreduce() + record replayed_end_event
             → rollback_done_ = true, final_commit_op_.store(0)
 t=11: 同一 wait() call：攔截點 2
@@ -560,30 +538,98 @@ t=12: 後續 AllReduce：collective() 前置分流 is_degraded_=true
 
 ---
 
-## 十四、已知問題（待解決）
+## 十四、已知問題狀態
 
-### Bug 1（嚴重）：collective() 中降級路徑的 execute_shadow_allreduce 被呼叫兩次
+### ✅ Bug 1（已修復）：collective() 雙重執行 execute_shadow_allreduce
 
-**位置：** 行 5142-5148（前置分流）和行 5250-5278（舊切換點 B）
+**修復：** 移除舊的切換點 A/B 整個程式區塊，改為乾淨的 `if (is_degraded_) { ... } else { ... }` 二分支（行 5153-5220）。降級路徑只有一處 `execute_shadow_allreduce`，不再雙重執行。
 
-**現象：** `is_degraded_ = true` 時，前置分流執行 `execute_shadow_allreduce` 後 fall-through，舊切換點 B 的條件 `is_degraded_ && !ran_shadow_replay` 也成立（`ran_shadow_replay` 在前置分流中未設定），導致同一個 AllReduce 被執行兩次。
+### ✅ Bug 2（已修復）：early return 路徑的 future_ 未設置
 
-**影響：** 梯度數值錯誤（double reduce），或 NCCL 序列混亂。
+**修復：** catch block（行 5200-5214）現在正確設置 `work->future_`、`blockingWait_`、`store_`、`assignTimeoutToWork`，並呼叫 `workEnqueue(work)`，再 `return work`。
 
-### Bug 2（中）：early return 路徑的 future_ 未設置
+### ✅ Bug 3（已修復）：recover_and_replay_inflight_ops seq 邊界
 
-**位置：** 行 5157-5165（catch NCCLFaultToleranceError）
+**修復：** 行 5294 改為 `if (seq > agreed_ss)`，只 replay 在故障時尚未完成的 ops，不再 replay 已成功完成的 agreed_ss 本身。
 
-**現象：** 在前置分流的 catch 中，`return work` 前未設置 `work->future_`。若 DDP 呼叫 `getFuture()` 將崩潰。（舊切換點 B 的對應 catch，行 5307-5340，有完整設置。）
+### ✅ Bug 4（已修復）：get_or_allocate_shadow_context 在鎖內呼叫 pin_memory()
 
-### Bug 3（中）：recover_and_replay_inflight_ops 的 seq 邊界
+**修復：** 兩段式設計（行 4933-4962）。第一段在鎖內快速查找 free pool；若 cache miss，**出鎖後**才執行昂貴的 `pin_memory()` 和 `cudaEventCreate`，Watchdog GC 在此期間可自由運行。
 
-**位置：** 行 5465：`if (seq >= agreed_ss)`
+---
 
-**現象：** `agreed_ss` 是已成功完成的最後一個 seq。若 `seq == agreed_ss` 的那個 AllReduce 已被 Watchdog GC 清除（成功完成），`in_flight_shadow_bufs_` 中找不到它，replay 會跳過不影響。但若 `seq == agreed_ss` 的 AllReduce **尚未**被 GC，會被 replay 兩次（一次已成功，一次又 replay）。正確邏輯應為 `seq > agreed_ss`。
+## 十五、多網卡故障支援分析
 
-### Bug 4（低）：get_or_allocate_shadow_context 在鎖內呼叫 pin_memory()
+### 同時多網卡故障（Simultaneous faults）：✅ 已支援
 
-**位置：** 行 4934, 4948
+| 機制 | 位置 | 說明 |
+|------|------|------|
+| `trigger_fault_proposal` 用 `fetch_or` 累積 bitmask | 行 4540 | 多個 NIC callback 同時觸發，每個 bit 都不遺漏 |
+| 側車用 `exchange(0)` 一次取出所有 bit | 行 4627 | 整個 bitmask 原子性排出 |
+| 2PC 聚合 `agg_fault_mask \|= p_fmask` | 行 4780 | 所有 rank 的故障 mask OR 合併 |
+| `faulty_local_devs_` 插入所有 bit | 行 4820-4826 | 多個 faulty dev 進入集合 |
+| `proxy_comm_size_ = size_ - N * nodes` | 行 4207 | 排除每節點 N 個 faulty dev |
+| `execute_shadow_allreduce` 的 `my_wards` 是 vector | 行 4365-4372 | 一個 proxy 可同時代理多個 faulty rank |
 
-**現象：** `pin_memory()` = `cudaHostAlloc`（同步 CUDA call）在 `shadow_buf_mutex_` 鎖住狀態下執行，可能 stall Watchdog GC（低機率，ring pool 命中時不會發生）。
+### 逐步故障（Sequential faults）：❌ 三個阻斷性 Bug
+
+第一次故障恢復後，若再有一個 NIC 故障，以下三個 Bug 會阻止第二輪恢復：
+
+---
+
+#### Bug A（嚴重）：`ft_round_` 從未被遞增
+
+**位置：** `ft_round_` 在整個程式中只被讀取（7 處），沒有任何地方執行 `ft_round_++`。
+
+**現象：** 第一次故障完成後 `ft_round_` 仍為 0。第二次故障時，側車嘗試寫 `NCCL_FT_PROPOSE_<rank>_0`，但 round=0 的 TCPStore keys 已存在（第一次故障留下的），側車在行 4639 偵測到 `cur_round == last_proposed_round`，把 fault_mask 放回後 sleep，**第二輪 2PC 永遠無法開始**。
+
+**修復：** 在 `recover_and_replay_inflight_ops()` 末尾（`final_commit_op_.store(0)` 之後）加入 `ft_round_++`，推進到下一輪。
+
+---
+
+#### Bug B（嚴重）：`rollback_done_` 永遠不重置為 `false`
+
+**位置：** 行 5333 設為 `true`，整個程式中**不存在** `rollback_done_ = false`。
+
+**現象：** 第一次故障後 `rollback_done_ = true`、`is_degraded_ = true`。第二次故障發生、側車設 `final_commit_op_ ≠ 0` 後，`wait()` 攔截點 1 呼叫 `recover_and_replay_inflight_ops()`，行 5272：
+
+```cpp
+if (this->is_degraded_ && this->rollback_done_) return;
+```
+
+兩個條件都成立，函式**直接返回**，第二次故障完全沒有被處理。
+
+**修復：** 在開始新一輪恢復前（即 Bug A 的 `ft_round_++` 之後），重置 `rollback_done_ = false`。
+
+---
+
+#### Bug C（中）：`proxy_global_comm_` 在第二輪不重建
+
+**位置：** `rebuild_shadow_ping_pong_topology()` 行 4190-4191
+
+**現象：** 由於 Bug B，第二次故障時 `recover_and_replay_inflight_ops()` 直接返回，`rebuild_shadow_ping_pong_topology()` 從未被呼叫。`proxy_global_comm_` 仍指向第一次 rebuild 建立的 comm（只排除了第一批故障 NIC），仍然會嘗試透過第二次故障的 NIC 進行通訊，導致 hang 或 NCCL error。
+
+**現象（即使 Bug B 修復後）：** `faulty_local_devs_` 在第二輪 2PC 完成後已包含 {dev_0, dev_1}，但 `proxy_global_comm_` 是只排除 {dev_0} 的舊 comm，新的 rebuild 必須用更新後的 `faulty_local_devs_` 重建一個排除 {dev_0, dev_1} 的新 comm。這在 Bug A + B 修復後、`rebuild_shadow_ping_pong_topology()` 可以執行時，會自動取用最新的 `faulty_local_devs_`（行 4177-4181 snapshot），所以此 bug 隨著 Bug A + B 的修復自然消失。
+
+---
+
+### 逐步故障修復方案
+
+在 `recover_and_replay_inflight_ops()` 末尾（行 5334 之後），加入兩行：
+
+```cpp
+this->rollback_done_ = false;  // 重置，允許下一輪恢復
+ft_round_++;                    // 推進 TCPStore key namespace，防止 round=0 衝突
+```
+
+這兩行修復可讓 Bug A、B、C 全部消除：
+- `rollback_done_ = false` → 第二輪 `recover_and_replay_inflight_ops()` 不再被 early-return 擋住
+- `ft_round_++` → 側車使用新的 round key，不再與舊 round 的 TCPStore keys 衝突
+
+---
+
+### 降級後繼續做 D2H shadow copy：✅ 設計選擇（非 Bug）
+
+**位置：** `collective()` 行 5150 `pre(ncclStream, work)` 在 `is_degraded_=true` 時仍無條件執行。
+
+**設計意圖：** 降級後每次 AllReduce 仍做 D2H copy，為下一次故障預備 shadow buffer，支援**逐步故障場景**的連續 replay 能力。這是實現「第二次 NIC 故障也能恢復」的必要條件，不應移除。

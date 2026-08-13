@@ -4931,24 +4931,34 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
 //New add functions
 // 尋找或配置 ShadowContext
 ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_context(const at::Tensor& t) {
-    std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
-    
-    for (auto it = free_shadow_bufs_.begin(); it != free_shadow_bufs_.end(); ++it) {
-        if (it->buffer.numel() >= t.numel()) {
-            ShadowContext ctx = *it;
-            free_shadow_bufs_.erase(it);
-            return ctx;
+    // ---------------------------------------------------------
+    // 1. 臨界區 (Critical Section)：只負責極速檢查與取出
+    // ---------------------------------------------------------
+    {
+        std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+        
+        for (auto it = free_shadow_bufs_.begin(); it != free_shadow_bufs_.end(); ++it) {
+            if (it->buffer.numel() >= t.numel()) {
+                ShadowContext ctx = *it;
+                free_shadow_bufs_.erase(it);
+                return ctx; // 找到可用 Buffer，直接返回
+            }
         }
-    }
+    } // ⚠️ 注意這裡：離開這個括號時，lk 會被解構，Mutex 就解鎖了！
 
+    // ---------------------------------------------------------
+    // 2. 非鎖區 (Lock-free Section)：執行昂貴的 OS 與 CUDA 呼叫
+    // ---------------------------------------------------------
+    // 此時主執行緒沒有持有任何鎖，Watchdog 可以自由進行 GC 回收
     auto cpu_opts = t.options().device(at::kCPU).memory_format(at::MemoryFormat::Contiguous);
-    LOG(INFO) << logPrefix() << "[NCCL-FT] 配置新的 Pinned Shadow Context, 大小: " << t.nbytes() << " bytes";
+    LOG(INFO) << logPrefix() << "[NCCL-FT] Cache Miss: 配置新的 Pinned Shadow Context, 大小: " << t.nbytes() << " bytes";
     
     ShadowContext new_ctx;
-    new_ctx.buffer = at::empty({t.numel()}, cpu_opts).pin_memory();
-    // 使用 cudaEventDisableTiming 以獲取最高效能
+    new_ctx.buffer = at::empty({t.numel()}, cpu_opts).pin_memory(); // 昂貴的 cudaHostAlloc
+    // 昂貴的 cudaEventCreate
     new_ctx.copy_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
     new_ctx.replayed_end_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+    
     return new_ctx;
 }
 
@@ -5281,7 +5291,7 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     {
         std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
         for (auto const& [seq, ctx] : in_flight_shadow_bufs_) {
-            if (seq >= agreed_ss) { 
+            if (seq > agreed_ss) { 
                 seqs_to_replay.push_back(seq);
             }
         }
