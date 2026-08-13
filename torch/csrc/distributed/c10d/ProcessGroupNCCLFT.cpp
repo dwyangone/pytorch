@@ -4896,30 +4896,65 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
 ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_context(const at::Tensor& t) {
     // ---------------------------------------------------------
     // 1. 臨界區：使用 Best-Fit (最佳適配) 尋找最適合的 Buffer
+    //    若CPU 太快了，睡 2 毫秒等 GPU 和網路傳輸追上來
     // ---------------------------------------------------------
-    {
-        std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
-        
-        auto best_it = free_shadow_bufs_.end();
-        size_t min_diff = std::numeric_limits<size_t>::max();
-
-        for (auto it = free_shadow_bufs_.begin(); it != free_shadow_bufs_.end(); ++it) {
-            if (it->buffer.numel() >= t.numel()) {
-                size_t diff = it->buffer.numel() - t.numel();
-                if (diff < min_diff) {
-                    min_diff = diff;
-                    best_it = it;
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+            
+            // 1. 🔥 Inline GC: CPU 主動收割已經「成功」完成的 Bucket 🔥
+            size_t current_in_flight_bytes = 0;
+            for (auto it = in_flight_shadow_bufs_.begin(); it != in_flight_shadow_bufs_.end(); ) {
+                // 如果 Work 存在，且 GPU 已經確認跑完這個任務，且「沒有」發生硬體例外
+                if (it->second.work_ptr && 
+                    it->second.work_ptr->finishedGPUExecutionInternal() && 
+                    !it->second.work_ptr->exception()) {
+                    
+                    ShadowContext recycle_ctx = it->second;
+                    recycle_ctx.original_input = at::Tensor(); // 斷開 VRAM 參照
+                    recycle_ctx.original_output = at::Tensor();
+                    recycle_ctx.work_ptr.reset(); // 清除 Work 參照
+                    free_shadow_bufs_.push_back(recycle_ctx); // 歸還給 Free Pool
+                    it = in_flight_shadow_bufs_.erase(it);
+                } else {
+                    current_in_flight_bytes += it->second.buffer.nbytes();
+                    ++it;
                 }
-                if (diff == 0) break; // 完美命中 (Exact Match)，提早結束尋找！
             }
-        }
 
-        if (best_it != free_shadow_bufs_.end()) {
-            ShadowContext ctx = *best_it;
-            free_shadow_bufs_.erase(best_it);
-            return ctx; 
-        }
-    } // 離開括號，Mutex 解鎖
+            // 2. Best-Fit (最佳適配)：從 Free Pool 找出大小最接近的 Buffer 複用
+            auto best_it = free_shadow_bufs_.end();
+            size_t min_diff = std::numeric_limits<size_t>::max();
+            for (auto it = free_shadow_bufs_.begin(); it != free_shadow_bufs_.end(); ++it) {
+                if (it->buffer.numel() >= t.numel()) {
+                    size_t diff = it->buffer.numel() - t.numel();
+                    if (diff < min_diff) {
+                        min_diff = diff;
+                        best_it = it;
+                    }
+                    if (diff == 0) break; // 大小完全吻合，直接命中！
+                }
+            }
+
+            if (best_it != free_shadow_bufs_.end()) {
+                ShadowContext ctx = *best_it;
+                free_shadow_bufs_.erase(best_it);
+                return ctx; 
+            }
+
+            // 3. 🛡️ Memory Backpressure (背壓防禦)：防止 CPU 暴走導致 OOM 🛡️
+            // 如果目前飛行中的 Buffer 總量超過 2GB (安全值)，強迫 CPU 讓出資源等待 GPU 消化！
+            if (current_in_flight_bytes > 2ULL * 1024 * 1024 * 1024) { 
+                // 解鎖，往下走去 Sleep，然後重試
+            } else {
+                // 安全範圍內，允許向 OS 申請新的 Memory
+                break; 
+            }
+        } // mutex unlock
+
+        // CPU 太快了，睡 2 毫秒等 GPU 和網路傳輸追上來
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 
     // ---------------------------------------------------------
     // 2. 非鎖區：執行昂貴的 OS 呼叫並印出統計 Log
@@ -4936,7 +4971,7 @@ ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_con
     total_pinned_bytes_ += new_ctx.buffer.nbytes();
     total_pinned_buffers_++;
     
-    LOG(INFO) << logPrefix() << "[NCCL-FT] Cache Miss: 配置新的 Pinned Shadow Context. "
+    LOG(WARNING) << logPrefix() << "[NCCL-FT] Cache Miss: 配置新的 Pinned Shadow Context. "
               << "本次大小: " << (new_ctx.buffer.nbytes() / 1024.0 / 1024.0) << " MB. "
               << "目前總共分配區塊數: " << total_pinned_buffers_.load() 
               << ", 總 Pinned Memory: " << (total_pinned_bytes_.load() / 1024.0 / 1024.0) << " MB";
@@ -5989,6 +6024,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
     ctx.original_input = tensor;
     ctx.original_output = tensor; // AllReduce 通常 in-place
     ctx.reduce_op = opts.reduceOp;
+    ctx.work_ptr = work;          // 綁定 Work 指標，讓 Inline GC 知道要檢查誰
     
     {
         std::lock_guard<std::mutex> lk(shadow_buf_mutex_);

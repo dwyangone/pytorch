@@ -1180,6 +1180,7 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
       std::shared_ptr<at::cuda::CUDAEvent> copy_event;    // D2H 備份完成的 Event
       std::shared_ptr<at::cuda::CUDAEvent> replayed_end_event; // 重播完成的 Event
       std::shared_ptr<at::cuda::CUDAEvent> compute_event; // [新增] 用於同步 compute 與 copy stream
+      c10::intrusive_ptr<WorkNCCLFT> work_ptr;            // 綁定原生的 Work，讓系統可以直接檢查它是否成功跑完
       at::Tensor original_input;                          // 用於 H2D 還原的 GPU Tensor
       at::Tensor original_output;
       ReduceOp reduce_op;                                 // 每個 Bucket 可能有不同的 ReduceOp
