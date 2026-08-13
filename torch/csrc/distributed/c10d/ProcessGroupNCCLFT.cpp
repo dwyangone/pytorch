@@ -5135,19 +5135,44 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
     work->ncclStartEvent_->record(ncclStream);
   }
 
-  /* 保留最單純的分流 */
+  /* ===================================================================== */
+  /* 保留最單純的分流：只負責派發任務，不負責重播與重建 */
   pre(ncclStream, work);
   ncclComm_t comm = ncclComm->getNcclComm();
 
   if (C10_UNLIKELY(this->is_degraded_)) {
       LOG(INFO) << logPrefix() << "[NCCL-FT] 降級模式，執行 Shadow Ping-Pong (seq=" << seqCollective_ << ")";
-      if (opType == OpType::ALLREDUCE) {
+      
+      if (opType == OpType::ALLREDUCE && proxy_comm_ready_.load(std::memory_order_acquire)) {
           execute_shadow_allreduce(inputs[0], outputs[0], ncclStream, current_shadow_reduce_op_);
       } else {
-          LOG(WARNING) << logPrefix() << "Non-AllReduce op in degraded mode...";
+          LOG(WARNING) << logPrefix() << "[NCCL-FT] Non-AllReduce op in degraded mode — falling back...";
+#ifndef NCCL_HAS_COMM_NONBLOCKING
+          C10D_NCCL_FT_CHECK(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm->getNcclCommFailureReason());
+#else
+          C10D_NCCL_FT_CHECK_TIMEOUT(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm, ncclComm->getNcclCommFailureReason());
+#endif 
       }
-      work->ncclComm_ = proxy_global_comm_ ? proxy_global_comm_ : local_nvlink_comm_;
+
+      // [Bug 10 Fix] 降級模式下，必須把 work->ncclComm_ 指向實際代傳的 Comm，避免 Watchdog 誤判
+      int local_rank_for_comm = rank_ % localDeviceCount_;
+      std::unordered_set<int> snap;
+      {
+          std::lock_guard<std::mutex> lk(faulty_devs_mutex_);
+          snap = faulty_local_devs_;
+      }
+      bool is_faulty_rank = (snap.count(local_rank_for_comm) > 0);
+      
+      if (is_faulty_rank && local_nvlink_comm_ != nullptr) {
+          work->ncclComm_ = local_nvlink_comm_;
+      } else if (!is_faulty_rank && proxy_global_comm_ != nullptr) {
+          work->ncclComm_ = proxy_global_comm_;
+      } else {
+          work->ncclComm_ = ncclComm; // Fallback
+      }
+
   } else {
+      /* --- [原生 NCCL 執行路徑] (正常訓練時，100% 只會走這裡) --- */
       try {
 #ifndef NCCL_HAS_COMM_NONBLOCKING
         C10D_NCCL_FT_CHECK(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm->getNcclCommFailureReason());
@@ -5156,173 +5181,13 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 #endif 
       } catch (const ::c10::NCCLFaultToleranceError& e) {
         if (!ft_disabled_) {
-          LOG(WARNING) << logPrefix() << "[NCCL-FT] 攔截到 NCCL Error (seq=" << seqCollective_ << ")，交給 wait() 重播。";
+          LOG(WARNING) << logPrefix() << "[NCCL-FT] 攔截到 NCCL Error (seq=" << seqCollective_ << ")，交給 wait() 處理。";
+          
+          // 紀錄 end event 讓 wait() 能夠解鎖
           work->ncclEndEvent_->record(ncclStream);
-          // 這裡必須賦值給未來 Python 的 wait
           work->ncclComm_ = ncclComm; 
-          // ... 略過 future_ 設置邏輯 ...
-          return work;
-        }
-        throw;
-      }
-      work->ncclComm_ = ncclComm;
-  }
-
-
-
-// Not all collectives have the same signature, e.g, all-reduce take in a Tensor
-// as the input and output while all-to-all take in a vector of Tensors as input
-// and output. Because we define the signature of the fn to take only single
-// tensor as input and output, we need to do a hack to get the first element in
-// the vector and pass it to fn.
-// TODO: we should clean up this in future (by either entirely removing lambda's
-// or removing input and output from lambda's signature).
-
-// Shadow Ping-Pong degraded path vs. native path.
-//
-// [NCCL-FT] Sub-Task 5: replay path.
-// shadow_replay_pending_ is set by the Watchdog (Sub-Task 3) when it has
-// enqueued a shadow restore.  After the 2PC barrier above, the topology is
-// rebuilt and proxy_comm_ready_ is true.  We detect this combination here
-// and replay the failed AllReduce via execute_shadow_allreduce on the clean
-// (restored) tensor, then skip the normal fn() call.
-//
-// seqCollective_ double-count fix:
-// collective() already bumped seqCollective_ for this invocation (line ~4615).
-// But this invocation is the REPLAY of the failed op — it is not a new op from
-// DDP's perspective. DDP's Reducer issued the original allreduce (seq N), it
-// was aborted, and now we are re-executing seq N. If we leave seqCollective_
-// bumped to N+1, the Watchdog's seq tracking and the next fault's target_op
-// calculation will be off by one. Fix: undo the bump before replay and restore
-// it after, so seqCollective_ stays at N (the replayed op) when collective()
-// returns, matching what DDP expects for the next bucket.
-  // [Step E] Safety reset: if rebuild happened (rollback_done_=true) but there
-  // is no replay pending (e.g., fault was detected before any AllReduce ran, so
-  // no checkpoint was made), reset rollback_done_ so the next round is not
-  // blocked.  The normal reset is inside the ran_shadow_replay block below.
-  if (!ft_disabled_ && C10_UNLIKELY(rollback_done_)) {
-      bool pending;
-      {
-          std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
-          pending = shadow_replay_pending_;
-      }
-      if (!pending) {
-          rollback_done_ = false;
-          LOG(INFO) << logPrefix()
-                    << "[NCCL-FT] rollback_done_ reset (no replay pending).";
-      }
-  }
-
-  bool ran_shadow_replay = false;
-  // 【切換點 A：故障發生後的第一次重播】
-  if (!ft_disabled_ && C10_UNLIKELY(shadow_replay_pending_) &&
-      opType == OpType::ALLREDUCE &&
-      proxy_comm_ready_.load(std::memory_order_acquire)) {
-      // Undo the seqCollective_ bump: this call IS the replay of seq N, not
-      // a new op. After replay, seqCollective_ should equal committed_shadow_seq_
-      // (the agreed seq of the replayed op).
-      // 1. 退回 seq，準備重播
-      if (!coalescing_state_) {
-          seqCollective_--;
-      }
-      uint64_t replay_seq = committed_shadow_seq_.load(std::memory_order_acquire);
-      LOG(INFO) << logPrefix()
-                << "[NCCL-FT] Sub-Task 5 REPLAY after rollback for seq="
-                << replay_seq
-                << " (seqCollective_ adjusted to " << seqCollective_ << ")";
-      // 2. 呼叫 Shadow Ping-Pong (代傳機制)          
-      execute_shadow_allreduce(
-          inputs[0], outputs[0], ncclStream, current_shadow_reduce_op_);
-      // 3. 標記重播完成    
-      {
-          std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
-          shadow_replay_pending_ = false;
-      }
-      ran_shadow_replay = true;
-      // [Step E] Replay is complete — the barrier for this fault round has
-      // fully executed.  Reset rollback_done_ so the next fault round can
-      // use the barrier again.  This is the only place it is reset.
-      rollback_done_ = false;
-  }
-
-  // 【切換點 B：日常訓練 vs. 降級代傳】
-  // 情況 1：網路已經斷線過了 (is_degraded_ == true)，而且這不是重播的那一次
-  if (C10_UNLIKELY(this->is_degraded_) && !ran_shadow_replay) {
-      LOG(INFO) << logPrefix()
-                << "[NCCL-FT] Degraded mode active, opType="
-                << opTypeToString(opType) << ", rank=" << rank_;
-      if (opType == OpType::ALLREDUCE && proxy_comm_ready_.load(std::memory_order_acquire)) {
-          // 走降級代傳機制 (健康卡 做 AllReduce，死卡走 NVLink 委託)
-          execute_shadow_allreduce(
-              inputs[0], outputs[0], ncclStream, current_shadow_reduce_op_);
-      } else {
-          // Non-AllReduce op or proxy comm not ready: fall back to native path
-          // and log a warning. proxy_global_comm_ has a different size, so we
-          // must still use the original comm here.
-          // Fallback 邏輯 (萬一是不支援的 OP)
-          if (opType != OpType::ALLREDUCE) {
-              LOG(WARNING) << logPrefix()
-                           << "[NCCL-FT] Non-AllReduce op in degraded mode — "
-                           << "falling back to native comm (may fail if NIC is down).";
-          }
-#ifndef NCCL_HAS_COMM_NONBLOCKING
-          C10D_NCCL_FT_CHECK(
-              fn(inputs[0], outputs[0], comm, ncclStream),
-              ncclComm->getNcclCommFailureReason());
-#else
-          C10D_NCCL_FT_CHECK_TIMEOUT(
-              fn(inputs[0], outputs[0], comm, ncclStream),
-              ncclComm,
-              ncclComm->getNcclCommFailureReason());
-#endif // NCCL_HAS_COMM_NONBLOCKING
-      }
-  } else {
-      /* ========================================================= */
-      /* --- [原生 NCCL 執行路徑] (正常訓練時，100% 只會走這裡) --- */
-      /* ========================================================= */
-      // [NCCL-FT] Catch synchronous NCCL errors thrown by the fn() call.
-      //
-      // When a NIC fault fires during or before the first collective (e.g.,
-      // during DDP init's _verify_param_shape_across_processes), the NCCL
-      // error propagates here as NCCLFaultToleranceError thrown from
-      // C10D_NCCL_FT_CHECK_TIMEOUT.  If we let it escape, it reaches Python
-      // as DistBackendError and crashes the training script.
-      //
-      // Swallow the exception here, record ncclEndEvent_, and return a
-      // complete-looking work object.  The NCCL fault callback
-      // (trigger_fault_proposal) fires independently and drives 2PC recovery
-      // via the side-car thread.  DDP's wait() on the returned work sees no
-      // stored exception and returns cleanly.
-      try {
-#ifndef NCCL_HAS_COMM_NONBLOCKING
-        C10D_NCCL_FT_CHECK(
-            fn(inputs[0], outputs[0], comm, ncclStream),
-            ncclComm->getNcclCommFailureReason());
-#else
-        C10D_NCCL_FT_CHECK_TIMEOUT(
-            fn(inputs[0], outputs[0], comm, ncclStream),
-            ncclComm,
-            ncclComm->getNcclCommFailureReason());
-#endif // NCCL_HAS_COMM_NONBLOCKING
-      } catch (const ::c10::NCCLFaultToleranceError& e) {
-        if (!ft_disabled_) {
-          LOG(WARNING) << logPrefix()
-                       << "[NCCL-FT] Synchronous NCCL error caught in "
-                       << "collective() native path (seq=" << seqCollective_
-                       << "): " << e.what()
-                       << " -- swallowing, fault callback drives 2PC recovery.";
-          // Record end event so wait()->synchronize()->block() returns.
-          // The NCCL fault callback (trigger_fault_proposal) has already fired
-          // (or will fire) and will drive the 2PC recovery via the side-car
-          // thread.  We must NOT rethrow here -- that would crash Python before
-          // the 2PC has a chance to rebuild the topology.
-          //
-          // Do NOT set exception on work: DDP will call wait() which calls
-          // handleException(asyncErrorHandling_).  With the default
-          // SkipCleanUpFT mode, handleException rethrows any stored exception.
-          // Leaving exception_ null makes wait() return cleanly.
-          work->ncclEndEvent_->record(ncclStream);
-          work->ncclComm_ = ncclComm;
+          
+          // 補齊 Future 狀態，防止 DDP 崩潰
           {
             c10::cuda::CUDAMultiStreamGuard sg(ncclStream);
             std::vector<at::Device> devs{device};
@@ -5336,11 +5201,14 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
           if (enqueue) {
             workEnqueue(work);
           }
-          return work;
+          return work; // 提早返回，把容錯交給側車與 wait()
         }
-        throw; // ft_disabled_: surface error normally
+        throw; // 如果停用 FT，直接把錯誤往上拋
       }
+      // 正常成功執行，指派原生 Comm
+      work->ncclComm_ = ncclComm;
   }
+  /* ===================================================================== */
 
   post(ncclStream, work);
 
@@ -5349,67 +5217,18 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
     work->ncclEndEvent_->record(ncclStream);
   }
 
-  // [NCCL-FT Bug 10 fix] In degraded/replay mode, work->ncclComm_ must point
-  // to the communicator that is actually used for this op, NOT the original
-  // (broken) global comm.
-  //
-  // The Watchdog calls work.checkAndSetException() which internally queries
-  // ncclCommGetAsyncError() on work->ncclComm_. If ncclComm_ points to the
-  // original comm that reported ncclRemoteError, every subsequent Watchdog
-  // cycle will see an error and re-enter the FT path for this already-handled
-  // work — or, worse, trip the abort path if ft_disabled_ races.
-  //
-  // Correct mapping:
-  //   - Shadow replay / degraded ALLREDUCE (faulty rank): local_nvlink_comm_
-  //     (the faulty rank only communicates via NVLink in execute_shadow_allreduce)
-  //   - Shadow replay / degraded ALLREDUCE (proxy/healthy rank): proxy_global_comm_
-  //     (both NVLink sends and the cross-node AllReduce are enqueued on this stream)
-  //   - Non-AllReduce degraded ops: original ncclComm (fall-back path)
-  //   - Normal (non-degraded) ops: original ncclComm
-  if (ran_shadow_replay || (C10_UNLIKELY(this->is_degraded_) && opType == OpType::ALLREDUCE)) {
-    int local_rank_for_comm = rank_ % localDeviceCount_;
-    std::unordered_set<int> snap;
-    {
-      std::lock_guard<std::mutex> lk(faulty_devs_mutex_);
-      snap = faulty_local_devs_;
-    }
-    bool is_faulty_rank = (snap.count(local_rank_for_comm) > 0);
-    if (is_faulty_rank && local_nvlink_comm_ != nullptr) {
-      work->ncclComm_ = local_nvlink_comm_;
-      LOG(INFO) << logPrefix()
-                << "[NCCL-FT] Bug10: work->ncclComm_ -> local_nvlink_comm_ (faulty rank)";
-    } else if (!is_faulty_rank && proxy_global_comm_ != nullptr) {
-      work->ncclComm_ = proxy_global_comm_;
-      LOG(INFO) << logPrefix()
-                << "[NCCL-FT] Bug10: work->ncclComm_ -> proxy_global_comm_ (proxy/healthy rank)";
-    } else {
-      // Fallback: keep original comm (should not normally happen)
-      work->ncclComm_ = ncclComm;
-      LOG(WARNING) << logPrefix()
-                   << "[NCCL-FT] Bug10: degraded path but expected comm is null; "
-                   << "falling back to original comm for work seq=" << work->seq_;
-    }
-  } else {
-    work->ncclComm_ = ncclComm;
-  }
-
   {
     c10::cuda::CUDAMultiStreamGuard streamGuard(ncclStream);
     std::vector<at::Device> devices{device};
     work->future_ = c10::make_intrusive<at::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()), devices);
 
-    // Add a callback that runs profiling end callbacks. wrapCallback() in CUDA
-    // future blocks the stream this callback runs on the corresponding
-    // ncclEndEvents_ ensuring appropriate synchronization.
+    // Add a callback that runs profiling end callbacks.
     if (work->recordFunctionEndCallback_) {
       work->future_->addCallback(
           [work](at::ivalue::Future& /* unused */) {
             work->recordFunctionEndCallback_();
           },
-          // uses_future = false allows us to skip synchronization in
-          // ivalue::Future, but is only valid as long as the lambda doesn't use
-          // the "Future" argument.
           /*uses_future=*/false);
     }
     work->future_->markCompleted(at::IValue(*work->outputs_));
@@ -5419,8 +5238,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   work->blockingWait_ = blockingWait_;
   work->store_ = store_;
   assignTimeoutToWork(work, options_);
-  // Record size info for debug. We only record the size on the first device as
-  // multi-device per process is deprecated
+  
+  // Record size info for debug.
   work->numelIn_ = 0;
   work->numelOut_ = 0;
   for (const auto& input : inputs) {
