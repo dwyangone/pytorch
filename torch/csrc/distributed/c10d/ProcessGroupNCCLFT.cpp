@@ -4411,6 +4411,9 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         ward_bufs.reserve(my_wards.size());
         for (size_t i = 0; i < my_wards.size(); ++i) {
             ward_bufs.push_back(at::empty_like(input));
+            // 在 stream 執行完畢前，絕對不准回收或複用這塊 VRAM！
+            c10::cuda::CUDACachingAllocator::recordStream(
+                ward_bufs[i].storage().data_ptr(), stream);
         }
         C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
         for (int i = 0; i < static_cast<int>(my_wards.size()); ++i) {
