@@ -927,11 +927,25 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
           auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
           ctx.replayed_end_event->block(currentStream);
           
-          // 2. [修正] 釋放被扣留的 Tensor 參照，防止 VRAM Leak！
+          // 2. 釋放被扣留的 Tensor 參照，防止 DDP 端的 VRAM Leak
           this->stashed_for_allocator_safety_->unstash();
           
-          // 3. [修正] 清除可能被 Watchdog 標記的 exception，完美掩蓋錯誤
+          // 3. 清除可能被 Watchdog 標記的 exception，完美掩蓋錯誤
           this->setException(nullptr);
+
+          // 4. 執行 GC，徹底釋放這個 Bucket 的 Context 與 VRAM 參照 🔥
+          {
+              std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
+              auto it = pg_->in_flight_shadow_bufs_.find(this->seq_);
+              if (it != pg_->in_flight_shadow_bufs_.end()) {
+                  ShadowContext recycle_ctx = it->second;
+                  recycle_ctx.original_input = at::Tensor();  // 斷開 GPU VRAM 參照
+                  recycle_ctx.original_output = at::Tensor(); // 斷開 GPU VRAM 參照
+                  pg_->free_shadow_bufs_.push_back(recycle_ctx); // 歸還給 Free Pool
+                  pg_->in_flight_shadow_bufs_.erase(it); // 從飛行清單中抹除
+                  LOG(INFO) << logPrefix() << "[NCCL-FT] GC: 重播成功，已回收 Bucket (seq=" << this->seq_ << ") 的 VRAM 參照。";
+              }
+          }
 
           return true; // 欺騙 DDP，直接返回成功
       }
