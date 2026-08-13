@@ -909,54 +909,80 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
       static_cast<int>(1)); // number of device?
 
   // =========================================================================
-  // [NCCL-FT] 攔截點 1：如果有發生網路錯誤，由 wait 觸發全域重播
+  // [NCCL-FT] 終極防線：攔截任何帶有例外，或是 2PC 已經啟動的 Work
   // =========================================================================
-  if (!pg_->ft_disabled_ && pg_->final_commit_op_.load(std::memory_order_acquire) > 0) {
-      pg_->recover_and_replay_inflight_ops();
-  }
-
-  // =========================================================================
-  // [NCCL-FT] 攔截點 2：如果這個 seq 被重播過，必須等待重播的 Event 並安全撤退
-  // =========================================================================
-  if (!pg_->ft_disabled_ && pg_->is_degraded_ && this->seq_ >= pg_->committed_shadow_seq_.load()) {
-      ShadowContext ctx;
-      bool is_replayed = false;
-      {
-          std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
-          auto it = pg_->in_flight_shadow_bufs_.find(this->seq_);
-          if (it != pg_->in_flight_shadow_bufs_.end()) {
-              ctx = it->second;
-              is_replayed = true;
-          }
-      }
-      if (is_replayed) {
-          // 1. 確保目前 Compute Stream 等待重播的 Kernel 執行完畢
-          auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
-          ctx.replayed_end_event->block(currentStream);
-          
-          // 2. 釋放被扣留的 Tensor 參照，防止 DDP 端的 VRAM Leak
-          this->stashed_for_allocator_safety_->unstash();
-          
-          // 3. 清除可能被 Watchdog 標記的 exception，完美掩蓋錯誤
-          this->setException(nullptr);
-
-          // 4. 執行 GC，徹底釋放這個 Bucket 的 Context 與 VRAM 參照 🔥
-          {
-              std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
-              auto it = pg_->in_flight_shadow_bufs_.find(this->seq_);
-              if (it != pg_->in_flight_shadow_bufs_.end()) {
-                  ShadowContext recycle_ctx = it->second;
-                  recycle_ctx.original_input = at::Tensor();  // 斷開 GPU VRAM 參照
-                  recycle_ctx.original_output = at::Tensor(); // 斷開 GPU VRAM 參照
-                  pg_->free_shadow_bufs_.push_back(recycle_ctx); // 歸還給 Free Pool
-                  pg_->in_flight_shadow_bufs_.erase(it); // 從飛行清單中抹除
-                  LOG(INFO) << logPrefix() << "[NCCL-FT] GC: 重播成功，已回收 Bucket (seq=" << this->seq_ << ") 的 VRAM 參照。";
+  if (!pg_->ft_disabled_) {
+      bool needs_ft_recovery = false;
+      
+      // 情況 A：側車已經達成共識
+      if (pg_->final_commit_op_.load(std::memory_order_acquire) > 0) {
+          needs_ft_recovery = true;
+      } 
+      // 情況 B：側車還在跑，但這個 Work 已經被標記為失敗
+      else if (exception()) {
+          // 檢查這個 Exception 是否是我們自己塞的 FT 專用假錯誤
+          std::string msg = getExceptionMsgFromExceptionPtr(exception());
+          if (msg.find("NCCL-FT: Synchronous Error") != std::string::npos ||
+              msg.find("FT early-abort") != std::string::npos) {
+              
+              LOG(WARNING) << logPrefix() << "[NCCL-FT] wait() 發現硬體異常標記，強制等待 2PC 側車達成共識...";
+              needs_ft_recovery = true;
+              
+              // 既然確定是網卡錯誤，死死卡住主執行緒，直到 2PC 協商完成
+              while (pg_->final_commit_op_.load(std::memory_order_acquire) == 0) {
+                  std::this_thread::sleep_for(std::chrono::milliseconds(2));
               }
           }
-
-          return true; // 欺騙 DDP，直接返回成功
+          // 如果是普通的 CUDA OOM 等非網卡錯誤，則不攔截，放行給原生 PyTorch 處理
       }
-  }  
+
+      // 如果確認需要容錯救援
+      if (needs_ft_recovery) {
+          LOG(WARNING) << logPrefix() << "[NCCL-FT] 異常確認，轉交全域重播中心處理...";
+          pg_->recover_and_replay_inflight_ops();
+
+          // 執行重播後的後續處理與資源回收
+          if (pg_->is_degraded_.load(std::memory_order_acquire) && 
+              this->seq_ >= pg_->committed_shadow_seq_.load(std::memory_order_acquire)) {
+              ShadowContext ctx;
+              bool is_replayed = false;
+              {
+                  std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
+                  auto it = pg_->in_flight_shadow_bufs_.find(this->seq_);
+                  if (it != pg_->in_flight_shadow_bufs_.end()) {
+                      ctx = it->second;
+                      is_replayed = true;
+                  }
+              }
+              if (is_replayed) {
+                  // 1. 確保目前 Compute Stream 等待重播的 Kernel 執行完畢
+                  auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
+                  ctx.replayed_end_event->block(currentStream);
+                  
+                  // 2. 釋放扣留的 Tensor，防止 Caching Allocator 記憶體洩漏
+                  this->stashed_for_allocator_safety_->unstash();
+                  
+                  // 3. 抹除 Exception，不讓 PyTorch 發現
+                  this->setException(nullptr); 
+
+                  // 4. 執行 GC 徹底釋放 VRAM 參照
+                  {
+                      std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
+                      auto it = pg_->in_flight_shadow_bufs_.find(this->seq_);
+                      if (it != pg_->in_flight_shadow_bufs_.end()) {
+                          ShadowContext recycle_ctx = it->second;
+                          recycle_ctx.original_input = at::Tensor();  
+                          recycle_ctx.original_output = at::Tensor(); 
+                          pg_->free_shadow_bufs_.push_back(recycle_ctx); 
+                          pg_->in_flight_shadow_bufs_.erase(it); 
+                          LOG(INFO) << logPrefix() << "[NCCL-FT] GC: 重播成功，已回收 Bucket (seq=" << this->seq_ << ") 的 VRAM 參照。";
+                      }
+                  }
+                  return true; // 欺騙 DDP，直接返回成功
+              }
+          }
+      }
+  }
 
   // =========================================================================
   // --- [原生 NCCL 執行路徑] (若未發生容錯重播，則維持原本行為) ---
@@ -5117,6 +5143,9 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
           // 紀錄 end event 讓 wait() 能夠解鎖
           work->ncclEndEvent_->record(ncclStream);
           work->ncclComm_ = ncclComm; 
+
+          // 設定專屬的字串，讓 wait() 知道這是網卡硬體錯誤！
+          work->setException(std::make_exception_ptr(C10_BUILD_ERROR(DistBackendError, "NCCL-FT: Synchronous Error")));
           
           // 補齊 Future 狀態，防止 DDP 崩潰
           {
