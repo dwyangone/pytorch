@@ -4048,7 +4048,8 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm() {
 
     // 1. Generate or retrieve the NCCL Unique ID for this specific node
     ncclUniqueId localId;
-    std::string local_id_key = "NCCL_FT_LOCAL_COMM_ID_NODE_" + std::to_string(node_id);
+    std::string local_id_key = "NCCL_FT_LOCAL_COMM_ID_NODE_" + std::to_string(node_id) 
+                               + "_PG_" + std::to_string(this->getUid());
 
     if (local_rank == 0) {
         // 本機的 GPU 0 負責產生這台機器的專屬 ID
