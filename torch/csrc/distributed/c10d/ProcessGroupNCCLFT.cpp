@@ -599,6 +599,7 @@ std::vector<at::Tensor>& TensorShelfFT::get() {
 }
 
 ProcessGroupNCCLFT::WorkNCCLFT::WorkNCCLFT(
+    ProcessGroupNCCLFT* pg,
     std::string pgUID,
     std::string pgDesc,
     at::Device& device,
@@ -612,6 +613,7 @@ ProcessGroupNCCLFT::WorkNCCLFT::WorkNCCLFT(
     bool cudaEventCacheEnabled,
     DebugLevel distDebugLevel)
     : Work(rank, opType, profilingTitle, inputs),
+      pg_(pg),
       pgUID_(std::move(pgUID)),
       pgDesc_(std::move(pgDesc)),
       device_(device),
@@ -644,6 +646,7 @@ ProcessGroupNCCLFT::WorkNCCLFT::WorkNCCLFT(
 ProcessGroupNCCLFT::WorkNCCLFT::WorkNCCLFT(const WorkNCCLFT& w)
     : Work(w.rank_, w.opType_),
       std::enable_shared_from_this<WorkNCCLFT>(w),
+      pg_(w.pg_),
       pgUID_(w.pgUID_),
       pgDesc_(w.pgDesc_),
       device_(w.device_),
@@ -3744,6 +3747,7 @@ c10::intrusive_ptr<ProcessGroupNCCLFT::WorkNCCLFT> ProcessGroupNCCLFT::initWork(
     const std::vector<at::Tensor>& outputs, // TODO(kwen2501): necessary?
     bool record) {
   auto r = c10::make_intrusive<ProcessGroupNCCLFT::WorkNCCLFT>(
+      this,
       pg_uid_,
       pg_desc_,
       device,

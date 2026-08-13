@@ -324,6 +324,7 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
 
     // Constructor takes a list of CUDA devices
     WorkNCCLFT(
+        ProcessGroupNCCLFT* pg,
         std::string pgUID,
         std::string pgDesc,
         at::Device& device,
@@ -408,6 +409,8 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
     std::vector<at::Tensor> result() override;
 
    protected:
+    // 用來儲存外層 ProcessGroup 的指標
+    ProcessGroupNCCLFT* pg_;
     // The process group unique id
     std::string pgUID_;
 
