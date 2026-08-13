@@ -4206,18 +4206,6 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 
     // 刪除原本的 NCCLFTComm::split，改為以下全新建立的邏輯：
     if (!is_faulty) {
-        /*
-         * 【極度重要提醒】
-         * 在這裡，你必須確保 NCCL 底層已經實作了動態黑名單 API
-         * 否則 NCCL 重新 Init 時，Topology Cache 會去讀壞掉的網卡導致再次 Hang 死！
-         *
-         * TODO: 移除下方重複的 ncclCommBanNic 迴圈（行 4201-4203），
-         * 上方的迴圈已對所有 rank 呼叫過一次，健康 rank 不需要再呼叫。
-         */
-        for (int d : faulty_devs) {
-             ncclCommBanNic(d); // 呼叫你在 NCCL 開的後門 API
-        }
-
         // 重新分配一個 Unique ID 給新的降級群組
         ncclUniqueId proxyId;
         std::string proxy_id_key = "NCCL_FT_PROXY_ID_" + std::to_string(ft_round_);
