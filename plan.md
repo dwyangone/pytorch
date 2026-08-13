@@ -12,8 +12,8 @@
 
 | 執行緒 | 名稱 | 職責 |
 |--------|------|------|
-| 主執行緒 | — | 執行 collective；故障後由 `wait()` 的攔截點 1 觸發 `recover_and_replay_inflight_ops()` |
-| Watchdog | `pt_nccl_watchdg` | 掃描 workMetaList_，偵測失敗 work，FT 模式下清除 exception（不寫 fault mask，不 rethrow）；GC shadow buffers |
+| 主執行緒 | — | 執行 collective；故障後由 `wait()` 攔截點 1 觸發 `recover_and_replay_inflight_ops()` |
+| Watchdog | `pt_nccl_watchdg` | 掃描 workMetaList_，偵測失敗 work，FT 模式下清除 exception（不寫 fault mask，不 rethrow）；正常完成 GC shadow buffers |
 | Side-car negotiator | `pt_nccl_ft_side` | 透過 TCPStore 2PC 協商故障邊界；fault_mask 僅由 NCCL callback 寫入（不是 Watchdog） |
 
 ### 硬體假設
@@ -29,92 +29,56 @@
 
 | 項目 | 位置（cpp 行號） | 狀態 |
 |------|-----------------|------|
-| `initLocalNvlinkComm()` — 獨立建立 NVLink comm（不依賴 ncclCommSplit） | ~4060 | ✅ |
-| `rebuild_shadow_ping_pong_topology()` — NCCLFTComm::create reinit + ncclCommBanNic | ~4133 | ✅ |
-| `execute_shadow_allreduce()` — FAULTY/PROXY/HEALTHY 四步驟角色邏輯 | ~4297 | ✅ |
-| `trigger_fault_proposal()` — NCCL callback，bitmask fetch_or | ~4488 | ✅ |
-| `start_ft_negotiator_thread()` — 2PC side-car，per-rank PROPOSE key，min agreed_ss | ~4538 | ✅ |
-| `get_or_allocate_shadow_context()` — ShadowContext ring pool（取代舊 at::Tensor） | ~4933 | ✅ |
-| `recover_and_replay_inflight_ops()` — 全域重播中心，abort→rebuild→H2D→replay | ~5440 | ✅ |
+| `initLocalNvlinkComm()` — 獨立建立 NVLink comm（不依賴 ncclCommSplit） | ~4040 | ✅ |
+| `rebuild_shadow_ping_pong_topology()` — NCCLFTComm::create reinit + ncclCommBanNic | ~4106 | ✅ |
+| `execute_shadow_allreduce()` — FAULTY/PROXY/HEALTHY 四角色邏輯（含 findProxy + my_wards） | ~4270 | ✅ |
+| `trigger_fault_proposal()` — NCCL callback，bitmask fetch_or | ~4461 | ✅ |
+| `start_ft_negotiator_thread()` — 2PC side-car，per-rank PROPOSE key，min agreed_ss | ~4511 | ✅ |
+| `get_or_allocate_shadow_context()` — ShadowContext ring pool，兩段式鎖設計 | ~4865 | ✅ |
+| `recover_and_replay_inflight_ops()` — 全域重播中心，abort→rebuild→H2D→replay | ~5201 | ✅ |
 | `WorkNCCLFT::wait()` 攔截點 1 — `final_commit_op_ > 0` 觸發 recover_and_replay | ~907 | ✅ |
-| `WorkNCCLFT::wait()` 攔截點 2 — `is_degraded_` 時等待 `replayed_end_event` | ~914 | ✅ |
-| `allreduce_impl()` shadow_pre lambda — per-seq ShadowContext（含 reduce_op / per-seq event） | ~6146 | ✅ |
-| `collective()` 前置分流（行 5138-5169）— `is_degraded_` 直接執行 shadow allreduce | ~5138 | ✅ |
-| Fix A：移除 Watchdog fallback fault_mask 寫入 | Watchdog runLoop | ✅ |
-| Fix 1：每個 rank 獨立呼叫 `ncclCommRegisterFaultCallback` | collective() lazy-init ~5014 | ✅ |
-| Fix 3：Watchdog early-abort（final_commit_op_ > 0 時強制記錄 ncclEndEvent_） | Watchdog runLoop ~2486 | ✅ |
-| Fix D：collective() 原生路徑捕獲 NCCLFaultToleranceError，不傳到 Python | collective() ~5307 | ✅ |
-| Fix D2：`initLocalNvlinkComm()` try-catch + `nvlink_init_attempted_` flag | collective() lazy-init ~5014 | ✅ |
-| Bug 1 fix：FT 模式下 Watchdog 不設 COMM_ERROR | Watchdog runLoop ~2470 | ✅ |
-| Bug 6 fix：`allreduce()` 降級模式跳過 intraNodeComm fast-path | allreduce() ~6225 | ✅ |
-| Bug 10 fix：降級模式下 work->ncclComm_ 指向實際使用的 comm | collective() ~5369 | ✅ |
-| Bug 12 fix：多 NIC 同時故障用 bitmask fetch_or | trigger_fault_proposal | ✅ |
+| `WorkNCCLFT::wait()` 攔截點 2 — `is_degraded_` 時等待 `replayed_end_event` + GC | ~914 | ✅ |
+| `allreduce_impl()` shadow_pre lambda — per-seq ShadowContext（含 reduce_op / per-seq event） | ~5929 | ✅ |
+| `collective()` 二分支設計（行 5085-5152）— `is_degraded_` 直接執行 shadow allreduce | ~5085 | ✅ |
+| Fix A：移除 Watchdog fallback fault_mask 寫入 | Watchdog runLoop ~2562 | ✅ |
+| Fix 1：每個 rank 獨立呼叫 `ncclCommRegisterFaultCallback` | collective() lazy-init ~4956 | ✅ |
+| Fix 3：Watchdog early-abort（final_commit_op_ > 0 時強制記錄 ncclEndEvent_） | Watchdog runLoop ~2503 | ✅ |
+| Fix D：collective() 原生路徑捕獲 NCCLFaultToleranceError，補齊 future_，不傳到 Python | collective() ~5124 | ✅ |
+| Fix D2：`initLocalNvlinkComm()` try-catch + `nvlink_init_attempted_` flag | collective() lazy-init ~4956 | ✅ |
+| Bug 1 fix：FT 模式下 Watchdog 不設 COMM_ERROR | Watchdog runLoop ~2489 | ✅ |
+| Bug 2 fix：catch NCCLFaultToleranceError 的 early return 補齊 work->future_ | collective() ~5133 | ✅ |
+| Bug 3 確認：recover_and_replay seq >= agreed_ss 是正確的（agreed_ss 本身狀態未知，必須重播） | ~5232 | ✅ |
+| Bug 4 fix：get_or_allocate_shadow_context 兩段式鎖設計（pin_memory 在鎖外執行） | ~4865 | ✅ |
+| Bug 5 確認：降級後 shadow_pre 仍執行 D2H copy — **設計決定**，為二次故障 replay 預備 | shadow_pre | ✅ |
+| Bug 6 fix：`allreduce()` 降級模式跳過 intraNodeComm fast-path | allreduce() ~6008 | ✅ |
+| Bug 7 fix：proxy 的 ATen 算術（copy_/add_）在 ncclStream 上執行（setCurrentCUDAStream） | execute_shadow_allreduce ~4401 | ✅ |
+| Bug 10 fix：降級模式下 work->ncclComm_ 指向實際使用的 comm | collective() ~5108 | ✅ |
+| Bug 12 fix：多 NIC 同時故障用 bitmask fetch_or | trigger_fault_proposal ~4472 | ✅ |
+| Bug A fix：`ft_round_++` 在 recover_and_replay 末尾執行 + TCPStore cleanup | ~5273 | ✅ |
+| Bug B fix：用 `final_commit_op_ == 0` 取代 `rollback_done_` 判斷重入 | ~5207 | ✅ |
+| Bug C fix：side-car Phase 1b OR 累積更新 `faulty_local_devs_`（逐步故障支援） | ~4752 | ✅ |
 | UINT64_MAX sentinel（agreed_ss == UINT64_MAX 表示無 checkpoint） | side-car & barrier | ✅ |
-| 2PC side-car 強制 abort globalComm 以喚醒卡死的主執行緒 | start_ft_negotiator_thread ~4841 | ✅ |
-| Watchdog GC：AllReduce 成功後釋放 in_flight_shadow_bufs_ 到 free pool（清 Tensor 參照） | Watchdog runLoop ~2860 | ✅ |
+| 2PC side-car 強制 abort globalComm 以喚醒卡死的主執行緒 | start_ft_negotiator_thread ~4814 | ✅ |
+| Watchdog GC：AllReduce 成功後釋放 in_flight_shadow_bufs_ 到 free pool | Watchdog runLoop ~2792 | ✅ |
+| wait() 攔截點 2 GC：replay 完成後由主執行緒回收 shadow buffer | wait() ~937 | ✅ |
 | `ShadowContext` struct（含 per-seq copy_event / replayed_end_event / reduce_op） | hpp ~1181 | ✅ |
+| findProxy()：round-robin 尋找下一個健康 proxy（支援多 faulty） | ~4259 | ✅ |
+| my_wards vector：proxy 可代理多個 faulty rank | execute_shadow_allreduce ~4297 | ✅ |
 
 ---
 
 ## 三、待確認與待修復項目
 
-### P0：必須修復的 Bugs
-
-#### Bug 1（嚴重）：collective() 降級路徑的 execute_shadow_allreduce 被呼叫兩次
-
-**位置：** 行 5142-5148（新前置分流）和行 5250-5278（舊切換點 B）
-
-**現象：** `is_degraded_ = true` 時，新前置分流執行 `execute_shadow_allreduce` 後 fall-through，舊切換點 B 的條件 `is_degraded_ && !ran_shadow_replay` 也成立（`ran_shadow_replay` 未在前置分流中設定），導致同一個 AllReduce **執行兩次**。
-
-**影響：** 梯度數值錯誤（double reduce），或 NCCL stream 序列混亂。
-
-**修復方向：** 選其一：
-1. 在前置分流（行 5148）後設定 `ran_shadow_replay = true`，讓切換點 B 不觸發
-2. 完整刪除舊的切換點 A/B 邏輯（行 5203-5343），整合到前置分流
-
-#### Bug 2（中）：前置分流的 early return 未設置 work->future_
-
-**位置：** 行 5157-5165（catch NCCLFaultToleranceError 的 early return）
-
-**現象：** `return work` 前未設置 `work->future_`。DDP 呼叫 `getFuture()` 時會因 nullptr future 崩潰。
-
-**修復：** 在 return 前加入與行 5307-5340（舊邏輯）相同的 future_ 設置邏輯：
-```cpp
-c10::cuda::CUDAMultiStreamGuard sg(ncclStream);
-std::vector<at::Device> devs{device};
-work->future_ = c10::make_intrusive<at::ivalue::Future>(
-    c10::ListType::create(c10::TensorType::get()), devs);
-work->future_->markCompleted(at::IValue(*work->outputs_));
-```
-
-#### Bug 3（中）：recover_and_replay_inflight_ops 的 seq 邊界條件
-
-**位置：** 行 5465：`if (seq >= agreed_ss)`
-
-**現象：** 若 `seq == agreed_ss` 的 AllReduce **尚未被 Watchdog GC**，它已成功完成但仍在 in_flight_shadow_bufs_ 中，會被 replay（重複 reduce）。
-
-**修復：** 改為 `if (seq > agreed_ss)`，只 replay 在故障時還未完成的 ops。
-
-### P1：效能問題
-
-#### Bug 4（低）：get_or_allocate_shadow_context 在鎖內呼叫 pin_memory()
-
-**位置：** 行 4934, 4948
-
-**現象：** `pin_memory()` = `cudaHostAlloc`（同步 CUDA call）在 `shadow_buf_mutex_` 鎖住狀態下執行，可能 stall Watchdog GC。
-
-**緩解：** ring pool 命中時不執行，低機率，可接受。正式修復：在鎖外配置後再鎖定插入。
-
 ### P0：確認 NCCL Fork 行為
 
 **問題 1：** `ncclCommBanNic(dev_idx)` 是 process-level global 還是 per-comm？
 - 如果是 process-level：rebuild 前呼叫一次即可，後續 `NCCLFTComm::create` 建立的新 comm 自動跳過被 ban 的 NIC。
-- 如果是 per-comm：ban 在 abort 後失效，需要在 reinit 前再次呼叫（目前 `rebuild_shadow_ping_pong_topology` 已在 reinit 前重複呼叫，應可覆蓋此情況）。
+- 如果是 per-comm：ban 在 abort 後失效，需要在 reinit 前再次呼叫（目前 `rebuild_shadow_ping_pong_topology` 已在所有 rank 呼叫 ban，應可覆蓋此情況）。
 
-**問題 2：** `ncclCommInitRank`（即 `NCCLFTComm::create`）是否每次都重新執行 topo discovery？
+**問題 2：** `NCCLFTComm::create`（即 `ncclCommInitRank`）是否每次都重新執行 topo discovery？
 - 需要實驗確認：呼叫 `ncclCommBanNic(0)` 後再建立新 comm，確認新 comm 不使用 mlx5_0。
 
-### 端對端測試（P0）
+### P0：端對端測試
 
 ```
 [ ] 測試 1：NIC 在 DDP init 期間故障
@@ -122,23 +86,25 @@ work->future_->markCompleted(at::IValue(*work->outputs_));
 [ ] 測試 2：NIC 在訓練中途故障（已完成 N 個 AllReduce 後）
       預期：2PC 完整流程 → recover_and_replay_inflight_ops → is_degraded_ mode 繼續
 [ ] 測試 3：兩個 NIC 同時故障
-      預期：bitmask 正確捕捉兩個 dev，agg_fault_mask 有兩個 bit
+      預期：bitmask 正確捕捉兩個 dev，agg_fault_mask 有兩個 bit，findProxy 正確分配
 [ ] 測試 4：NCCL_FT_DISABLE=1
       預期：完全走原生 NCCL 路徑，無任何 FT 邏輯
-[ ] 測試 5：故障後梯度數學正確性驗證（修復 Bug 1 後）
+[ ] 測試 5：故障後梯度數學正確性驗證
       預期：故障 step 的梯度與無故障版本 allclose
+[ ] 測試 6：逐步故障（第一次故障後，第二張 NIC 再次故障）
+      預期：ft_round_ 遞增，第二輪 2PC 完整流程，faulty_local_devs_ 累積兩個故障
 ```
 
-### 後續 P1 工作
+### P1：後續工作
 
 | 項目 | 說明 |
 |------|------|
-| 清理 collective() 舊邏輯 | 刪除或重構行 5203-5343 的舊切換點 A/B（含舊 2PC barrier），與前置分流整合，消除 Bug 1 |
-| AllGather / ReduceScatter 降級路徑 | FSDP / ZeRO2/3 場景 |
-| Per-Server NIC Pool 非對稱降級 | 不同節點不同 NIC 索引（Bug 13） |
-| Proxy 負載均衡 | 目前固定 `(faulty+1) % N`，多 faulty 時可能集中在同一個 proxy |
+| AllGather / ReduceScatter 降級路徑 | FSDP / ZeRO2/3 場景；目前降級時非 AllReduce op 走 fallback fn()，可能崩潰 |
+| Per-Server NIC Pool 非對稱降級 | 不同節點不同 NIC 索引時（對稱降級假設目前固定） |
+| Proxy 負載均衡 | 目前固定 `(faulty+1) % N`，多 faulty 時 findProxy 可能將多個 ward 集中在同一 proxy |
 | Error type 精細分類 | 目前所有 ncclRemoteError 視為 NIC 硬體故障，應區分網路抖動 vs. 實際 NIC failure |
-| AllReduce AVG 正確性驗證 | proxy 用 ncclSum 再除以原始 size_，需驗證浮點精度 |
+| AllReduce AVG 正確性驗證 | proxy 用 ncclSum 再除以原始 size_，需驗證浮點精度是否與 ncclAvg 一致 |
+| 降級後 `is_degraded_` 不恢復 | 目前一旦降級不回到正常模式；若 NIC 可熱插拔可考慮恢復路徑 |
 
 ---
 
@@ -148,7 +114,7 @@ work->future_->markCompleted(at::IValue(*work->outputs_));
 
 **根因：** Watchdog 清除 `ncclRemoteError` poisoned work 時，`device_idx = work.device_.index() % localDeviceCount_`。這是每個 rank 自己的 GPU index，不是故障 NIC 的 index。AllReduce 是集體操作，`ncclRemoteError` 會傳播到所有 rank 的 comm，導致每個 rank 都把自己的 device index 寫入 fault_mask，`agg_fault_mask` 有全部 8 個 bit，`proxy_comm_size_` 計算為 0，系統崩潰。
 
-**修復：** `local_hardware_fault_mask_` 只由 `trigger_fault_proposal()`（NCCL callback，接收的是真正故障的 `dev_idx`）寫入。Watchdog 完全不寫 fault_mask。
+**修復：** `local_hardware_fault_mask_` 只由 `trigger_fault_proposal()`（NCCL callback，接收的是真正故障的 `dev_idx`）寫入。Watchdog 完全不寫 fault_mask（Fix A）。
 
 ### Bug B（已解決）：ncclCommSplit 在 RemoteError comm 上失敗
 
@@ -160,13 +126,19 @@ work->future_->markCompleted(at::IValue(*work->outputs_));
 
 **根因：** NIC 在第一個 collective（DDP init 的 `_verify_param_shape_across_processes`）期間故障時，`C10D_NCCL_FT_CHECK_TIMEOUT` 在 `fn()` 呼叫中同步拋出 `NCCLFaultToleranceError`，沒有任何 catch，直接傳到 Python 為 `DistBackendError`，訓練崩潰。
 
-**修復：** `collective()` 原生路徑的 `fn()` 呼叫外加 try-catch，捕獲 `NCCLFaultToleranceError`，記錄 `ncclEndEvent_`，設定 work 的必要欄位，return 完好的 work。2PC 恢復由 NCCL fault callback 機制驅動，主執行緒不感知。
+**修復：** `collective()` 原生路徑的 `fn()` 呼叫外加 try-catch，捕獲 `NCCLFaultToleranceError`，記錄 `ncclEndEvent_`，補齊 `work->future_`，workEnqueue 後 return work。2PC 恢復由 NCCL fault callback 機制驅動，主執行緒不感知（Bug 2 fix 同時修復了 future_ 未設置問題）。
 
 ### Bug 6（已解決）：降級模式下 intraNodeComm fast-path 繞過 FT 邏輯
 
 **根因：** `allreduce()` 中，`intraNodeComm_->allReduce()` 返回的 `IntraNodeCommWork` 完全繞過 `allreduce_impl()` 的 shadow buffer checkpoint 和 `collective()` 的容錯邏輯，在降級後使用舊 topology 產生錯誤結果或崩潰。
 
-**修復：** `allreduce()` 中加入 `!is_degraded_` 條件，降級模式下強制走 `allreduce_impl`。
+**修復：** `allreduce()` 中加入 `!is_degraded_` 條件，降級模式下強制走 `allreduce_impl`（行 6008）。
+
+### Bug 7（已解決）：proxy 的 ATen 算術未在 ncclStream 上執行
+
+**根因：** proxy step 2 的 `output.copy_()` 和 `output.add_()` 預設在 compute stream 執行，但 `ward_bufs` 的數據是由 ncclRecv 寫到 ncclStream 上的。兩個 stream 並行執行時，ATen 可能讀到 ncclRecv 尚未完成的數據。
+
+**修復：** 使用 `setCurrentCUDAStream(stream)` + restore，確保算術核心在 ncclStream 上排入（行 4401-4410）。
 
 ---
 
@@ -182,3 +154,13 @@ work->future_->markCompleted(at::IValue(*work->outputs_));
 | `ncclCommRegisterFaultCallback` API 可用 | ✅ 已確認（在 first collective 成功呼叫） |
 | **`ncclCommBanNic` 作用域（process-level vs. per-comm）** | ❓ 待確認 |
 | **`NCCLFTComm::create` 在 reinit 時是否每次重新做 topo discovery** | ❓ 待確認 |
+
+---
+
+## 六、遺留效能注意事項
+
+| 項目 | 影響 | 說明 |
+|------|------|------|
+| early-abort 的 ncclEndEvent_ 被 record 兩次 | 極低 | 行 2517（early-abort）和 2633（FT clearing path）；多一次 CUDA API 呼叫，無害 |
+| 降級後仍執行 D2H copy | 輕微額外記憶體頻寬 | **設計決定**，為二次故障 replay 預備 shadow buffer |
+| proxy step 2 建立 ward_bufs（at::empty_like） | GPU allocator 呼叫 | 每個降級 AllReduce 都會配置，影響較輕；可考慮預配置 |
