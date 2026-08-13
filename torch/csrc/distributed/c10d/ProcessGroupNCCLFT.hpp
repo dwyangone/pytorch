@@ -1080,7 +1080,6 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   /* --- [NCCL-FT: 零開銷容錯控制面變數] --- */
   std::atomic<uint64_t> do_not_cross_op_{0};
   std::atomic<uint64_t> final_commit_op_{0};
-  bool is_degraded_ = false;
   bool ft_disabled_ = false;
 
   // Monotonically increasing fault-round counter.  Bumped by the main thread
@@ -1090,7 +1089,8 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // side-car to construct COMMIT key names.  No atomic needed: the main
   // thread writes before unlocking the barrier, side-car reads after COMMIT
   // (there is a TCPStore-mediated happens-before relationship).
-  uint64_t ft_round_{0};
+  std::atomic<bool> is_degraded_{false};
+  std::atomic<uint64_t> ft_round_{0};
 
   // Pending fault signal from NCCL callback / Watchdog.
   // Bitmask: bit i is set when local device i has a pending NIC fault.

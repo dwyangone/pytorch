@@ -2620,7 +2620,7 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
           LOG(INFO) << pg_->logPrefix()
                     << "[NCCL-FT] Watchdog FT detail: seq=" << work.seq_
                     << " opType=" << static_cast<int>(work.opType_)
-                    << " shadow_seq=" << pg_->shadow_seq_
+                    << " shadow_seq=" << pg_->shadow_seq_.load(std::memory_order_relaxed)
                     << " outputs_null=" << (work.outputs_ == nullptr)
                     << " outputs_empty="
                     << (work.outputs_ == nullptr || work.outputs_->empty());
@@ -5097,7 +5097,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   pre(ncclStream, work);
   ncclComm_t comm = ncclComm->getNcclComm();
 
-  if (C10_UNLIKELY(this->is_degraded_)) {
+  if (C10_UNLIKELY(this->is_degraded_.load(std::memory_order_acquire))) {
       LOG(INFO) << logPrefix() << "[NCCL-FT] 降級模式，執行 Shadow Ping-Pong (seq=" << seqCollective_ << ")";
       
       if (opType == OpType::ALLREDUCE && proxy_comm_ready_.load(std::memory_order_acquire)) {
@@ -5219,8 +5219,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     std::lock_guard<std::mutex> lock(recovery_mutex_); // 確保只有一個 Thread 進行恢復
     
-    // [Bug B 修正] 不再依賴 rollback_done_。
-    // 改用 final_commit_op_ 判斷。如果為 0，代表這個 Round 已經被其他 Bucket (Thread) 恢復過了
+    // 用 final_commit_op_ 判斷。如果為 0，代表這個 Round 已經被其他 Bucket (Thread) 恢復過了
     uint64_t commit_signal = this->final_commit_op_.load(std::memory_order_acquire);
     if (commit_signal == 0) {
         return; 
