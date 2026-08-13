@@ -4891,6 +4891,7 @@ ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_con
     // 昂貴的 cudaEventCreate
     new_ctx.copy_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
     new_ctx.replayed_end_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+    new_ctx.compute_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
     
     return new_ctx;
 }
@@ -5944,14 +5945,9 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
         in_flight_shadow_bufs_[current_seq] = ctx;
     }
 
-    // NOTE: compute_done is created here (cudaEventCreate) on every AllReduce
-    // call.  For high-bucket-count models this adds measurable CUDA API
-    // overhead.  TODO: promote to a PG member (shadow_compute_done_event_)
-    // initialised once in the constructor and reused here.
-    at::cuda::CUDAEvent compute_done;
     auto compute_stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
-    compute_done.record(compute_stream);
-    compute_done.block(shadow_copy_stream_);
+    ctx.compute_event->record(compute_stream);
+    ctx.compute_event->block(shadow_copy_stream_);
 
     auto prev = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
     at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
