@@ -5160,6 +5160,15 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
     work->ncclStartEvent_->record(ncclStream);
   }
 
+  // 將 Future 的初始化移到最前面！
+  // 確保在 pre() 將任務暴露給重播中心之前，Future 已經存在，徹底消滅 Race Condition！
+  {
+    c10::cuda::CUDAMultiStreamGuard sg(ncclStream);
+    std::vector<at::Device> devs{device};
+    work->future_ = c10::make_intrusive<at::ivalue::Future>(
+        c10::ListType::create(c10::TensorType::get()), devs);
+  }
+
   /* ===================================================================== */
   pre(ncclStream, work);
 
@@ -5228,16 +5237,6 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
           // 3. 設定內部 Exception 標記，讓重播中心知道這包資料壞了
           work->setException(std::make_exception_ptr(e));
 
-          // 4. 建立 Future，但【絕對不要 markCompleted】！
-          // 讓它保持在 Pending (未完成) 狀態，DDP 拿到後會乖乖在背景非同步等待
-          {
-            c10::cuda::CUDAMultiStreamGuard sg(ncclStream);
-            std::vector<at::Device> devs{device};
-            work->future_ = c10::make_intrusive<at::ivalue::Future>(
-                c10::ListType::create(c10::TensorType::get()), devs);
-            // 移除 work->future_->markCompleted(...)
-          }
-
           work->blockingWait_ = blockingWait_;
           work->store_ = store_;
           assignTimeoutToWork(work, options_);
@@ -5260,9 +5259,6 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 
   {
     c10::cuda::CUDAMultiStreamGuard streamGuard(ncclStream);
-    std::vector<at::Device> devices{device};
-    work->future_ = c10::make_intrusive<at::ivalue::Future>(
-        c10::ListType::create(c10::TensorType::get()), devices);
 
     // Add a callback that runs profiling end callbacks.
     if (work->recordFunctionEndCallback_) {
@@ -5272,6 +5268,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
           },
           /*uses_future=*/false);
     }
+    // 正常執行完畢，標記完成
     work->future_->markCompleted(at::IValue(*work->outputs_));
   }
 
