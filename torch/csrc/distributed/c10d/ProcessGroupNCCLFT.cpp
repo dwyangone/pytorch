@@ -5123,21 +5123,22 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
         c10::ListType::create(c10::TensorType::get()), devs);
   }
 
-  /* ===================================================================== */
+/* ===================================================================== */
   pre(ncclStream, work);
 
   try {
-      // 將 getNcclComm() 移入 try 區塊！
-      // 若被側車 Abort，這裡會拋出 NCCLFaultToleranceError，並被下方完美捕捉！
-      ncclComm_t comm = ncclComm->getNcclComm();
-
+      // 先判斷是否處於降級模式！
+      // 絕對不要在降級模式下呼叫 ncclComm->getNcclComm()，因為它已經被 abort，會拋出例外！
       if (C10_UNLIKELY(this->is_degraded_.load(std::memory_order_acquire))) {
           LOG(INFO) << logPrefix() << "[NCCL-FT] 降級模式，執行 Shadow Ping-Pong (seq=" << seqCollective_ << ")";
           
           if (opType == OpType::ALLREDUCE && proxy_comm_ready_.load(std::memory_order_acquire)) {
+              // 執行降級重播，內部會使用 proxy_global_comm_ 和 local_nvlink_comm_
               execute_shadow_allreduce(inputs[0], outputs[0], ncclStream, current_shadow_reduce_op_);
           } else {
               LOG(WARNING) << logPrefix() << "[NCCL-FT] Non-AllReduce op in degraded mode — falling back...";
+              // 只有不支援的 Op 才會去撞舊的 Comm 觸發例外
+              ncclComm_t comm = ncclComm->getNcclComm(); 
 #ifndef NCCL_HAS_COMM_NONBLOCKING
               C10D_NCCL_FT_CHECK(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm->getNcclCommFailureReason());
 #else
@@ -5163,6 +5164,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 
       } else {
           /* --- [原生 NCCL 執行路徑] (正常訓練時，100% 只會走這裡) --- */
+          ncclComm_t comm = ncclComm->getNcclComm(); // 正常情況下才去拿 Comm
 #ifndef NCCL_HAS_COMM_NONBLOCKING
           C10D_NCCL_FT_CHECK(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm->getNcclCommFailureReason());
 #else
@@ -5176,10 +5178,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
       if (!ft_disabled_) {
           LOG(WARNING) << logPrefix() << "[NCCL-FT] 攔截到同步派發錯誤 (seq=" << seqCollective_ << ")，建立 Pending Work 轉交背景重播。";
           
-          // 1. 記錄 End Event，避免後續 CUDA Stream 卡死
           work->ncclEndEvent_->record(ncclStream);
           
-          // 2. 指派降級後的新通訊子 (如果已經有的話)
           if (this->proxy_global_comm_) {
               work->ncclComm_ = this->proxy_global_comm_;
           } else if (this->local_nvlink_comm_) {
@@ -5188,8 +5188,6 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
               work->ncclComm_ = ncclComm;
           }
 
-          // 讓稍後呼叫的 work->wait() 知道這筆任務壞了，從而進入 while 迴圈乖乖等待側車重播！
-          // (不用擔心崩潰，因為我們現在的 wait() 已經會在重播完畢後將它設回 nullptr 了)
           work->setException(std::make_exception_ptr(e));
 
           work->blockingWait_ = blockingWait_;
@@ -5199,10 +5197,9 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
             workEnqueue(work);
           }
           
-          // 5. 立即返回！不阻塞 CPU，讓 Autograd 引擎全速往下跑！
           return work; 
       }
-      throw; // 若未開啟FT，維持向上拋出
+      throw; 
   }
 
   post(ncclStream, work);
