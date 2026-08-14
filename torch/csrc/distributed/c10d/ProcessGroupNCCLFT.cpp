@@ -5175,59 +5175,65 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   }
 
   /* ===================================================================== */
-  /* 保留最單純的分流：只負責派發任務，不負責重播與重建 */
   pre(ncclStream, work);
-  ncclComm_t comm = ncclComm->getNcclComm();
 
-  if (C10_UNLIKELY(this->is_degraded_.load(std::memory_order_acquire))) {
-      LOG(INFO) << logPrefix() << "[NCCL-FT] 降級模式，執行 Shadow Ping-Pong (seq=" << seqCollective_ << ")";
-      
-      if (opType == OpType::ALLREDUCE && proxy_comm_ready_.load(std::memory_order_acquire)) {
-          execute_shadow_allreduce(inputs[0], outputs[0], ncclStream, current_shadow_reduce_op_);
+  try {
+      // 將 getNcclComm() 移入 try 區塊！
+      // 若被側車 Abort，這裡會拋出 NCCLFaultToleranceError，並被下方完美捕捉！
+      ncclComm_t comm = ncclComm->getNcclComm();
+
+      if (C10_UNLIKELY(this->is_degraded_.load(std::memory_order_acquire))) {
+          LOG(INFO) << logPrefix() << "[NCCL-FT] 降級模式，執行 Shadow Ping-Pong (seq=" << seqCollective_ << ")";
+          
+          if (opType == OpType::ALLREDUCE && proxy_comm_ready_.load(std::memory_order_acquire)) {
+              execute_shadow_allreduce(inputs[0], outputs[0], ncclStream, current_shadow_reduce_op_);
+          } else {
+              LOG(WARNING) << logPrefix() << "[NCCL-FT] Non-AllReduce op in degraded mode — falling back...";
+#ifndef NCCL_HAS_COMM_NONBLOCKING
+              C10D_NCCL_FT_CHECK(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm->getNcclCommFailureReason());
+#else
+              C10D_NCCL_FT_CHECK_TIMEOUT(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm, ncclComm->getNcclCommFailureReason());
+#endif 
+          }
+
+          int local_rank_for_comm = rank_ % localDeviceCount_;
+          std::unordered_set<int> snap;
+          {
+              std::lock_guard<std::mutex> lk(faulty_devs_mutex_);
+              snap = faulty_local_devs_;
+          }
+          bool is_faulty_rank = (snap.count(local_rank_for_comm) > 0);
+          
+          if (is_faulty_rank && local_nvlink_comm_ != nullptr) {
+              work->ncclComm_ = local_nvlink_comm_;
+          } else if (!is_faulty_rank && proxy_global_comm_ != nullptr) {
+              work->ncclComm_ = proxy_global_comm_;
+          } else {
+              work->ncclComm_ = ncclComm; // Fallback
+          }
+
       } else {
-          LOG(WARNING) << logPrefix() << "[NCCL-FT] Non-AllReduce op in degraded mode — falling back...";
+          /* --- [原生 NCCL 執行路徑] (正常訓練時，100% 只會走這裡) --- */
 #ifndef NCCL_HAS_COMM_NONBLOCKING
           C10D_NCCL_FT_CHECK(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm->getNcclCommFailureReason());
 #else
           C10D_NCCL_FT_CHECK_TIMEOUT(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm, ncclComm->getNcclCommFailureReason());
 #endif 
+          // 正常成功執行，指派原生 Comm
+          work->ncclComm_ = ncclComm;
       }
 
-      // [Bug 10 Fix] 降級模式下，必須把 work->ncclComm_ 指向實際代傳的 Comm，避免 Watchdog 誤判
-      int local_rank_for_comm = rank_ % localDeviceCount_;
-      std::unordered_set<int> snap;
-      {
-          std::lock_guard<std::mutex> lk(faulty_devs_mutex_);
-          snap = faulty_local_devs_;
-      }
-      bool is_faulty_rank = (snap.count(local_rank_for_comm) > 0);
-      
-      if (is_faulty_rank && local_nvlink_comm_ != nullptr) {
-          work->ncclComm_ = local_nvlink_comm_;
-      } else if (!is_faulty_rank && proxy_global_comm_ != nullptr) {
-          work->ncclComm_ = proxy_global_comm_;
-      } else {
-          work->ncclComm_ = ncclComm; // Fallback
-      }
-
-  } else {
-      /* --- [原生 NCCL 執行路徑] (正常訓練時，100% 只會走這裡) --- */
-      try {
-#ifndef NCCL_HAS_COMM_NONBLOCKING
-        C10D_NCCL_FT_CHECK(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm->getNcclCommFailureReason());
-#else
-        C10D_NCCL_FT_CHECK_TIMEOUT(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm, ncclComm->getNcclCommFailureReason());
-#endif 
-      } catch (const ::c10::NCCLFaultToleranceError& e) {
-        if (!ft_disabled_) {
-          LOG(WARNING) << logPrefix() << "[NCCL-FT] 攔截到 NCCL Error (seq=" << seqCollective_ << ")，交給 wait() 處理。";
+  } catch (const ::c10::NCCLFaultToleranceError& e) {
+      // 現在所有巨集與 getNcclComm 拋出的錯誤，都能靠 C++ 型別系統精準捕捉
+      if (!ft_disabled_) {
+          LOG(WARNING) << logPrefix() << "[NCCL-FT] 攔截到同步派發錯誤 (seq=" << seqCollective_ << ")，交給 wait() 處理。原因: " << e.what();
           
           // 紀錄 end event 讓 wait() 能夠解鎖
           work->ncclEndEvent_->record(ncclStream);
           work->ncclComm_ = ncclComm; 
 
-          // 設定專屬的字串，讓 wait() 知道這是網卡硬體錯誤！
-          work->setException(std::make_exception_ptr(C10_BUILD_ERROR(DistBackendError, "NCCL-FT: Synchronous Error")));
+          // 將捕捉到的強型別例外重新存入 Work，供後續 wait() 透過 RTTI 讀取
+          work->setException(std::make_exception_ptr(e));
           
           // 補齊 Future 狀態，防止 DDP 崩潰
           {
@@ -5244,11 +5250,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
             workEnqueue(work);
           }
           return work; // 提早返回，把容錯交給側車與 wait()
-        }
-        throw; // 如果停用 FT，直接把錯誤往上拋
       }
-      // 正常成功執行，指派原生 Comm
-      work->ncclComm_ = ncclComm;
+      throw; // 如果停用 FT，直接把錯誤往上拋
   }
   /* ===================================================================== */
 
