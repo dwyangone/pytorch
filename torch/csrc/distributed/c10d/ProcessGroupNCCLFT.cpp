@@ -5234,9 +5234,6 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
               work->ncclComm_ = ncclComm;
           }
 
-          // 3. 設定內部 Exception 標記，讓重播中心知道這包資料壞了
-          work->setException(std::make_exception_ptr(e));
-
           work->blockingWait_ = blockingWait_;
           work->store_ = store_;
           assignTimeoutToWork(work, options_);
@@ -5307,6 +5304,10 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
 
     // 1. 確保舊的 Communicator 徹底死亡
     auto device = at::Device(at::DeviceType::CUDA, this->guessDeviceId());
+    // 強制將側車執行緒綁定到當前正確的 GPU！
+    // 拯救所有 CUDAEvent、Tensor Copy 與 Future 完成時的跨設備崩潰！
+    at::cuda::CUDAGuard device_guard(device);
+
     auto globalComm = this->getNCCLComm(getKeyFromDevice(device));
     if (globalComm && !globalComm->isAborted()) {
         globalComm->abort("FT Recovery - Aborting dead comm");
