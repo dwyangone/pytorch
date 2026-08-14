@@ -2560,7 +2560,7 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
             // 標記異常，讓 wait() 知道它必須被重播
             std::string exceptionMsg = c10::str(work.logPrefix(), "FT early-abort: Comm dead.");
             work.setException(std::make_exception_ptr(
-                C10_BUILD_ERROR(::c10::NCCLFaultToleranceError, exceptionMsg)));
+                C10_BUILD_ERROR(NCCLFaultToleranceError, exceptionMsg)));
             
             // 設定完例外後，程式會順順地往下走，
             // 進入下方的 if (work.exception()) 區塊統一執行 record 與 erase！
@@ -3166,7 +3166,7 @@ std::exception_ptr ProcessGroupNCCLFT::checkForNCCLErrorsInternal(
         commFailureReason->find("FT early-abort") != std::string::npos) {
         
         std::string err_msg = c10::str("NCCL FT communicator was safely aborted: ", *commFailureReason);
-        return std::make_exception_ptr(C10_BUILD_ERROR(::c10::NCCLFaultToleranceError, err_msg));
+        return std::make_exception_ptr(C10_BUILD_ERROR(NCCLFaultToleranceError, err_msg));
     }
     // 其他原生的 Abort 維持拋出 DistBackendError
     return std::make_exception_ptr(C10_BUILD_ERROR(
@@ -3184,7 +3184,7 @@ std::exception_ptr ProcessGroupNCCLFT::checkForNCCLErrorsInternal(
     // [分流] 如果是單純的網路連線問題 (SystemError / RemoteError)，拋出容錯專用例外！
     if (ncclAsyncErr == ncclSystemError || ncclAsyncErr == ncclRemoteError) {
         std::string err_msg = c10::str(ncclGetErrorWithVersion(ncclAsyncErr), "\n", getNcclErrorDetailStr(ncclAsyncErr));
-        return std::make_exception_ptr(C10_BUILD_ERROR(::c10::NCCLFaultToleranceError, err_msg));
+        return std::make_exception_ptr(C10_BUILD_ERROR(NCCLFaultToleranceError, err_msg));
     }
     
     // [不攔截] 若是 CUDA OOM, Illegal Access (ncclUnhandledCudaError) 或參數錯誤，
