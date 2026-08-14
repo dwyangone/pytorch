@@ -959,20 +959,23 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
     } 
     // 情況 B：側車還在跑，但這個 Work 已經被 Watchdog 或 NCCL 原生標記為失敗
     else if (exception()) {
-        std::string msg = getExceptionMsgFromExceptionPtr(exception());
-        // 攔截所有網路或 FT 相關的錯誤 (包含 Watchdog 的 early-abort 和原生網路中斷)
-        if (msg.find("NCCL-FT: Synchronous Error") != std::string::npos ||
-            msg.find("FT early-abort") != std::string::npos ||
-            msg.find("NCCL communicator encountered error") != std::string::npos ||
-            msg.find("network error") != std::string::npos) {
-            
-            LOG(WARNING) << logPrefix() << "[NCCL-FT] wait() 發現硬體異常信號，強制等待 2PC 側車達成共識...";
+        try {
+            std::rethrow_exception(exception());
+        } catch (const ::c10::NCCLFaultToleranceError& e) {
+            // 只有我們篩選過的「網路與控制流異常」會掉進這裡！
+            LOG(WARNING) << logPrefix() << "[NCCL-FT] wait() 捕捉到專屬容錯例外，強制等待 2PC 側車達成共識...";
             needs_ft_recovery = true;
-            
-            // 死死卡住主執行緒，直到側車談判完成
             while (pg_->final_commit_op_.load(std::memory_order_acquire) == 0) {
+                if (pg_->is_degraded_.load(std::memory_order_acquire) && 
+                    this->seq_ <= pg_->committed_shadow_seq_.load(std::memory_order_acquire)) {
+                    already_recovered = true;
+                    needs_ft_recovery = false;
+                    break;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
+        } catch (const std::exception& e) {
+            // CUDA Error 等嚴重錯誤會掉進這裡，不攔截，直接放行給後方的 handleException 擊殺系統！
         }
     }
 
@@ -2551,7 +2554,8 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
             
             // 標記異常，讓 wait() 知道它必須被重播
             std::string exceptionMsg = c10::str(work.logPrefix(), "FT early-abort: Comm dead.");
-            work.setException(std::make_exception_ptr(C10_BUILD_ERROR(DistBackendError, exceptionMsg)));
+            work.setException(std::make_exception_ptr(
+                ::c10::NCCLFaultToleranceError("FT early-abort", exceptionMsg)));
             
             // 設定完例外後，程式會順順地往下走，
             // 進入下方的 if (work.exception()) 區塊統一執行 record 與 erase！
@@ -3148,26 +3152,38 @@ std::exception_ptr ProcessGroupNCCLFT::checkForNCCLErrors(
 
 std::exception_ptr ProcessGroupNCCLFT::checkForNCCLErrorsInternal(
     std::shared_ptr<NCCLFTComm>& ncclComm) {
-  // Prioritize commFailureReason over checkForNcclError() result if
-  // commFailureReason is set.
+  
+  // 1. 檢查是否有自定義的 Abort 原因
   auto commFailureReason = ncclComm->getNcclCommFailureReason();
   if (commFailureReason != std::nullopt) {
+    // 💡 [分流] 如果是我們側車強制切斷的訊號，拋出容錯專用例外！
+    if (commFailureReason->find("FT 2PC Committed") != std::string::npos) {
+        return std::make_exception_ptr(::c10::NCCLFaultToleranceError(
+            *commFailureReason, 
+            c10::str("NCCL FT communicator was safely aborted: ", *commFailureReason)));
+    }
+    // 其他原生的 Abort 維持拋出 DistBackendError
     return std::make_exception_ptr(C10_BUILD_ERROR(
         DistBackendError,
-        c10::str(
-            "NCCL communicator encountered error set by ProcessGroupNCCLFT: ",
-            *commFailureReason)));
+        c10::str("NCCL communicator encountered error set by ProcessGroupNCCLFT: ", *commFailureReason)));
   }
+
+  // 2. 檢查 NCCL 底層硬體錯誤
   ncclResult_t ncclAsyncErr = ncclComm->checkForNcclError();
-  // When nonblocking mode is enabled by TORCH_NCCLFT_USE_COMM_NONBLOCKING,
-  // ncclInProgress could be returned when there are pending NCCL calls.
-  // In this case, no exception should be thrown
 #ifdef NCCL_HAS_COMM_NONBLOCKING
-  // ncclInProgress is defined only if NCCL_HAS_COMM_NONBLOCKING is defined
   if (ncclAsyncErr != ncclSuccess && ncclAsyncErr != ncclInProgress) {
 #else
   if (ncclAsyncErr != ncclSuccess) {
-#endif // NCCL_HAS_COMM_NONBLOCKING
+#endif
+    // [分流] 如果是單純的網路連線問題 (SystemError / RemoteError)，拋出容錯專用例外！
+    if (ncclAsyncErr == ncclSystemError || ncclAsyncErr == ncclRemoteError) {
+        return std::make_exception_ptr(::c10::NCCLFaultToleranceError(
+            ncclGetErrorWithVersion(ncclAsyncErr), 
+            getNcclErrorDetailStr(ncclAsyncErr)));
+    }
+    
+    // [不攔截] 若是 CUDA OOM, Illegal Access (ncclUnhandledCudaError) 或參數錯誤，
+    // 維持拋出 DistBackendError，讓 PyTorch 原生機制將其擊殺！
     return std::make_exception_ptr(C10_BUILD_ERROR(
         DistBackendError,
         "NCCL error: " + ncclGetErrorWithVersion(ncclAsyncErr) + "\n" +
