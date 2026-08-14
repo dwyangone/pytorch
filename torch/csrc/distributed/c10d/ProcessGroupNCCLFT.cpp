@@ -892,7 +892,7 @@ void ProcessGroupNCCLFT::WorkNCCLFT::synchronizeStream() {
   stashed_for_allocator_safety_->unstash();
 }
 
-// Same as calling synchronize() when blockingWait_ is false
+
 bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
   RECORD_PARAM_COMMS(
       std::make_tuple(static_cast<int64_t>(this->seq_), this->isP2P_), // seq
@@ -909,95 +909,54 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
       static_cast<int>(1)); // number of device?
 
   // =========================================================================
-  // --- [原生 NCCL 執行路徑] (若未發生容錯重播，則維持原本行為) ---
-  // =========================================================================
-
-  // synchronize() will block the current stream on the NCCL stream 
-  // and trigger stashed_for_allocator_safety_->unstash() internally.
-  synchronize();
-
-  // In case of blockingWait or a timeout value is specified by the user, we
-  // block the CPU thread until the work is completed or timed out.
-  if (blockingWait_ || timeout != kNoTimeout) {
-    while (!isCompleted()) {
-      bool timedOut = checkTimeout(
-          timeout == kNoTimeout ? std::nullopt : std::make_optional(timeout));
-      // Explicitly abort ncclComms here before throwing this timed out
-      // exception to users.
-      // If throwing timed out excepiton without aborting nccl communicators
-      // here, it was observed that CUDA GPU will have 100% utilization and
-      // can not run new events successfully.
-      if (timedOut) {
-        std::string exceptionMsg = c10::str(
-            logPrefix(), "Work ", (*this), " timed out in blocking wait.");
-        LOG(ERROR) << exceptionMsg;
-        break;
-      }
-      // Yield
-      std::this_thread::sleep_for(
-          std::chrono::milliseconds(kSynchronizeBusyWaitMillis_FT));
-    }
-  } else if (isBarrierOp_ && !isCompleted()) {
-    // For barrier wait when timeout is unspecified, we block the CPU thread on
-    // current stream. This is to minimize the CPU barrier wait time in healthy
-    // path
-    auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
-    // CUDAStream wrapper will correctly use a DeviceGuard here
-    currentStream.synchronize();
-  }
-
-  // =========================================================================
-  // 🔥 [NCCL-FT] 終極防線：攔截任何帶有例外，或是 2PC 已經啟動的 Work
+  // 🔥 [NCCL-FT] 終極防線：必須放在 synchronize() 之前！
+  // 攔截任何帶有例外，或是 2PC 已經啟動的 Work，避開死結！
   // =========================================================================
   if (!pg_->ft_disabled_) {
       bool needs_ft_recovery = false;
       bool already_recovered = false; 
       
-      // [多執行緒死結防禦] 檢查這個 Bucket 的梯次，是否已經被「其他 Thread」恢復過了？
+      // 1. 檢查是否已經被側車恢復完成
       if (pg_->is_degraded_.load(std::memory_order_acquire) && 
           this->seq_ <= pg_->committed_shadow_seq_.load(std::memory_order_acquire)) {
           already_recovered = true;
       }
 
       if (!already_recovered) {
-          // 情況 A：側車已經達成共識
+          // 2. 檢查側車是否已經發起 2PC 共識
           if (pg_->final_commit_op_.load(std::memory_order_acquire) > 0) {
               needs_ft_recovery = true;
           } 
-          // 情況 B：側車還在跑，但這個 Work 已經被 Watchdog 或 NCCL 原生標記為失敗
+          // 3. 或者這個 Work 本身已經被 Watchdog 標記為失敗
           else if (exception()) {
               try {
                   std::rethrow_exception(exception());
               } catch (const ::c10::NCCLFaultToleranceError& e) {
-                  // 只有我們篩選過的「網路與控制流異常」會掉進這裡！
-                  LOG(WARNING) << logPrefix() << "[NCCL-FT] wait() 捕捉到專屬容錯例外，強制等待 2PC 側車達成共識...";
+                  LOG(WARNING) << logPrefix() << "[NCCL-FT] wait() 捕捉到專屬容錯例外，主執行緒進入安全避風港，等待側車接管重播...";
                   needs_ft_recovery = true;
-                  while (pg_->final_commit_op_.load(std::memory_order_acquire) == 0) {
-                      if (pg_->is_degraded_.load(std::memory_order_acquire) && 
-                          this->seq_ <= pg_->committed_shadow_seq_.load(std::memory_order_acquire)) {
-                          already_recovered = true;
-                          needs_ft_recovery = false;
-                          break;
-                      }
-                      std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                  }
               } catch (const std::exception& e) {
-                  // CUDA Error 等嚴重錯誤會掉進這裡，不攔截，直接放行給後方的 handleException 擊殺系統！
+                  // 非網路錯誤，放行給底下的原生邏輯擊殺系統
               }
           }
       }
 
-      // 如果確認需要容錯救援 (且還沒被其他 Thread 救過)
+      // 如果確認需要容錯救援，主執行緒就在此「原地踏步」死等！
+      // 🚨 絕對不准自己執行 pg_->recover_and_replay_inflight_ops()！
+      // 責任完全交給獨立的側車執行緒，避免互搶 Mutex 導致死結。
       if (needs_ft_recovery && !already_recovered) {
-          LOG(WARNING) << logPrefix() << "[NCCL-FT] 異常確認，轉交全域重播中心處理...";
-          pg_->recover_and_replay_inflight_ops(); // 內部有 Mutex 保護，第一名進去的 Thread 負責執行
+          while (true) {
+              if (pg_->is_degraded_.load(std::memory_order_acquire) && 
+                  this->seq_ <= pg_->committed_shadow_seq_.load(std::memory_order_acquire)) {
+                  already_recovered = true;
+                  break;
+              }
+              std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          }
       }
 
-      // 無論是自己救的，還是其他 Thread 救的，只要這個 Bucket 屬於受災戶：
-      if (pg_->is_degraded_.load(std::memory_order_acquire) && 
-          this->seq_ <= pg_->committed_shadow_seq_.load(std::memory_order_acquire)) {
-          
-          this->setException(nullptr); // 完美抹除 Exception，保護 Python 不崩潰！
+      if (already_recovered) {
+          // 抹除例外，對 Python 裝作沒事
+          this->setException(nullptr); 
 
           ShadowContext ctx;
           bool is_replayed = false;
@@ -1011,6 +970,7 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
           }
           if (is_replayed) {
               auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
+              // 🌟 這裡才是安全的！等待「重播專用」的 Event，徹底避開已經死掉的 ncclStream！
               ctx.replayed_end_event->block(currentStream);
               this->stashed_for_allocator_safety_->unstash();
           }
@@ -1026,24 +986,46 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
                   recycle_ctx.work_ptr.reset(); 
                   pg_->free_shadow_bufs_.push_back(recycle_ctx); 
                   pg_->in_flight_shadow_bufs_.erase(it); 
-                  if (needs_ft_recovery || already_recovered) {
-                      LOG(INFO) << logPrefix() << "[NCCL-FT] GC: 異常恢復成功，已回收 Bucket (seq=" << this->seq_ << ") 的 VRAM 參照。";
-                  }
+                  LOG(INFO) << logPrefix() << "[NCCL-FT] GC: 異常恢復成功，已回收 Bucket (seq=" << this->seq_ << ") 的 VRAM 參照。";
               }
           }
-          return true; // 欺騙 DDP，安全返回
+          // 🌟 成功返回，徹底避開底下的原生 synchronize()！
+          return true; 
       }
   }
 
-  // 若非 FT 模式，或發生了非網路相關的普通 Exception（如 OutOfMemory），交給原生處理
+  // =========================================================================
+  // --- [原生 NCCL 執行路徑] (若未發生容錯重播，則維持原本行為) ---
+  // =========================================================================
+
+  // synchronize() will block the current stream on the NCCL stream 
+  // and trigger stashed_for_allocator_safety_->unstash() internally.
+  synchronize();
+
+  // In case of blockingWait or a timeout value is specified by the user, we
+  // block the CPU thread until the work is completed or timed out.
+  if (blockingWait_ || timeout != kNoTimeout) {
+    while (!isCompleted()) {
+      bool timedOut = checkTimeout(
+          timeout == kNoTimeout ? std::nullopt : std::make_optional(timeout));
+      if (timedOut) {
+        std::string exceptionMsg = c10::str(
+            logPrefix(), "Work ", (*this), " timed out in blocking wait.");
+        LOG(ERROR) << exceptionMsg;
+        break;
+      }
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(kSynchronizeBusyWaitMillis_FT));
+    }
+  } else if (isBarrierOp_ && !isCompleted()) {
+    auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
+    currentStream.synchronize();
+  }
+
   if (exception()) {
-    // Throw exception (from main thread here)
     handleException(CleanUpOnlyFT);
   }
 
-  // TODO(kwen2501): this should be moved to c10d tests, to qualify a NCCL
-  // upgrade. Once a NCCL version is qualified, this code should not be needed
-  // at runtime.
 #ifdef PGNCCL_ENABLE_HASH
   if (enableCollectiveHashDebug_.load()) {
     auto numel = getTensorsNumel(*outputs_);
@@ -1053,7 +1035,6 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
   }
 #endif // PGNCCL_ENABLE_HASH
 
-  // Always return true, because abort API is not implemented.
   return true;
 }
 
