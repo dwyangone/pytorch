@@ -4912,6 +4912,12 @@ ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_con
     // ---------------------------------------------------------
     while (true) {
         {
+            // 破除死結：如果側車已經達成共識，優先執行全域重播！
+            // 執行完重播後，壞掉的 Exception 會被清除，Inline GC 就能順利回收記憶體，打破 2GB 背壓死結！
+            if (final_commit_op_.load(std::memory_order_acquire) > 0) {
+                recover_and_replay_inflight_ops();
+            }
+
             std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
             
             // 1. 🔥 Inline GC: CPU 主動收割已經「成功」完成的 Bucket 🔥
@@ -5004,6 +5010,12 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
     bool nanCheck) {
   // Environment setting by the user may add onto collective call's option
   nanCheck &= enableNanCheck_;
+
+  // 第一道防線！在派發任何新任務前，若發現側車已宣佈網卡死亡，立刻停下腳步進行重播！
+  // 這確保 DDP 無縫過渡到降級模式，完全不會被卡住。
+  if (!ft_disabled_ && final_commit_op_.load(std::memory_order_acquire) > 0) {
+      recover_and_replay_inflight_ops();
+  }
 
   auto device = getDevice(inputs[0]);
   // Guard must be created before `currentStreamCaptureStatusMayInitCtx`;
@@ -5370,6 +5382,14 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         
         // 紀錄專屬的 Replayed End Event
         ctx.replayed_end_event->record(ncclStream);
+
+        // 抹除例外並補齊 Future，解鎖 DDP 並允許 Inline GC 進行記憶體回收！
+        if (ctx.work_ptr) {
+            ctx.work_ptr->setException(nullptr);
+            if (ctx.work_ptr->future_ && !ctx.work_ptr->future_->completed()) {
+                ctx.work_ptr->future_->markCompleted(at::IValue(*ctx.work_ptr->outputs_));
+            }
+        }
     }
 
     // 5. [Bug A 修正] 推進容錯回合，並清理 TCPStore
