@@ -910,73 +910,53 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
 
   // =========================================================================
   // 🔥 [NCCL-FT] 終極防線：必須放在 synchronize() 之前！
-  // 攔截任何帶有例外，或是 2PC 已經啟動的 Work，避開死結！
+  // 依賴 Future 機制來進行絕對安全的非同步等待，徹底消滅 while(true) 死結
   // =========================================================================
   if (!pg_->ft_disabled_) {
-      bool needs_ft_recovery = false;
-      bool already_recovered = false; 
+      bool is_ft_managed = false;
+      {
+          std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
+          if (pg_->in_flight_shadow_bufs_.count(this->seq_) > 0) {
+              is_ft_managed = true;
+          }
+      }
       
-      // 1. 檢查是否已經被側車恢復完成
-      if (pg_->is_degraded_.load(std::memory_order_acquire) && 
-          this->seq_ <= pg_->committed_shadow_seq_.load(std::memory_order_acquire)) {
-          already_recovered = true;
+      bool is_ft_exception = false;
+      if (exception()) {
+          try { std::rethrow_exception(exception()); }
+          catch (const ::c10::NCCLFaultToleranceError& e) { is_ft_exception = true; }
+          catch (...) {}
       }
 
-      if (!already_recovered) {
-          // 2. 檢查側車是否已經發起 2PC 共識
-          if (pg_->final_commit_op_.load(std::memory_order_acquire) > 0) {
-              needs_ft_recovery = true;
-          } 
-          // 3. 或者這個 Work 本身已經被 Watchdog 標記為失敗
-          else if (exception()) {
-              try {
-                  std::rethrow_exception(exception());
-              } catch (const ::c10::NCCLFaultToleranceError& e) {
-                  LOG(WARNING) << logPrefix() << "[NCCL-FT] wait() 捕捉到專屬容錯例外，主執行緒進入安全避風港，等待側車接管重播...";
-                  needs_ft_recovery = true;
-              } catch (const std::exception& e) {
-                  // 非網路錯誤，放行給底下的原生邏輯擊殺系統
-              }
+      // 如果這筆任務被 FT 攔截 (有例外)，或是處於降級狀態且它還在備份池裡
+      if (is_ft_exception || (is_ft_managed && pg_->is_degraded_.load(std::memory_order_acquire))) {
+          LOG(WARNING) << logPrefix() << "[NCCL-FT] wait() 進入容錯安全等待區 (seq=" << this->seq_ << ")";
+          
+          // 1. 乖乖等待 Side-car 重播完畢並標記 Future 完成！(不耗 CPU 的完美等待)
+          if (future_) {
+              future_->wait(); 
           }
-      }
-
-      // 如果確認需要容錯救援，主執行緒就在此「原地踏步」死等！
-      // 🚨 絕對不准自己執行 pg_->recover_and_replay_inflight_ops()！
-      // 責任完全交給獨立的側車執行緒，避免互搶 Mutex 導致死結。
-      if (needs_ft_recovery && !already_recovered) {
-          while (true) {
-              if (pg_->is_degraded_.load(std::memory_order_acquire) && 
-                  this->seq_ <= pg_->committed_shadow_seq_.load(std::memory_order_acquire)) {
-                  already_recovered = true;
-                  break;
-              }
-              std::this_thread::sleep_for(std::chrono::milliseconds(2));
-          }
-      }
-
-      if (already_recovered) {
-          // 抹除例外，對 Python 裝作沒事
+          
+          // 2. Future 已經完成，代表重播中心處理完了！對 Python 裝作一切正常。
           this->setException(nullptr); 
 
           ShadowContext ctx;
-          bool is_replayed = false;
+          bool has_ctx = false;
           {
               std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
               auto it = pg_->in_flight_shadow_bufs_.find(this->seq_);
               if (it != pg_->in_flight_shadow_bufs_.end()) {
                   ctx = it->second;
-                  is_replayed = true;
+                  has_ctx = true;
               }
           }
-          if (is_replayed) {
+
+          if (has_ctx && ctx.replayed_end_event) {
               auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
-              // 🌟 這裡才是安全的！等待「重播專用」的 Event，徹底避開已經死掉的 ncclStream！
               ctx.replayed_end_event->block(currentStream);
               this->stashed_for_allocator_safety_->unstash();
-          }
-
-          // 正常路徑與重播路徑共同的強制 GC：確保記憶體物理封頂
-          {
+              
+              // 3. Inline GC：回收 VRAM
               std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
               auto it = pg_->in_flight_shadow_bufs_.find(this->seq_);
               if (it != pg_->in_flight_shadow_bufs_.end()) {
@@ -989,21 +969,15 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
                   LOG(INFO) << logPrefix() << "[NCCL-FT] GC: 異常恢復成功，已回收 Bucket (seq=" << this->seq_ << ") 的 VRAM 參照。";
               }
           }
-          // 🌟 成功返回，徹底避開底下的原生 synchronize()！
-          return true; 
+          return true; // 🌟 成功返回，徹底避開底下的原生 synchronize() 與死掉的 ncclStream！
       }
   }
 
   // =========================================================================
   // --- [原生 NCCL 執行路徑] (若未發生容錯重播，則維持原本行為) ---
   // =========================================================================
-
-  // synchronize() will block the current stream on the NCCL stream 
-  // and trigger stashed_for_allocator_safety_->unstash() internally.
   synchronize();
 
-  // In case of blockingWait or a timeout value is specified by the user, we
-  // block the CPU thread until the work is completed or timed out.
   if (blockingWait_ || timeout != kNoTimeout) {
     while (!isCompleted()) {
       bool timedOut = checkTimeout(
@@ -1014,8 +988,7 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
         LOG(ERROR) << exceptionMsg;
         break;
       }
-      std::this_thread::sleep_for(
-          std::chrono::milliseconds(kSynchronizeBusyWaitMillis_FT));
+      std::this_thread::sleep_for(std::chrono::milliseconds(kSynchronizeBusyWaitMillis_FT));
     }
   } else if (isBarrierOp_ && !isCompleted()) {
     auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
@@ -5215,6 +5188,10 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
               work->ncclComm_ = ncclComm;
           }
 
+          // 讓稍後呼叫的 work->wait() 知道這筆任務壞了，從而進入 while 迴圈乖乖等待側車重播！
+          // (不用擔心崩潰，因為我們現在的 wait() 已經會在重播完畢後將它設回 nullptr 了)
+          work->setException(std::make_exception_ptr(e));
+
           work->blockingWait_ = blockingWait_;
           work->store_ = store_;
           assignTimeoutToWork(work, options_);
@@ -5273,9 +5250,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 }
 
 void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
-    std::lock_guard<std::mutex> lock(recovery_mutex_); // 確保只有一個 Thread 進行恢復
+    std::lock_guard<std::mutex> lock(recovery_mutex_); 
     
-    // 用 final_commit_op_ 判斷。如果為 0，代表這個 Round 已經被其他 Bucket (Thread) 恢復過了
     uint64_t commit_signal = this->final_commit_op_.load(std::memory_order_acquire);
     if (commit_signal == 0) {
         return; 
@@ -5283,10 +5259,7 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
 
     LOG(INFO) << logPrefix() << "[NCCL-FT] 啟動全域重播中心！ (容錯回合 Round=" << this->ft_round_ << ")";
 
-    // 1. 確保舊的 Communicator 徹底死亡
     auto device = at::Device(at::DeviceType::CUDA, this->guessDeviceId());
-    // 強制將側車執行緒綁定到當前正確的 GPU！
-    // 拯救所有 CUDAEvent、Tensor Copy 與 Future 完成時的跨設備崩潰！
     at::cuda::CUDAGuard device_guard(device);
 
     auto globalComm = this->getNCCLComm(getKeyFromDevice(device));
@@ -5294,20 +5267,21 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         globalComm->abort("FT Recovery - Aborting dead comm");
     }
 
-    // 2. 重建降級拓撲
     rebuild_shadow_ping_pong_topology();
     this->is_degraded_ = true;
 
     uint64_t agreed_ss = this->committed_shadow_seq_.load(std::memory_order_acquire);
 
-    // 3. 收集所有需要重播的 Buckets (大於等於 agreed_ss)
+    // 3. 收集所有飛行中的 Buckets，分為「需要重播」與「只需補齊 Future」兩批
     std::vector<uint64_t> seqs_to_replay;
+    std::vector<uint64_t> seqs_to_skip;
     {
         std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
         for (auto const& [seq, ctx] : in_flight_shadow_bufs_) {
-            // [修正] 必須是 >=，因為 agreed_ss 也就是發生錯誤的那一個 Bucket 本身也必須被重播！
             if (seq >= agreed_ss) { 
                 seqs_to_replay.push_back(seq);
+            } else {
+                seqs_to_skip.push_back(seq);
             }
         }
     }
@@ -5315,7 +5289,23 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
 
     auto ncclStream = ncclStreams_.at(getKeyFromDevice(device));
 
-    // 把 CUDAEvent 提早宣告在迴圈外，重複利用！
+    // 🔥 [核心修復] 處理小於 agreed_ss 的無辜任務：把它們當作正常完成並補齊 Future，解鎖 DDP！
+    for (uint64_t seq : seqs_to_skip) {
+        ShadowContext ctx;
+        {
+            std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
+            ctx = in_flight_shadow_bufs_[seq];
+        }
+        if (ctx.work_ptr) {
+            ctx.work_ptr->setException(nullptr);
+            if (ctx.work_ptr->future_ && !ctx.work_ptr->future_->completed()) {
+                c10::cuda::CUDAMultiStreamGuard streamGuard(ncclStream);
+                ctx.replayed_end_event->record(ncclStream); // 確保 wait() 呼叫 block() 時不會空等
+                ctx.work_ptr->future_->markCompleted(at::IValue(*ctx.work_ptr->outputs_));
+            }
+        }
+    }
+
     at::cuda::CUDAEvent restore_done(cudaEventDisableTiming);
 
     // 4. 依序還原並重播
@@ -5327,37 +5317,31 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
             ctx = in_flight_shadow_bufs_[seq];
         }
 
-        // 確保這包資料的 D2H 備份完成
         ctx.copy_event->synchronize();
 
-        // H2D 還原
         auto prev_stream = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
         at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
-        // 加上 .flatten() 確保 1D buffer 的資料能正確倒回多維的 GPU 記憶體中
         ctx.original_input.flatten().copy_(ctx.buffer.narrow(0, 0, ctx.original_input.numel()), true);
 
-        restore_done.record(shadow_copy_stream_); // 重複使用同一個 Event
+        restore_done.record(shadow_copy_stream_); 
         at::cuda::setCurrentCUDAStream(prev_stream);
         restore_done.block(ncclStream);
 
-        // 重播
         execute_shadow_allreduce(ctx.original_input, ctx.original_output, ncclStream, ctx.reduce_op);
-        
-        // 紀錄專屬的 Replayed End Event
         ctx.replayed_end_event->record(ncclStream);
 
-        // 抹除例外並補齊 Future，解鎖 DDP 並允許 Inline GC 進行記憶體回收！
         if (ctx.work_ptr) {
             ctx.work_ptr->setException(nullptr);
             if (ctx.work_ptr->future_ && !ctx.work_ptr->future_->completed()) {
+                c10::cuda::CUDAMultiStreamGuard streamGuard(ncclStream);
                 ctx.work_ptr->future_->markCompleted(at::IValue(*ctx.work_ptr->outputs_));
             }
         }
     }
 
-    // 5. [Bug A 修正] 推進容錯回合，並清理 TCPStore
+    // 5. 推進容錯回合，並清理 TCPStore
     uint64_t cur_round = commit_signal - 1; 
-    this->ft_round_++; // 推進 Round，側車才會更新 key namespace 進入下一輪 2PC！
+    this->ft_round_++; 
     
     try {
         std::string round_str = std::to_string(cur_round);
@@ -5371,7 +5355,6 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         LOG(WARNING) << logPrefix() << "[NCCL-FT] TCPStore cleanup failed (non-fatal): " << e.what();
     }
 
-    // 6. 重置 2PC 狀態，解除側車執行緒的等待
     this->final_commit_op_.store(0, std::memory_order_release);
     LOG(INFO) << logPrefix() << "[NCCL-FT] 全域重播完成！系統準備進入下一回合: " << this->ft_round_;
 }
