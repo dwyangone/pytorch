@@ -5243,10 +5243,10 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
           work->ncclEndEvent_->record(ncclStream);
           
           // 2. 指派降級後的新通訊子 (如果已經有的話)
-          if (pg_->proxy_global_comm_) {
-              work->ncclComm_ = pg_->proxy_global_comm_;
-          } else if (pg_->local_nvlink_comm_) {
-              work->ncclComm_ = pg_->local_nvlink_comm_;
+          if (this->proxy_global_comm_) {
+              work->ncclComm_ = this->proxy_global_comm_;
+          } else if (this->local_nvlink_comm_) {
+              work->ncclComm_ = this->local_nvlink_comm_;
           } else {
               work->ncclComm_ = ncclComm;
           }
