@@ -4853,44 +4853,30 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                     }
                 }
 
-                /* ========================================================= */
-                /* [新增] 暴力砍斷全域通訊，解救卡死的主執行緒！               */
+              /* ========================================================= */
+                /* 暴力砍斷全域通訊，解救卡死的主執行緒！               */
                 {
                     auto device = at::Device(at::DeviceType::CUDA, this->guessDeviceId());
                     auto globalComm = this->getNCCLComm(getKeyFromDevice(device));
                     if (globalComm && !globalComm->isAborted()) {
-                        LOG(WARNING) << logPrefix() << "[NCCL-FT] 2PC 達成共識，側車強制 Abort 全域 Communicator 以喚醒主執行緒！";
+                        LOG(WARNING) << logPrefix() << "[NCCL-FT] 2PC 達成共識，側車強制 Abort 全域 Communicator！";
                         globalComm->abort("FT 2PC Committed - Wake up main thread");
                     }
                 }
                 /* ========================================================= */                
 
-                // Signal the main thread: any non-zero value unblocks it.
-                // Using cur_round+1 makes the value strictly increasing and
-                // gives the main thread the round number for cleanup.
-                this->final_commit_op_.store(
-                    cur_round + 1, std::memory_order_release);
+                // 設定訊號，讓其他模組知道正在重播
+                this->final_commit_op_.store(cur_round + 1, std::memory_order_release);
+                LOG(INFO) << logPrefix() << "[NCCL-FT] 2PC 共識達成，側車親自啟動全域重播中心...";
 
-                // Reset pending_shadow_seq_ sentinel for the next round.
-                this->pending_shadow_seq_.store(
-                    UINT64_MAX, std::memory_order_release);
+                // 側車自己啟動重播中心！不依賴主執行緒！
+                // 這樣一來，不管主執行緒卡在哪裡等 Future，側車都會在背景幫它算完並喚醒它！
+                this->recover_and_replay_inflight_ops();
 
-                LOG(INFO) << logPrefix()
-                          << "[NCCL-FT] final_commit_op_ set to "
-                          << cur_round + 1
-                          << "; main thread will proceed.";
-
-                // Wait for the main thread to advance ft_round_ (by reading
-                // final_commit_op_ being reset to 0 after the barrier block).
-                // This prevents the side-car from re-processing the same
-                // round if it loops again before the main thread commits.
-                while (this->ft_negotiator_running_.load()) {
-                    if (this->final_commit_op_.load(
-                            std::memory_order_acquire) == 0) {
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }
+                // 刪除原本等待主執行緒將 final_commit_op_ 設回 0 的 while 迴圈！
+                // 因為 recover_and_replay_inflight_ops 執行完畢後，它自己就會把 final_commit_op_ 設回 0，
+                // 所以側車可以直接進入下一輪監控，不需要再等了！
+ 
 
             } catch (const std::exception& e) {
                 LOG(WARNING) << logPrefix()
@@ -4912,12 +4898,6 @@ ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_con
     // ---------------------------------------------------------
     while (true) {
         {
-            // 破除死結：如果側車已經達成共識，優先執行全域重播！
-            // 執行完重播後，壞掉的 Exception 會被清除，Inline GC 就能順利回收記憶體，打破 2GB 背壓死結！
-            if (final_commit_op_.load(std::memory_order_acquire) > 0) {
-                recover_and_replay_inflight_ops();
-            }
-
             std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
             
             // 1. 🔥 Inline GC: CPU 主動收割已經「成功」完成的 Bucket 🔥
@@ -5010,12 +4990,6 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
     bool nanCheck) {
   // Environment setting by the user may add onto collective call's option
   nanCheck &= enableNanCheck_;
-
-  // 第一道防線！在派發任何新任務前，若發現側車已宣佈網卡死亡，立刻停下腳步進行重播！
-  // 這確保 DDP 無縫過渡到降級模式，完全不會被卡住。
-  if (!ft_disabled_ && final_commit_op_.load(std::memory_order_acquire) > 0) {
-      recover_and_replay_inflight_ops();
-  }
 
   auto device = getDevice(inputs[0]);
   // Guard must be created before `currentStreamCaptureStatusMayInitCtx`;
