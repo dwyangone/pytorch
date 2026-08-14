@@ -5236,36 +5236,46 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
       }
 
   } catch (const ::c10::NCCLFaultToleranceError& e) {
-      // 現在所有巨集與 getNcclComm 拋出的錯誤，都能靠 C++ 型別系統精準捕捉
       if (!ft_disabled_) {
-          LOG(WARNING) << logPrefix() << "[NCCL-FT] 攔截到同步派發錯誤 (seq=" << seqCollective_ << ")，交給 wait() 處理。原因: " << e.what();
+          LOG(WARNING) << logPrefix() << "[NCCL-FT] 攔截到同步派發錯誤 (seq=" << seqCollective_ << ")，建立 Pending Work 轉交背景重播。";
           
-          // 紀錄 end event 讓 wait() 能夠解鎖
+          // 1. 記錄 End Event，避免後續 CUDA Stream 卡死
           work->ncclEndEvent_->record(ncclStream);
-          work->ncclComm_ = ncclComm; 
-
-          // 將捕捉到的強型別例外重新存入 Work，供後續 wait() 透過 RTTI 讀取
-          work->setException(std::make_exception_ptr(e));
           
-          // 補齊 Future 狀態，防止 DDP 崩潰
+          // 2. 指派降級後的新通訊子 (如果已經有的話)
+          if (pg_->proxy_global_comm_) {
+              work->ncclComm_ = pg_->proxy_global_comm_;
+          } else if (pg_->local_nvlink_comm_) {
+              work->ncclComm_ = pg_->local_nvlink_comm_;
+          } else {
+              work->ncclComm_ = ncclComm;
+          }
+
+          // 3. 設定內部 Exception 標記，讓重播中心知道這包資料壞了
+          work->setException(std::make_exception_ptr(e));
+
+          // 4. 建立 Future，但【絕對不要 markCompleted】！
+          // 讓它保持在 Pending (未完成) 狀態，DDP 拿到後會乖乖在背景非同步等待
           {
             c10::cuda::CUDAMultiStreamGuard sg(ncclStream);
             std::vector<at::Device> devs{device};
             work->future_ = c10::make_intrusive<at::ivalue::Future>(
                 c10::ListType::create(c10::TensorType::get()), devs);
-            work->future_->markCompleted(at::IValue(*work->outputs_));
+            // 移除 work->future_->markCompleted(...)
           }
+
           work->blockingWait_ = blockingWait_;
           work->store_ = store_;
           assignTimeoutToWork(work, options_);
           if (enqueue) {
             workEnqueue(work);
           }
-          return work; // 提早返回，把容錯交給側車與 wait()
+          
+          // 5. 立即返回！不阻塞 CPU，讓 Autograd 引擎全速往下跑！
+          return work; 
       }
-      throw; // 如果停用 FT，直接把錯誤往上拋
+      throw; // 若未開啟FT，維持向上拋出
   }
-  /* ===================================================================== */
 
   post(ncclStream, work);
 
