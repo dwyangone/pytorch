@@ -12,7 +12,7 @@
 
 | 執行緒 | 名稱 | 職責 |
 |--------|------|------|
-| 主執行緒 | — | 執行 collective；故障後在 `wait()` FT 防線等待或自行呼叫 `recover_and_replay_inflight_ops()` |
+| 主執行緒 | — | 執行 collective；故障後 `wait()` 進入 FT 安全等待區，呼叫 `future_->wait()` 阻塞等側車的 `markCompleted`，不輪詢 final_commit_op_ |
 | Watchdog | `pt_nccl_watchdg` | 掃描 workMetaList_，偵測失敗 work，FT 模式下清除 exception（不寫 fault mask，不 rethrow）；正常完成 GC shadow buffers |
 | Side-car negotiator | `pt_nccl_ft_side` | 透過 TCPStore 2PC 協商故障邊界；2PC 完成後**直接呼叫 recover_and_replay_inflight_ops()**，不依賴主執行緒 |
 
@@ -40,14 +40,14 @@
 | `ShadowContext::work_ptr` — 綁定 Work，供 Inline GC 主動回收成功 bucket | hpp ~1183 | ✅ |
 | `recover_and_replay_inflight_ops()` — 全域重播中心，abort→rebuild→H2D→replay→setException/markCompleted | ~5297 | ✅ |
 | recover 內部直接 `work_ptr->setException(nullptr)` + `future_->markCompleted` 解鎖 DDP | ~5367-5373 | ✅ |
-| `WorkNCCLFT::wait()` 整合式 FT 防線（情況 A/B/C + 後處理 GC） | ~952 | ✅ |
-| `allreduce_impl()` shadow_pre lambda — work_ptr + compute_event + atomic shadow_seq_ | ~6034 | ✅ |
-| `collective()` future_ 提前初始化（pre() 呼叫前），消除 Race Condition | ~5165 | ✅ |
-| `collective()` 二分支設計（行 5180-5251）— `is_degraded_` 直接執行 shadow allreduce | ~5180 | ✅ |
-| Fix A：移除 Watchdog fallback fault_mask 寫入 | Watchdog runLoop ~2644 | ✅ |
-| Fix 1：每個 rank 獨立呼叫 `ncclCommRegisterFaultCallback` | collective() lazy-init ~5039 | ✅ |
-| Fix 3：Watchdog early-abort（final_commit_op_ > 0 時強制 setException） | Watchdog runLoop ~2550 | ✅ |
-| Fix D：collective() 原生路徑捕獲 NCCLFaultToleranceError，設 exception，提早 return | collective() ~5221 | ✅ |
+| `WorkNCCLFT::wait()` Future 機制 FT 安全等待區（is_ft_exception / is_ft_managed + future_->wait() + Inline GC） | ~915 | ✅ |
+| `allreduce_impl()` shadow_pre lambda — work_ptr + compute_event + atomic shadow_seq_ | ~5996 | ✅ |
+| `collective()` future_ 提前初始化（pre() 呼叫前），消除 Race Condition | ~5117 | ✅ |
+| `collective()` 二分支設計 — `is_degraded_` 直接執行 shadow allreduce（行 5132-5163）| ~5132 | ✅ |
+| Fix A：移除 Watchdog fallback fault_mask 寫入 | Watchdog runLoop | ✅ |
+| Fix 1：每個 rank 獨立呼叫 `ncclCommRegisterFaultCallback` | collective() lazy-init ~4993 | ✅ |
+| Fix 3：Watchdog early-abort（final_commit_op_ > 0 時強制 setException） | Watchdog runLoop | ✅ |
+| Fix D：collective() 原生路徑捕獲 NCCLFaultToleranceError，設 exception，提早 return | collective() ~5177 | ✅ |
 | Fix D2：`initLocalNvlinkComm()` try-catch + `nvlink_init_attempted_` flag | collective() lazy-init ~5063 | ✅ |
 | Bug 1 fix：FT 模式下 Watchdog 不設 COMM_ERROR | Watchdog runLoop ~2536 | ✅ |
 | Bug 2 fix：future_ 在 pre() 前初始化（消除 catch 區塊需要重建 future_ 的問題） | collective() ~5165 | ✅ |
@@ -79,16 +79,14 @@
 | **迴圈內 CUDAEvent 效能 fix**：recover_and_replay 迴圈外宣告 `restore_done`，迴圈內重複 record | recover_and_replay ~5337 | ✅ |
 | **Watchdog 例外清除後 GC 保底**：clearing path 將非空 stash push 到 shelvesToUnstash_ | Watchdog runLoop ~2679 | ✅ |
 | any_proposed 快速路徑：side-car 無故障時 sleep 50ms 避免空轉 | ~4686 | ✅ |
+| **logPrefix() static 返回懸空參照 fix**：移除 `static`，改為 `return c10::str(...)` 回傳值；宣告改 `std::string`（非引用） | WorkNCCLFT::logPrefix ~719，hpp ~393 | ✅ |
+| **`initLocalNvlinkComm` N-to-N all-ready barrier**：每個 local rank 寫 ready key 後 wait 全部 ready key，確保全部 rank 同時進入 `NCCLFTComm::create`，防止 bootstrap 掛死 | initLocalNvlinkComm ~4071-4093 | ✅ |
+| **`collective()` FT catch block 補齊 `numelIn_`/`numelOut_`**：FT 攔截路徑設定 `inputs[0].numel()` / `outputs[0].numel()`，確保 Work debug 欄位完整 | collective() catch ~5238-5239 | ✅ |
+| **`initLocalNvlinkComm` TCPStore ID key 清除**：all-ready barrier 通過後（所有 rank 已讀取 ID），`local_rank==0` 立即 `deleteKey(local_id_key)`，消除 Store 殘留 | initLocalNvlinkComm ~4091-4103 | ✅ |
 
 ---
 
 ## 三、待確認與待修復項目
-
-### P0：高危 Bug（應優先修復）
-
-| Bug | 位置 | 說明 | 修復方向 |
-|-----|------|------|---------|
-| `WorkNCCLFT::logPrefix()` static Bug | ~724 | 行 724 程式碼有警告注解但 `static` 關鍵字**仍然存在**；function-local static 以第一個呼叫者的 `rank_` 初始化後固定不變，所有後續 Work 拿到錯誤前綴 | 移除 `static` 關鍵字（僅一字之差） |
 
 ### P0：確認 NCCL Fork 行為
 
@@ -100,16 +98,15 @@
 - 需要實驗確認：呼叫 `ncclCommBanNic(0)` 後再建立新 comm，確認新 comm 不使用 mlx5_0。
 
 **問題 3：** 側車在 recovery_mutex_ 上的執行緒競爭
-- 側車自行呼叫 recover_and_replay（持鎖）；主執行緒的 wait() 也可能觸發 recover_and_replay（等鎖）
-- 兩者序列化，不死結；後進者拿到鎖後 `final_commit_op_ == 0` 直接返回
-- 確認主執行緒等鎖時不會造成 DDP timeout 問題
+- 現行設計：只有側車呼叫 `recover_and_replay_inflight_ops()`，主執行緒的 `wait()` 只呼叫 `future_->wait()`，不再觸發 recover
+- recovery_mutex_ 只作防重入保護（避免兩次側車回合重疊），主執行緒不持鎖
+- 結論：無死結風險；確認 `future_->wait()` 在側車 markCompleted 後能正確解除阻塞
 
 ### P1：低危清理
 
 | 項目 | 位置 | 說明 |
 |------|------|------|
 | `get_or_allocate_shadow_buffer` 殭屍函式宣告 | hpp ~1229 | `at::Tensor get_or_allocate_shadow_buffer(const at::Tensor& t)` 仍保留在 hpp 宣告；應刪除 |
-| `initLocalNvlinkComm` TCPStore key 殘留 | ~4103 | `"NCCL_FT_LOCAL_COMM_ID_NODE_<id>_PG_<uid>"` key 永久殘留；可在成功讀取後 `deleteKey` |
 | `sscanf` 格式字串可移植性 | side-car ~4751 | `%lu`/`%lx` 在 Windows 是 32-bit；改用 `SCNu64`/`SCNx64` |
 
 ### P0：端對端測試

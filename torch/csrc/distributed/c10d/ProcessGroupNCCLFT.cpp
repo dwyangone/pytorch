@@ -716,13 +716,8 @@ void ProcessGroupNCCLFT::WorkNCCLFT::checkAndSetException() {
   }
 }
 
-std::string& ProcessGroupNCCLFT::WorkNCCLFT::logPrefix() const {
-  // WARNING: do NOT add `static` here.  A function-local static is initialised
-  // exactly once (by the first caller's rank_) and then shared by every
-  // WorkNCCLFT instance regardless of their rank_, producing wrong log prefixes
-  // for all ranks after the first.
-  static std::string prefix = c10::str("[Rank ", rank_, "] ");
-  return prefix;
+std::string ProcessGroupNCCLFT::WorkNCCLFT::logPrefix() const {
+  return c10::str("[Rank ", rank_, "] ");
 }
 
 void ProcessGroupNCCLFT::WorkNCCLFT::setException(
@@ -4075,6 +4070,41 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm() {
         std::memcpy(&localId, vec.data(), vec.size());
     }
 
+    // N-to-N all-ready barrier: ensure all local ranks on this node have
+    // retrieved localId before any of them enters NCCLFTComm::create.
+    // Without this, local_rank==0 may enter create immediately after writing
+    // the key while other ranks haven't retrieved it yet, causing bootstrap hang.
+    {
+        std::string my_ready_key = "NCCL_FT_LOCAL_READY_NODE_" +
+            std::to_string(node_id) + "_PG_" + std::to_string(this->getUid()) +
+            "_ROUND_" + std::to_string(ft_round_) + "_LR_" + std::to_string(local_rank);
+        std::string one = "1";
+        this->globalStore_->set(my_ready_key,
+            std::vector<uint8_t>(one.begin(), one.end()));
+
+        std::vector<std::string> all_ready_keys;
+        for (int lr = 0; lr < localDeviceCount_; ++lr) {
+            all_ready_keys.push_back("NCCL_FT_LOCAL_READY_NODE_" +
+                std::to_string(node_id) + "_PG_" + std::to_string(this->getUid()) +
+                "_ROUND_" + std::to_string(ft_round_) + "_LR_" + std::to_string(lr));
+        }
+        this->globalStore_->wait(all_ready_keys, std::chrono::seconds(60));
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT] All-ready barrier passed for local_nvlink_comm_ (node="
+                  << node_id << ").";
+
+        // All ranks have now read localId; local_rank==0 cleans up the ID key.
+        if (local_rank == 0) {
+            try {
+                this->globalStore_->deleteKey(local_id_key);
+            } catch (const std::exception& e) {
+                LOG(WARNING) << logPrefix()
+                             << "[NCCL-FT] Failed to delete TCPStore key " << local_id_key
+                             << " (non-fatal): " << e.what();
+            }
+        }
+    }
+
     // 2. Initialize the local communicator
     // 使用 blocking 模式，確保建立失敗時能立刻捕捉到錯誤
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
@@ -4230,7 +4260,32 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
             std::memcpy(&proxyId, vec.data(), vec.size());
         }
 
-        LOG(INFO) << logPrefix() << "[NCCL-FT] 建立全新的 proxy_global_comm_ (Size=" 
+        // N-to-N all-ready barrier：確保所有健康 rank 都已到達此處再進入
+        // ncclCommInitRankConfig，避免先到的 rank 在 bootstrap 中永久等待。
+        //
+        // 每個健康 rank 寫自己的 ready key，然後 wait 所有其他健康 rank 的 key。
+        // 故障 rank 不參與（它們的 local_rank 在 faulty_devs 中），因此只收集
+        // global rank 不在故障集合內的那些 rank。
+        {
+            std::string my_ready_key = "NCCL_FT_PROXY_READY_" +
+                std::to_string(ft_round_) + "_" + std::to_string(rank_);
+            std::string one = "1";
+            this->globalStore_->set(my_ready_key,
+                std::vector<uint8_t>(one.begin(), one.end()));
+
+            std::vector<std::string> all_ready_keys;
+            for (int r = 0; r < size_; ++r) {
+                if (faulty_devs.count(r % localDeviceCount_) == 0) {
+                    all_ready_keys.push_back("NCCL_FT_PROXY_READY_" +
+                        std::to_string(ft_round_) + "_" + std::to_string(r));
+                }
+            }
+            this->globalStore_->wait(all_ready_keys, std::chrono::seconds(60));
+            LOG(INFO) << logPrefix()
+                      << "[NCCL-FT] All-ready barrier passed for proxy_global_comm_.";
+        }
+
+        LOG(INFO) << logPrefix() << "[NCCL-FT] 建立全新的 proxy_global_comm_ (Size="
                   << proxy_comm_size_ << " Rank=" << proxy_comm_rank_ << ")";
         
         // 從頭建立全新的降級群組 (Re-Init)
@@ -5193,11 +5248,13 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
           work->blockingWait_ = blockingWait_;
           work->store_ = store_;
           assignTimeoutToWork(work, options_);
+          work->numelIn_ = inputs[0].numel();
+          work->numelOut_ = outputs[0].numel();
           if (enqueue) {
             workEnqueue(work);
           }
           
-          return work; 
+          return work;
       }
       throw; 
   }
@@ -5286,7 +5343,7 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
 
     auto ncclStream = ncclStreams_.at(getKeyFromDevice(device));
 
-    // 🔥 [核心修復] 處理小於 agreed_ss 的無辜任務：把它們當作正常完成並補齊 Future，解鎖 DDP！
+    // 處理小於 agreed_ss 的無辜任務：把它們當作正常完成並補齊 Future，解鎖 DDP！
     for (uint64_t seq : seqs_to_skip) {
         ShadowContext ctx;
         {
@@ -5342,10 +5399,35 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     
     try {
         std::string round_str = std::to_string(cur_round);
+
+        // 每個 rank 清除自己的 per-rank keys
         this->globalStore_->deleteKey("NCCL_FT_PROPOSE_" + std::to_string(this->rank_) + "_" + round_str);
+
+        // 每個健康 rank 清除自己寫的 proxy all-ready barrier key
+        bool is_faulty_rank = (this->faulty_local_devs_.count(
+            this->rank_ % this->localDeviceCount_) > 0);
+        if (!is_faulty_rank) {
+            this->globalStore_->deleteKey(
+                "NCCL_FT_PROXY_READY_" + round_str + "_" + std::to_string(this->rank_));
+        }
+
+        // 清除 initLocalNvlinkComm 的 all-ready barrier key (每個 rank 清自己的)
+        // initLocalNvlinkComm 只在 ft_round_==0 時呼叫一次，所以只需清 ROUND_0。
+        if (cur_round == 0) {
+            int node_id = this->rank_ / this->localDeviceCount_;
+            int local_rank = this->rank_ % this->localDeviceCount_;
+            this->globalStore_->deleteKey(
+                "NCCL_FT_LOCAL_READY_NODE_" + std::to_string(node_id) +
+                "_PG_" + std::to_string(this->getUid()) +
+                "_ROUND_0" +
+                "_LR_" + std::to_string(local_rank));
+        }
+
+        // rank 0 負責清除共用 keys
         if (this->rank_ == 0) {
             this->globalStore_->deleteKey("NCCL_FT_COMMIT_" + round_str);
             this->globalStore_->deleteKey("NCCL_FT_SS_AGREED_" + round_str);
+            this->globalStore_->deleteKey("NCCL_FT_PROXY_ID_" + round_str);
         }
         LOG(INFO) << logPrefix() << "[NCCL-FT] TCPStore keys cleaned for round=" << cur_round;
     } catch (const std::exception& e) {

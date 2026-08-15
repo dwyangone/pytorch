@@ -390,7 +390,7 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
 
     uint64_t getSequencenumber() const override;
 
-    std::string& logPrefix() const;
+    std::string logPrefix() const;
 
     // Helper function that sets an exception_ptr on the WorkNCCLFT object.
     void setException(std::exception_ptr exception_ptr);
@@ -1226,7 +1226,7 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   uint64_t calculate_safe_buffer();
   void initLocalNvlinkComm();
   void rebuild_shadow_ping_pong_topology();
-  at::Tensor get_or_allocate_shadow_buffer(const at::Tensor& t);
+  
   void execute_shadow_allreduce(
       at::Tensor& input,
       at::Tensor& output,

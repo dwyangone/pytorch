@@ -29,58 +29,60 @@ Python 例外**，梯度數學結果與無故障版本相同。
 執行 DDP backward → 呼叫 `allreduce()` → `allreduce_impl()` → `collective()`，
 然後呼叫 `work->wait()` 等待完成。
 
-`wait()` 的 FT 攔截邏輯（行 952-1036）為一個**整合式防線**，統一判斷三種情況：
+`wait()` 的 FT 攔截邏輯（行 915-973）採用 **Future 機制**，一次性判斷是否需要 FT 等待：
 
-**情況 A：`is_degraded_ == true` 且 `this->seq_ <= committed_shadow_seq_`（已被他人恢復）**
+**進入 FT 安全等待區的條件（二選一）：**
 ```cpp
-already_recovered = true;  // 跳過主動恢復，直接進入 FT 後處理
+bool is_ft_managed = (pg_->in_flight_shadow_bufs_.count(this->seq_) > 0);
+bool is_ft_exception = false;
+if (exception()) {
+    try { std::rethrow_exception(exception()); }
+    catch (const ::c10::NCCLFaultToleranceError&) { is_ft_exception = true; }
+    catch (...) {}
+}
+if (is_ft_exception || (is_ft_managed && pg_->is_degraded_.load(acquire))) {
+    // ← FT 安全等待區
+}
 ```
 
-**情況 B：`final_commit_op_ > 0`（2PC 已達成共識）**
-```cpp
-needs_ft_recovery = true;
-pg_->recover_and_replay_inflight_ops();
-```
+**FT 安全等待區（行 936-972）：**
+1. `future_->wait()` — 不耗 CPU 地等待側車的 `recover_and_replay` 呼叫 `markCompleted`
+2. `setException(nullptr)` — 抹除例外，保護 Python
+3. 從 `in_flight_shadow_bufs_` 取出 ShadowContext
+4. `ctx.replayed_end_event->block(currentStream)` — 等待 replay 完成
+5. `stashed_for_allocator_safety_->unstash()` — 釋放扣留的 Tensor 參照
+6. **Inline GC**：`original_input/output = Tensor()`，`work_ptr.reset()`，歸還到 `free_shadow_bufs_`
+7. `return true` — 對 DDP 完全透明
 
-**情況 C：work 有 `NCCLFaultToleranceError` 例外（Watchdog 已標記，2PC 尚未完成）**
-```cpp
-// 等待 2PC 側車達成共識（自旋，每 2ms 輪詢）
-while (final_commit_op_ == 0) { sleep(2ms); }
-needs_ft_recovery = true;
-pg_->recover_and_replay_inflight_ops();
-```
-
-三種情況都匯入同一個後處理區塊（行 997-1035）：
-1. `setException(nullptr)` — 抹除例外，保護 Python
-2. 從 `in_flight_shadow_bufs_` 取出 ShadowContext
-3. `ctx.replayed_end_event->block(currentStream)` — 等待 replay 完成
-4. `stashed_for_allocator_safety_->unstash()` — 釋放扣留的 Tensor 參照
-5. 強制 GC：`original_input/output = Tensor()`，`work_ptr.reset()`，歸還到 `free_shadow_bufs_`
-6. `return true` — 對 DDP 隱藏整個故障過程
+**設計要點：**
+- `future_->wait()` 是阻塞呼叫，直到側車的 `recover_and_replay_inflight_ops()` 對應 Future 呼叫 `markCompleted()` 才解除
+- 側車自行執行重播（不依賴主執行緒），所以主執行緒等 Future 必然會被喚醒
+- 無 spin-loop，無 final_commit_op_ 輪詢，完全依賴 Future 機制
 
 ### 2.2 Watchdog 執行緒（`pt_nccl_watchdg`）
 
-持續掃描 `workMetaList_`，對每個 work 執行：
+持續掃描 `workMetaList_`，對每個 work 執行三條路徑：
 
-**路徑 A：FT early-abort（行 2550-2568）**
+**路徑 A：FT early-abort**
 ```cpp
 if (!ft_disabled_ && !work.exception() && commit_signal > 0)
+    work.setException(NCCLFaultToleranceError, "FT early-abort: Comm dead.")
 ```
-- 立即呼叫 `work.setException(NCCLFaultToleranceError, "FT early-abort: Comm dead.")`
-- 設定後程式順流進入下方的 `if (work.exception())` 區塊統一處理
+- 當 2PC 已達成共識（`final_commit_op_ > 0`），對尚無 exception 的飛行中任務主動注射 FT 例外
+- 讓後續 wait() 知道需要走 FT 安全路徑
 
-**路徑 B：FT clearing path（行 2596-2688）**
+**路徑 B：FT clearing path**
 ```cpp
 if (!ft_disabled_) {
-    // 清除 pg_->error_ → SUCCESS
-    // record ncclEndEvent_（確保 block() 能解鎖）
+    pg_->error_ = ErrorType::SUCCESS       // 清除 COMM_ERROR
+    work.ncclEndEvent_->record(ncclStream) // 確保 block() 能解鎖
     // 若 stash 非空：push_back 到 shelvesToUnstash_（保底 GC）
-    // erase from workMetaList_
+    erase from workMetaList_
 }
 ```
-注意：此路徑**不做 shadow buffer GC**（保留給 wait() 使用）
+注意：此路徑**不做 shadow buffer GC**（保留給 wait() 使用），stash 保底送給 shelvesToUnstash_
 
-**路徑 C：正常完成 GC（行 2839-2849）**
+**路徑 C：正常完成 GC**
 ```cpp
 if (work.isCompleted() && work.opType_ == OpType::ALLREDUCE && !ft_disabled_)
 ```
@@ -110,21 +112,22 @@ this->recover_and_replay_inflight_ops();
 
 ```
 Python DDP
-  └─ allreduce(tensors, opts)              [行 6091]
-       └─ allreduce_impl(tensor, opts)     [行 6013]
-            ├─ current_shadow_reduce_op_ = opts.reduceOp   [記錄 op]
+  └─ allreduce(tensors, opts)              [行 6053]
+       └─ allreduce_impl(tensor, opts)     [行 5975]
+            ├─ current_shadow_reduce_op_ = opts.reduceOp   [記錄 op，行 5981]
             └─ collective(tensor, tensor, fn, shadow_pre, post_noop, ALLREDUCE)
-                 ├─ [shadow_pre lambda]    D2H checkpoint   [行 6034-6063]
-                 ├─ collective() 正常分支 [行 5210-5218]
+                 ├─ future_ 初始化（pre() 前）              [行 5117-5124]
+                 ├─ [shadow_pre lambda]    D2H checkpoint   [行 5996-6025]
+                 ├─ collective() 正常分支 [行 5165-5175]
                  │    └─ C10D_NCCL_FT_CHECK_TIMEOUT(ncclAllReduce, ...)
-                 └─ work->ncclEndEvent_->record(ncclStream) [行 5256]
+                 └─ work->ncclEndEvent_->record(ncclStream) [行 5208-5210]
 ```
 
 **NCCL API 呼叫鏈（正常）：**
 1. `ncclAllReduce(input, output, numel, dataType, reduceOp, comm, stream)` — 非同步排入 ncclStream
 2. `ncclEndEvent_->record(ncclStream)` — 排入 EndEvent，DDP 的 `wait()` 透過 `block()` 等此 event
 
-### 3.2 shadow_pre lambda（D2H Checkpoint，行 6034-6063）
+### 3.2 shadow_pre lambda（D2H Checkpoint，行 5996-6025）
 
 每個 AllReduce 呼叫**在 ncclAllReduce 啟動前**執行 shadow_pre：
 
@@ -212,6 +215,7 @@ if (opts.reduceOp == ReduceOp::SUM && !is_degraded_) {
 - 使用 `NCCLFTComm::create` 完整從頭建立（**不用 ncclCommSplit**，因為 global comm 可能在第一個 collective 期間就死掉）
 - local_rank == 0 生成 `ncclUniqueId`，寫入 TCPStore（key: `NCCL_FT_LOCAL_COMM_ID_NODE_<node_id>_PG_<uid>`）
 - 其他 local rank 從 TCPStore 讀取
+- **N-to-N all-ready barrier**（行 4071-4093）：每個 local rank 讀取 ID 後先寫自己的 ready key（`NCCL_FT_LOCAL_READY_NODE_<node_id>_PG_<uid>_ROUND_<ft_round_>_LR_<lr>`），再 wait 所有 `localDeviceCount_` 個 ready key，確保全部 local rank 同時進入 `NCCLFTComm::create`（防止 bootstrap 永久阻塞）
 
 **proxy_global_comm_（行 4261-4293）：**
 - 在 `rebuild_shadow_ping_pong_topology()` 中建立
@@ -407,9 +411,12 @@ Step 4: 依序 H2D restore + replay（迴圈外宣告一個 restore_done CUDAEve
 
 Step 5: ft_round_++         [Bug A fix：讓 side-car 知道可以進入下一輪]
         TCPStore cleanup:
-          deleteKey("NCCL_FT_PROPOSE_<rank>_<round>")   [每個 rank 清自己的]
+          deleteKey("NCCL_FT_PROPOSE_<rank>_<round>")            [每個 rank 清自己的]
+          if !is_faulty: deleteKey("NCCL_FT_PROXY_READY_<round>_<rank>")
+          if cur_round==0: deleteKey("NCCL_FT_LOCAL_READY_NODE_<node>_PG_<uid>_ROUND_0_LR_<lr>")
           if rank==0: deleteKey("NCCL_FT_COMMIT_<round>")
                       deleteKey("NCCL_FT_SS_AGREED_<round>")
+                      deleteKey("NCCL_FT_PROXY_ID_<round>")
 
 Step 6: final_commit_op_.store(0, release)
           [解除 wait() 的自旋，允許下一輪 2PC 開始]
@@ -430,12 +437,15 @@ replay 邊界條件是 `seq >= agreed_ss`（含 agreed_ss 本身），
 ### 7.1 重要結構改變：Future 提前初始化
 
 ```cpp
-// Future 在 pre() 呼叫前就初始化（行 5165-5170）
-work->future_ = c10::make_intrusive<at::ivalue::Future>(...);
+// Future 在 pre() 呼叫前就初始化（行 5117-5124）
+{
+    c10::cuda::CUDAMultiStreamGuard sg(ncclStream);
+    work->future_ = c10::make_intrusive<at::ivalue::Future>(...);
+}
 // 這確保 shadow_pre 將 work_ptr 暴露給重播中心時，Future 已存在，消滅 Race Condition
 ```
 
-### 7.2 降級分支（行 5180-5208）
+### 7.2 降級分支（行 5132-5163）
 
 ```cpp
 if (C10_UNLIKELY(this->is_degraded_.load(acquire))) {
@@ -445,12 +455,12 @@ if (C10_UNLIKELY(this->is_degraded_.load(acquire))) {
         // 非 AllReduce 或 proxy comm 未就緒：fallback 到原生路徑（可能繼續失敗）
         fn(inputs[0], outputs[0], comm, ncclStream);
     }
-    // Bug 10 fix：work->ncclComm_ 依角色選擇
+    // Bug 10 fix：work->ncclComm_ 依角色選擇（行 5157-5163）
     work->ncclComm_ = is_faulty_rank ? local_nvlink_comm_ : proxy_global_comm_;
 }
 ```
 
-### 7.3 原生分支（行 5210-5218）
+### 7.3 原生分支（行 5165-5203）
 
 ```cpp
 else {
@@ -460,16 +470,18 @@ else {
     } catch (const NCCLFaultToleranceError& e) {
         if (!ft_disabled_) {
             work->ncclEndEvent_->record(ncclStream);
-            work->setException(e);     // 設定例外，讓 wait() 知道需要重播
+            work->setException(e);             // 設定例外
+            work->numelIn_  = inputs[0].numel();  // 確保 debug 欄位完整
+            work->numelOut_ = outputs[0].numel();
             workEnqueue(work);
-            return work;              // 提早返回，等 side-car + wait() 處理
+            return work;              // 提早返回，等側車重播並 markCompleted
         }
         throw;
     }
 }
 ```
 
-**注意：** 現在 future_ 已在進入 try 前初始化，catch 區塊不再需要重建 future_（old Bug 2 的症狀消失）。catch 區塊的 work->setException 保留例外，讓 wait() 的情況 C 能正確觸發 FT 恢復。
+**注意：** future_ 已在進入 try 前初始化。catch 區塊設定例外後提早返回；wait() 進入 FT 安全等待區，呼叫 `future_->wait()` 等側車的 `markCompleted`（不再有 spin-loop 或 A/B/C 分支）。
 
 ---
 
@@ -501,21 +513,30 @@ else {
 
 ```
 initWork()
-  → pre() 呼叫前：future_ 已初始化
+  → pre() 呼叫前：future_ 已初始化（行 5117-5124）
   → pre()：shadow_pre D2H checkpoint，work_ptr 插入 in_flight_shadow_bufs_
   → enqueue to workMetaList_
        ↓
   Watchdog scan:
-    isCompleted()? → GC shadow buffer (正常路徑)
-    exception (FT early-abort)? → setException + 進入 FT clearing path
-    exception (FT clearing path)? → erase + 保底 GC stash
+    isCompleted()? → 路徑 C：GC shadow buffer 到 free pool（正常路徑）
+    exception (FT early-abort)? → 路徑 A：注射 FT 例外
+    exception (FT clearing path)? → 路徑 B：erase + 保底 GC stash
+       ↓
+  側車（2PC 完成後直接呼叫）：
+    recover_and_replay_inflight_ops()
+      → rebuild topology → H2D restore → execute_shadow_allreduce
+      → work_ptr->setException(nullptr)
+      → work_ptr->future_->markCompleted(...)   ← 喚醒 wait()
        ↓
   DDP calls wait():
-    FT 防線 (行 952-1035):
-      已被恢復 (already_recovered) → 直接後處理 GC
-      需要恢復 (needs_ft_recovery) → recover_and_replay_inflight_ops()
-      後處理 GC: replayed_end_event->block + unstash + in_flight GC + return true
-    原生路徑: handleException()
+    FT 安全等待區（行 915-973）：
+      is_ft_exception || (is_ft_managed && is_degraded_)
+        → future_->wait()           ← 等側車 markCompleted
+        → setException(nullptr)
+        → replayed_end_event->block(currentStream)
+        → unstash + Inline GC
+        → return true（對 Python 完全透明）
+    原生路徑（無 FT 例外）: synchronize() + handleException()
 ```
 
 ---
@@ -599,11 +620,13 @@ T3: Side-car thread（pt_nccl_ft_side）
           └─ final_commit_op_ = 0
 
 T4: 主執行緒（wait()）
-    └─ synchronize() 返回（globalComm abort 後 ncclEndEvent 已由 Watchdog 或側車記錄）
-       FT 防線判斷：
-         is_degraded_=true 且 seq <= committed_ss？
-         → already_recovered = true
-         → 後處理 GC: replayed_end_event->block + unstash + 回收 shadow buffer
+    └─ FT 安全等待區判斷（行 915-973）：
+         is_ft_exception=true（comm abort 後 checkForNCCLErrors 偵測到 FaultToleranceError）
+         → future_->wait()           ← 等側車已呼叫 markCompleted（T3 已完成）
+         → setException(nullptr)     ← 抹除例外，保護 Python
+         → replayed_end_event->block(currentStream)
+         → stashed_for_allocator_safety_->unstash()
+         → Inline GC: 回收 shadow buffer 到 free pool
          → return true (對 DDP 完全透明)
 
 T5: 後續所有 AllReduce 走降級路徑
@@ -688,9 +711,7 @@ T5: 後續所有 AllReduce 走降級路徑
 
 | 項目 | 嚴重性 | 說明 |
 |------|--------|------|
-| `WorkNCCLFT::logPrefix()` static 局部變數 Bug | **高危** | 行 724：程式碼有注解警告但 `static` 關鍵字**仍然存在**，所有 WorkNCCLFT 物件共享第一次呼叫者的 rank_ 前綴。應移除 `static`。 |
 | `get_or_allocate_shadow_buffer` 殭屍函式 | **低危** | `at::Tensor get_or_allocate_shadow_buffer(const at::Tensor& t)` 宣告在 hpp 行 1229，與新版 `ShadowContext get_or_allocate_shadow_context` 並存，前者已無實作邏輯或永不被呼叫。應刪除宣告。 |
-| `initLocalNvlinkComm` TCPStore key 不清除 | **低危** | `"NCCL_FT_LOCAL_COMM_ID_NODE_<id>_PG_<uid>"` key 在 Store 中永久殘留；多次 `init_process_group` 時若 Store 不清除可能讀到舊值。 |
 | `sscanf` 格式字串可移植性 | **低危** | 行 4752：`%lu`/`%lx` 在 Windows 上對應 32-bit `unsigned long` 而非 64-bit `uint64_t`。應改用 `SCNu64`/`SCNx64`（`<cinttypes>`）。 |
 | `ncclCommBanNic` 作用域 | **待確認** | Process-level global 還是 per-comm？影響是否需要在 reinit 前重複呼叫。 |
 | `NCCLFTComm::create` topo discovery | **待確認** | 呼叫後是否確實跳過被 ban 的 NIC？需要實驗確認。 |
