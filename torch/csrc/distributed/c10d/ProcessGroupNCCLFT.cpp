@@ -995,7 +995,7 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
   }
 
 #ifdef PGNCCL_ENABLE_HASH
-  if (enableCollectiveHashDebug_.load()) {
+  if (enableCollectiveHashDebug_.load()) { 
     auto numel = getTensorsNumel(*outputs_);
     auto hashValue = hashTensors(*outputs_);
     PRINT_COLLECTIVE_HASH_SIGNATURE_FT(
@@ -1003,6 +1003,7 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
   }
 #endif // PGNCCL_ENABLE_HASH
 
+  LOG(INFO) << "[DEBUG] wait() 已經放行 seq=" << this->seq_;
   return true;
 }
 
@@ -6079,6 +6080,9 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
     if (ft_disabled_) return;
     
     uint64_t current_seq = work->seq_; 
+    // 👇 加入這行：追蹤 CPU 瘋狂派發任務與索求記憶體的瞬間
+    LOG(INFO) << "[DEBUG-RUNAWAY] 正在為 seq=" << current_seq << " 準備分配 Shadow Context 記憶體...";
+
     ShadowContext ctx = get_or_allocate_shadow_context(tensor);
     // 綁定 Tensor 與 Op 資訊，供稍後重播使用
     ctx.original_input = tensor;
