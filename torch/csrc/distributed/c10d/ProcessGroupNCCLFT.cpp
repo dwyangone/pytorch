@@ -4413,6 +4413,8 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         //   Step 1: send my tensor to my proxy via NVLink.
         //   Step 4: receive the final AllReduce result back from my proxy.
         // ----------------------------------------------------------------
+
+        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (FAULTY) 準備呼叫 ncclGroupEnd (等待 NVLink 連線)...";
         C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
         C10D_NCCL_FT_CHECK(
             ncclSend(input.data_ptr(), numel, ncclDataType,
@@ -4423,9 +4425,10 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
                      my_proxy, nvlink_comm, stream.stream()),
             std::nullopt);
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
+        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (FAULTY) 成功跨越 ncclGroupEnd！";
         LOG(INFO) << logPrefix()
-                  << "[NCCL-FT][FAULTY] Steps 1+4 enqueued via proxy="
-                  << my_proxy;
+          << "[NCCL-FT][FAULTY] Steps 1+4 enqueued via proxy="
+          << my_proxy;
 
     } else if (is_proxy) {
         // ----------------------------------------------------------------
@@ -4438,6 +4441,8 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         // ----------------------------------------------------------------
 
         // Step 1: receive all wards' tensors in a single ncclGroup.
+        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (PROXY) 準備呼叫 ncclGroupEnd (等待 NVLink 連線)...";
+
         std::vector<at::Tensor> ward_bufs;
         ward_bufs.reserve(my_wards.size());
         for (size_t i = 0; i < my_wards.size(); ++i) {
@@ -4454,6 +4459,8 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
                 std::nullopt);
         }
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
+
+        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (PROXY) 成功跨越 NVLink ncclGroupEnd！準備進行 Proxy AllReduce...";
 
         // Step 2: pre-aggregate.
         // [NCCL-FT Bug 7 fix] ATen copy_/add_ must be enqueued on the same
@@ -4504,11 +4511,14 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         LOG(INFO) << logPrefix()
                   << "[NCCL-FT][PROXY] All steps enqueued for wards=["
                   << wards_str << "]";
+        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (PROXY) 全部任務完成！";          
 
     } else {
         // ----------------------------------------------------------------
         // HEALTHY (non-proxy) role: straight cross-node AllReduce.
         // ----------------------------------------------------------------
+        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (HEALTHY) 準備呼叫 ncclAllReduce (等待 Proxy 全域連線)...";
+
         C10D_NCCL_FT_CHECK(
             ncclAllReduce(input.data_ptr(), output.data_ptr(),
                           numel, ncclDataType, nccl_proxy_op,
@@ -4522,6 +4532,8 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         }
         LOG(INFO) << logPrefix()
                   << "[NCCL-FT][HEALTHY] ncclAllReduce enqueued on proxy_global_comm_.";
+        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (HEALTHY) 成功跨越 ncclAllReduce！";
+    
     }
 }
 
