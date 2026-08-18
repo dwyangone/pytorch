@@ -4415,22 +4415,31 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
     if (is_faulty) {
         // ----------------------------------------------------------------
         // FAULTY role:
-        //   Step 1: send my tensor to my proxy via NVLink.
-        //   Step 4: receive the final AllReduce result back from my proxy.
+        //   Step 1: 將未聚合的梯度送給 Proxy (對應 Proxy 的 Step 1)
         // ----------------------------------------------------------------
-
-        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (FAULTY) 準備呼叫 ncclGroupEnd (等待 NVLink 連線)...";
+        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (FAULTY) 執行 Step 1: ncclSend";
         C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
         C10D_NCCL_FT_CHECK(
             ncclSend(input.data_ptr(), numel, ncclDataType,
                      my_proxy, nvlink_comm, stream.stream()),
             std::nullopt);
+        C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
+        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (FAULTY) Step 1 ncclSend 成功！";
+
+        // （此時 Proxy 正在執行 Step 2 的本機聚合與 Step 3 的跨節點 AllReduce，
+        //   FAULTY 節點的 CPU 會繼續往下走，並將接下來的 Recv 壓入 CUDA Stream 佇列中等待）
+
+        // ----------------------------------------------------------------
+        //   Step 4: 接收 Proxy 算完的全域最終結果 (對應 Proxy 的 Step 4)
+        // ----------------------------------------------------------------
+        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (FAULTY) 執行 Step 4: ncclRecv";
+        C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
         C10D_NCCL_FT_CHECK(
             ncclRecv(output.data_ptr(), numel, ncclDataType,
                      my_proxy, nvlink_comm, stream.stream()),
             std::nullopt);
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
-        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (FAULTY) 成功跨越 ncclGroupEnd！";
+        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (FAULTY) Step 4 ncclRecv 成功！";
         LOG(INFO) << logPrefix()
           << "[NCCL-FT][FAULTY] Steps 1+4 enqueued via proxy="
           << my_proxy;
