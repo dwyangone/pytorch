@@ -4167,7 +4167,36 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 
     // Mark proxy comm not-ready before rebuilding.
     proxy_comm_ready_.store(false, std::memory_order_release);
-    proxy_global_comm_.reset();
+    /* ===================================================================== */
+    /* 使用背景非同步執行緒進行垃圾回收 (Async GC) */
+    /* ===================================================================== */
+    // 1. 先用區域變數「捕捉」舊的 Communicator 擁有權 (Reference Count +1)
+    auto dead_proxy = this->proxy_global_comm_;
+    auto dead_local = this->local_nvlink_comm_;
+
+    // 2. 側車執行緒安全放手 (此時 Reference Count 至少為 1，不會觸發 ncclCommDestroy)
+    this->proxy_global_comm_.reset();
+    this->local_nvlink_comm_.reset();
+
+    // 3. 啟動一個分離的 (Detached) 背景執行緒，專門負責超渡這兩個物件
+    if (dead_proxy != nullptr || dead_local != nullptr) {
+        // 注意：把 logPrefix 先拷貝出來，避免 this 指標在背景執行緒中失效
+        std::thread([dead_proxy, dead_local, prefix = this->logPrefix()]() mutable {
+            c10::setThreadName("pt_nccl_gc");
+            LOG(INFO) << prefix << "[NCCL-FT] 背景 GC 執行緒啟動，準備回收死掉的 Communicators...";
+            
+            // 讓主訓練能先跑一段時間，避免跟正在重建的 NCCL 搶奪 IB 驅動鎖
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+
+            // 在這裡執行 reset()，這會觸發 ~NCCLFTComm() 與 ncclCommDestroy()
+            // 💡 如果底層驅動永久卡死，只會卡住這條獨立執行緒，完全不影響主訓練！
+            dead_proxy.reset();
+            dead_local.reset();
+            
+            LOG(INFO) << prefix << "[NCCL-FT] 背景 GC 執行緒成功回收資源並退出！";
+        }).detach();
+    }
+    /* ===================================================================== */
 
     int local_rank = rank_ % localDeviceCount_;
     bool is_faulty = (faulty_devs.count(local_rank) > 0);
@@ -4240,13 +4269,8 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     // 1. 為了確保驅動鎖被釋放，讓「所有 Rank (包含 Faulty)」都進行排空等待
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
-    // 2. 銷毀舊的、有毒的 NVLink comm
-    if (this->local_nvlink_comm_ && !this->local_nvlink_comm_->isAborted()) {
-        this->local_nvlink_comm_->abort("FT Recovery - Aborting dead nvlink comm");
-    }
-    this->local_nvlink_comm_.reset();
 
-    // 3. 動態組合硬性黑名單環境變數 (Hard-Ban)
+    // 2. 動態組合硬性黑名單環境變數 (Hard-Ban)
     std::string hca_ban_str = "";
     for (int d : faulty_devs) {
         // "^" 在 NCCL_IB_HCA 中代表「排除」
@@ -4259,14 +4283,14 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         LOG(INFO) << logPrefix() << "[NCCL-FT] 已動態設定環境變數 NCCL_IB_HCA=" << hca_ban_str;
     }
 
-    // 4. 強制重置 IB 快取，讓上面的環境變數立刻生效！
+    // 3. 強制重置 IB 快取，讓上面的環境變數立刻生效！
     nccl_ft_reset_ib_cache();
     LOG(INFO) << logPrefix() << "[NCCL-FT] IB 驅動快取已重置，準備重建 Local NVLink Comm...";
 
-    // 5. 所有 Rank (包含 Faulty) 重建全新的、無毒的 NVLink comm
+    // 4. 所有 Rank (包含 Faulty) 重建全新的、無毒的 NVLink comm
     initLocalNvlinkComm();
 
-    // 6. 重建 Proxy Global Comm (只有健康節點參與)
+    // 5. 重建 Proxy Global Comm (只有健康節點參與)
     if (!is_faulty) {
         // 重新分配一個 Unique ID 給新的降級群組
         ncclUniqueId proxyId;
