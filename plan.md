@@ -1,6 +1,6 @@
 # ProcessGroupNCCLFT — Shadow Ping-Pong Failover: Implementation Plan
 
-> 以 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實作狀態為準（2026-08，最新修訂）
+> 以 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實作狀態為準（2026-08，第三次修訂）
 
 ---
 
@@ -29,60 +29,64 @@
 
 | 項目 | 位置（cpp 行號） | 狀態 |
 |------|-----------------|------|
-| `initLocalNvlinkComm()` — 使用 NCCLFTComm::create 從頭建立 NVLink comm（不用 ncclCommSplit）| ~4092 | ✅ |
-| `rebuild_shadow_ping_pong_topology()` — NCCLFTComm::create reinit + ncclCommBanNic（單一 for 迴圈，不重複） | ~4166 | ✅ |
-| `execute_shadow_allreduce()` — FAULTY/PROXY/HEALTHY 四角色邏輯（含 findProxy + my_wards） | ~4326 | ✅ |
-| `trigger_fault_proposal()` — NCCL callback，bitmask fetch_or，shadow_seq_ atomic load | ~4520 | ✅ |
-| `start_ft_negotiator_thread()` — 2PC side-car，per-rank PROPOSE key，any_proposed 快速路徑，min agreed_ss | ~4554 | ✅ |
-| Side-car 2PC 完成後直接呼叫 `recover_and_replay_inflight_ops()`（不等主執行緒） | ~4874 | ✅ |
-| `get_or_allocate_shadow_context()` — 三段式設計（Inline GC + Best-Fit + Memory Backpressure + 鎖外 alloc） | ~4894 | ✅ |
+| `initLocalNvlinkComm(attempt)` — 使用 NCCLFTComm::create 從頭建立 NVLink comm（不用 ncclCommSplit）| ~4043 | ✅ |
+| `rebuild_shadow_ping_pong_topology()` — NCCLFTComm::create reinit + ncclCommBanNic（單一 for 迴圈，不重複） | ~4176 | ✅ |
+| `execute_shadow_allreduce()` — FAULTY/PROXY/HEALTHY 四角色邏輯（含 findProxy + my_wards） | ~4425 | ✅ |
+| `trigger_fault_proposal()` — NCCL callback，bitmask fetch_or，shadow_seq_ atomic load | ~4638 | ✅ |
+| `start_ft_negotiator_thread()` — 2PC side-car，per-rank PROPOSE key，any_proposed 快速路徑，min agreed_ss | ~4674 | ✅ |
+| Side-car 2PC 完成後直接呼叫 `recover_and_replay_inflight_ops()`（不等主執行緒） | ~4994 | ✅ |
+| `get_or_allocate_shadow_context()` — 三段式設計（Inline GC + Best-Fit + Memory Backpressure + 鎖外 alloc） | ~5012 | ✅ |
 | `ShadowContext::compute_event` — 提升為 ShadowContext 成員，不再每次 allreduce 建立新 event | hpp ~1182 | ✅ |
 | `ShadowContext::work_ptr` — 綁定 Work，供 Inline GC 主動回收成功 bucket | hpp ~1183 | ✅ |
-| `recover_and_replay_inflight_ops()` — 全域重播中心，abort→rebuild→H2D→replay→setException/markCompleted | ~5297 | ✅ |
-| recover 內部直接 `work_ptr->setException(nullptr)` + `future_->markCompleted` 解鎖 DDP | ~5367-5373 | ✅ |
+| `recover_and_replay_inflight_ops()` — 全域重播中心，abort→rebuild→H2D→replay→setException/markCompleted | ~5419 | ✅ |
+| recover 內部直接 `work_ptr->setException(nullptr)` + `future_->markCompleted` 解鎖 DDP | ~5499-5506 | ✅ |
 | `WorkNCCLFT::wait()` Future 機制 FT 安全等待區（is_ft_exception / is_ft_managed + future_->wait() + Inline GC） | ~915 | ✅ |
-| `allreduce_impl()` shadow_pre lambda — work_ptr + compute_event + atomic shadow_seq_ | ~5996 | ✅ |
-| `collective()` future_ 提前初始化（pre() 呼叫前），消除 Race Condition | ~5117 | ✅ |
-| `collective()` 二分支設計 — `is_degraded_` 直接執行 shadow allreduce（行 5132-5163）| ~5132 | ✅ |
+| `allreduce_impl()` shadow_pre lambda — work_ptr + compute_event + atomic shadow_seq_ | ~6185 | ✅ |
+| `collective()` future_ 提前初始化（pre() 呼叫前），消除 Race Condition | ~5287 | ✅ |
+| `collective()` 二分支設計 — `is_degraded_` 直接執行 shadow allreduce | ~5300 | ✅ |
 | Fix A：移除 Watchdog fallback fault_mask 寫入 | Watchdog runLoop | ✅ |
-| Fix 1：每個 rank 獨立呼叫 `ncclCommRegisterFaultCallback` | collective() lazy-init ~4993 | ✅ |
+| Fix 1：每個 rank 獨立呼叫 `ncclCommRegisterFaultCallback` | collective() lazy-init ~5159 | ✅ |
 | Fix 3：Watchdog early-abort（final_commit_op_ > 0 時強制 setException） | Watchdog runLoop | ✅ |
-| Fix D：collective() 原生路徑捕獲 NCCLFaultToleranceError，設 exception，提早 return | collective() ~5177 | ✅ |
-| Fix D2：`initLocalNvlinkComm()` try-catch + `nvlink_init_attempted_` flag | collective() lazy-init ~5063 | ✅ |
+| Fix D：collective() 原生路徑捕獲 NCCLFaultToleranceError，設 exception，提早 return | collective() ~5345 | ✅ |
+| Fix D2：`initLocalNvlinkComm()` try-catch + `nvlink_init_attempted_` flag | collective() lazy-init ~5183 | ✅ |
 | Bug 1 fix：FT 模式下 Watchdog 不設 COMM_ERROR | Watchdog runLoop ~2536 | ✅ |
-| Bug 2 fix：future_ 在 pre() 前初始化（消除 catch 區塊需要重建 future_ 的問題） | collective() ~5165 | ✅ |
-| Bug 3 確認：recover_and_replay seq >= agreed_ss 是正確的 | ~5327 | ✅ |
-| Bug 4 fix：get_or_allocate_shadow_context 三段式設計（鎖外 alloc） | ~4894 | ✅ |
+| Bug 2 fix：future_ 在 pre() 前初始化（消除 catch 區塊需要重建 future_ 的問題） | collective() ~5287 | ✅ |
+| Bug 3 確認：recover_and_replay seq >= agreed_ss 是正確的 | ~5447 | ✅ |
+| Bug 4 fix：get_or_allocate_shadow_context 三段式設計（鎖外 alloc） | ~5012 | ✅ |
 | Bug 5 確認：降級後 shadow_pre 仍執行 D2H copy — **設計決定** | shadow_pre | ✅ |
-| Bug 6 fix：`allreduce()` 降級模式跳過 intraNodeComm fast-path | allreduce() ~6114 | ✅ |
-| Bug 7 fix：proxy 的 ATen 算術（copy_/add_）在 ncclStream 上執行（setCurrentCUDAStream） | execute_shadow_allreduce ~4461 | ✅ |
-| Bug 10 fix：降級模式下 work->ncclComm_ 指向實際使用的 comm | collective() ~5194 | ✅ |
-| Bug 12 fix：多 NIC 同時故障用 bitmask fetch_or | trigger_fault_proposal ~4531 | ✅ |
-| Bug A fix：`ft_round_++` 在 recover_and_replay 末尾執行 + TCPStore cleanup | ~5377 | ✅ |
-| Bug B fix：用 `final_commit_op_ == 0` 取代 `rollback_done_` 判斷重入 | ~5302 | ✅ |
-| Bug C fix：side-car Phase 1b OR 累積更新 `faulty_local_devs_`（逐步故障支援） | ~4794 | ✅ |
-| shadow_seq_ 資料競爭修復：改為 `std::atomic<uint64_t>` | hpp ~1201, cpp ~5062, ~4540 | ✅ |
+| Bug 6 fix：`allreduce()` 降級模式跳過 intraNodeComm fast-path | allreduce() ~6281 | ✅ |
+| Bug 7 fix：proxy 的 ATen 算術（copy_/add_）在 ncclStream 上執行（setCurrentCUDAStream） | execute_shadow_allreduce ~4563 | ✅ |
+| Bug 10 fix：降級模式下 work->ncclComm_ 指向實際使用的 comm | collective() ~5317 | ✅ |
+| Bug 12 fix：多 NIC 同時故障用 bitmask fetch_or | trigger_fault_proposal ~4651 | ✅ |
+| Bug A fix：`ft_round_++` 在 recover_and_replay 末尾執行 + TCPStore cleanup | ~5509 | ✅ |
+| Bug B fix：用 `final_commit_op_ == 0` 取代 `rollback_done_` 判斷重入 | ~5422 | ✅ |
+| Bug C fix：side-car Phase 1b OR 累積更新 `faulty_local_devs_`（逐步故障支援） | ~4914 | ✅ |
+| shadow_seq_ 資料競爭修復：改為 `std::atomic<uint64_t>` | hpp ~1201 | ✅ |
 | compute_done event per-call fix：提升為 ShadowContext::compute_event | shadow_pre / get_or_allocate | ✅ |
-| ncclCommSplit 在 RemoteError comm 上失敗 fix：改用 NCCLFTComm::create（TCPStore rendezvous） | initLocalNvlinkComm ~4092 | ✅ |
-| 側車依賴主執行緒 fix：側車在 2PC 完成後直接呼叫 recover_and_replay | ~4874 | ✅ |
+| ncclCommSplit 在 RemoteError comm 上失敗 fix：改用 NCCLFTComm::create（TCPStore rendezvous） | initLocalNvlinkComm ~4043 | ✅ |
+| 側車依賴主執行緒 fix：側車在 2PC 完成後直接呼叫 recover_and_replay | ~4994 | ✅ |
 | UINT64_MAX sentinel（agreed_ss == UINT64_MAX 表示無 checkpoint） | side-car & barrier | ✅ |
-| 2PC side-car 強制 abort globalComm 以喚醒卡死的主執行緒 | start_ft_negotiator_thread ~4858 | ✅ |
-| Watchdog GC：AllReduce 成功後釋放 in_flight_shadow_bufs_ 到 free pool | Watchdog runLoop ~2839 | ✅ |
-| Inline GC：get_or_allocate 內主動回收已成功的 bucket | ~4900-4921 | ✅ |
-| Memory Backpressure：in-flight > 2GB 時 sleep 等待 | ~4944-4955 | ✅ |
-| Best-Fit buffer 搜尋：取代舊版第一個 numel >= 的策略 | ~4924-4941 | ✅ |
-| wait() FT 後處理 GC：replay 完成後由 wait() 回收 shadow buffer | wait() ~1019-1033 | ✅ |
+| 2PC side-car 強制 abort globalComm 以喚醒卡死的主執行緒 | start_ft_negotiator_thread ~4981 | ✅ |
+| Watchdog GC：AllReduce 成功後釋放 in_flight_shadow_bufs_ 到 free pool | Watchdog runLoop | ✅ |
+| Inline GC：get_or_allocate 內主動回收已成功的 bucket | ~5023 | ✅ |
+| Memory Backpressure：in-flight > 2GB 時 sleep 等待 | ~5065 | ✅ |
+| Best-Fit buffer 搜尋：取代舊版第一個 numel >= 的策略 | ~5043 | ✅ |
+| wait() FT 後處理 GC：replay 完成後由 wait() 回收 shadow buffer | wait() | ✅ |
 | `ShadowContext` struct（含 per-seq copy_event / replayed_end_event / compute_event / work_ptr / reduce_op） | hpp ~1178 | ✅ |
-| findProxy()：round-robin 尋找下一個健康 proxy（支援多 faulty） | ~4315 | ✅ |
-| my_wards vector：proxy 可代理多個 faulty rank | execute_shadow_allreduce ~4352 | ✅ |
-| **多維 Tensor Shape Mismatch fix**：shadow_pre D2H copy + H2D restore 均加 `.flatten()` | shadow_pre ~6058, recover_and_replay ~5355 | ✅ |
-| **迴圈內 CUDAEvent 效能 fix**：recover_and_replay 迴圈外宣告 `restore_done`，迴圈內重複 record | recover_and_replay ~5337 | ✅ |
+| findProxy()：round-robin 尋找下一個健康 proxy（支援多 faulty） | ~4414 | ✅ |
+| my_wards vector：proxy 可代理多個 faulty rank | execute_shadow_allreduce ~4452 | ✅ |
+| **多維 Tensor Shape Mismatch fix**：shadow_pre D2H copy + H2D restore 均加 `.flatten()` | shadow_pre, recover_and_replay ~5490 | ✅ |
+| **迴圈內 CUDAEvent 效能 fix**：recover_and_replay 迴圈外宣告 `restore_done`，迴圈內重複 record | recover_and_replay ~5476 | ✅ |
 | **Watchdog 例外清除後 GC 保底**：clearing path 將非空 stash push 到 shelvesToUnstash_ | Watchdog runLoop ~2679 | ✅ |
-| any_proposed 快速路徑：side-car 無故障時 sleep 50ms 避免空轉 | ~4686 | ✅ |
-| **logPrefix() static 返回懸空參照 fix**：移除 `static`，改為 `return c10::str(...)` 回傳值；宣告改 `std::string`（非引用） | WorkNCCLFT::logPrefix ~719，hpp ~393 | ✅ |
-| **`initLocalNvlinkComm` N-to-N all-ready barrier**：每個 local rank 寫 ready key 後 wait 全部 ready key，確保全部 rank 同時進入 `NCCLFTComm::create`，防止 bootstrap 掛死 | initLocalNvlinkComm ~4071-4093 | ✅ |
-| **`collective()` FT catch block 補齊 `numelIn_`/`numelOut_`**：FT 攔截路徑設定 `inputs[0].numel()` / `outputs[0].numel()`，確保 Work debug 欄位完整 | collective() catch ~5238-5239 | ✅ |
-| **`initLocalNvlinkComm` TCPStore ID key 清除**：all-ready barrier 通過後（所有 rank 已讀取 ID），`local_rank==0` 立即 `deleteKey(local_id_key)`，消除 Store 殘留 | initLocalNvlinkComm ~4091-4103 | ✅ |
+| any_proposed 快速路徑：side-car 無故障時 sleep 50ms 避免空轉 | ~4806 | ✅ |
+| **logPrefix() static 返回懸空參照 fix**：移除 `static`，改為回傳值 | WorkNCCLFT::logPrefix | ✅ |
+| **`initLocalNvlinkComm` 三屏障設計**（entry-arrival + ID 生成 + all-ready）| initLocalNvlinkComm ~4058-4132 | ✅ |
+| **`collective()` FT catch block 補齊 `numelIn_`/`numelOut_`** | collective() catch | ✅ |
+| **`initLocalNvlinkComm` TCPStore ID key 清除**：all-ready barrier 通過後立即 deleteKey | initLocalNvlinkComm ~4122 | ✅ |
+| **`initLocalNvlinkComm(attempt)` — 呼叫者傳入 attempt 消除 lazy-init vs recovery key 衝突** | lazy-init 傳 0，recovery 傳 `ft_round_+1` | ✅ |
+| **GC 執行緒加入 abort()** — 確保舊 comm 實際清理（`~NCCLFTComm` 不自動 abort） | rebuild ~4219-4240 | ✅ |
+| **`pending_shadow_seq_` 在 recover_and_replay 末尾重置為 UINT64_MAX** — 消除逐步故障的 stale checkpoint | recover_and_replay ~5565 | ✅ |
+| **移除所有 DEBUG-HANG / DEBUG-RUNAWAY log** — 清除暫時性調試輸出 | execute_shadow_allreduce, shadow_pre | ✅ |
 
 ---
 

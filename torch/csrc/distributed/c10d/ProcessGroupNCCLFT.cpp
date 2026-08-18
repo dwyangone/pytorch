@@ -4040,34 +4040,59 @@ float ProcessGroupNCCLFT::endTimeEstimate() {
 //   Since this is built during the very first collective (before any NIC faults
 //   typically bring down the system), NCCL will successfully discover the local 
 //   PCIe/NVLink topology and create an indestructible intra-node communicator.
-void ProcessGroupNCCLFT::initLocalNvlinkComm() {
+void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
     int node_id    = rank_ / localDeviceCount_;
     int local_rank = rank_ % localDeviceCount_;
 
     LOG(INFO) << logPrefix()
               << "[NCCL-FT] initLocalNvlinkComm: Building independent NVLink communicator "
-              << "from scratch (node_id=" << node_id 
-              << ", local_rank=" << local_rank << ")";
+              << "from scratch (node_id=" << node_id
+              << ", local_rank=" << local_rank
+              << ", attempt=" << attempt << ")";
 
-    // 1. Generate or retrieve the NCCL Unique ID for this specific node
+    // Key suffix that is unique per (node, PG, attempt).
+    std::string key_suffix = "NODE_" + std::to_string(node_id)
+                           + "_PG_" + std::to_string(this->getUid())
+                           + "_ATT_" + std::to_string(attempt);
+
+    // ── Phase 0: entry-arrival barrier ───────────────────────────────────────
+    // All local ranks on this node must reach this point before local_rank==0
+    // generates the ncclUniqueId.  Without this gate, local_rank==0 could
+    // generate and publish the ID while lagging ranks are still sleeping in
+    // the side-car's exception handler, causing those ranks to time out on
+    // the subsequent wait({local_id_key}).
+    {
+        std::string my_arrive_key = "NCCL_FT_LOCAL_ARRIVE_" + key_suffix
+                                  + "_LR_" + std::to_string(local_rank);
+        std::string one = "1";
+        this->globalStore_->set(my_arrive_key,
+            std::vector<uint8_t>(one.begin(), one.end()));
+
+        std::vector<std::string> all_arrive_keys;
+        for (int lr = 0; lr < localDeviceCount_; ++lr) {
+            all_arrive_keys.push_back("NCCL_FT_LOCAL_ARRIVE_" + key_suffix
+                                      + "_LR_" + std::to_string(lr));
+        }
+        this->globalStore_->wait(all_arrive_keys, std::chrono::seconds(120));
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT] Entry-arrival barrier passed (node=" << node_id
+                  << ", attempt=" << attempt << ").";
+    }
+
+    // ── Phase 1: generate or retrieve the per-node ncclUniqueId ──────────────
     ncclUniqueId localId;
-std::string local_id_key = "NCCL_FT_LOCAL_COMM_ID_NODE_" + std::to_string(node_id) 
-                               + "_PG_" + std::to_string(this->getUid())
-                               + "_ROUND_" + std::to_string(this->ft_round_);
+    std::string local_id_key = "NCCL_FT_LOCAL_COMM_ID_" + key_suffix;
 
     if (local_rank == 0) {
-        // 本機的 GPU 0 負責產生這台機器的專屬 ID
         C10D_NCCL_FT_CHECK(ncclGetUniqueId(&localId), std::nullopt);
         auto vec = std::vector<uint8_t>(
             reinterpret_cast<uint8_t*>(&localId),
             reinterpret_cast<uint8_t*>(&localId) + NCCL_UNIQUE_ID_BYTES);
         this->globalStore_->set(local_id_key, vec);
-        
-        LOG(INFO) << logPrefix() 
-                  << "[NCCL-FT] Local rank 0 generated and stored NVLink Comm ID for Node " 
-                  << node_id;
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT] Local rank 0 generated and stored NVLink Comm ID for Node "
+                  << node_id << " (attempt=" << attempt << ")";
     } else {
-        // 本機的其他 GPU 等待 GPU 0 將 ID 寫入 TCPStore
         this->globalStore_->wait({local_id_key}, std::chrono::seconds(30));
         auto vec = this->globalStore_->get(local_id_key);
         std::memcpy(&localId, vec.data(), vec.size());
@@ -4078,18 +4103,16 @@ std::string local_id_key = "NCCL_FT_LOCAL_COMM_ID_NODE_" + std::to_string(node_i
     // Without this, local_rank==0 may enter create immediately after writing
     // the key while other ranks haven't retrieved it yet, causing bootstrap hang.
     {
-        std::string my_ready_key = "NCCL_FT_LOCAL_READY_NODE_" +
-            std::to_string(node_id) + "_PG_" + std::to_string(this->getUid()) +
-            "_ROUND_" + std::to_string(ft_round_) + "_LR_" + std::to_string(local_rank);
+        std::string my_ready_key = "NCCL_FT_LOCAL_READY_" + key_suffix
+                                 + "_LR_" + std::to_string(local_rank);
         std::string one = "1";
         this->globalStore_->set(my_ready_key,
             std::vector<uint8_t>(one.begin(), one.end()));
 
         std::vector<std::string> all_ready_keys;
         for (int lr = 0; lr < localDeviceCount_; ++lr) {
-            all_ready_keys.push_back("NCCL_FT_LOCAL_READY_NODE_" +
-                std::to_string(node_id) + "_PG_" + std::to_string(this->getUid()) +
-                "_ROUND_" + std::to_string(ft_round_) + "_LR_" + std::to_string(lr));
+            all_ready_keys.push_back("NCCL_FT_LOCAL_READY_" + key_suffix
+                                     + "_LR_" + std::to_string(lr));
         }
         this->globalStore_->wait(all_ready_keys, std::chrono::seconds(60));
         LOG(INFO) << logPrefix()
@@ -4170,30 +4193,50 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     /* ===================================================================== */
     /* 使用背景非同步執行緒進行垃圾回收 (Async GC) */
     /* ===================================================================== */
-    // 1. 先用區域變數「捕捉」舊的 Communicator 擁有權 (Reference Count +1)
+    // 1. Capture ownership of the old communicators before releasing the
+    //    shared_ptr slots.  The ref count stays >= 1 so the objects are not
+    //    destroyed here.
     auto dead_proxy = this->proxy_global_comm_;
     auto dead_local = this->local_nvlink_comm_;
 
-    // 2. 側車執行緒安全放手 (此時 Reference Count 至少為 1，不會觸發 ncclCommDestroy)
+    // 2. Drop the PG's references; the GC thread owns the objects now.
     this->proxy_global_comm_.reset();
     this->local_nvlink_comm_.reset();
 
-    // 3. 啟動一個分離的 (Detached) 背景執行緒，專門負責超渡這兩個物件
+    // 3. Abort and destroy in a detached background thread so that a
+    //    potentially blocking ncclCommAbort() (e.g. a stuck GPU kernel) never
+    //    stalls the recovery path.
+    //
+    // Why abort() before reset():
+    //   ~NCCLFTComm() intentionally does NOT call ncclCommAbort/Destroy — it
+    //   only prints a WARN_ONCE about the leak.  Without an explicit abort()
+    //   here, the NCCL comm handle is silently leaked every recovery round.
+    //
+    // dead_local (NVLink-only comm) is healthy — no NIC fault can corrupt it —
+    // but it must still be properly destroyed to free GPU resources.
+    //
+    // dead_proxy may be null on the first recovery round (no prior proxy comm).
     if (dead_proxy != nullptr || dead_local != nullptr) {
-        // 注意：把 logPrefix 先拷貝出來，避免 this 指標在背景執行緒中失效
         std::thread([dead_proxy, dead_local, prefix = this->logPrefix()]() mutable {
             c10::setThreadName("pt_nccl_gc");
-            LOG(INFO) << prefix << "[NCCL-FT] 背景 GC 執行緒啟動，準備回收死掉的 Communicators...";
-            
-            // 讓主訓練能先跑一段時間，避免跟正在重建的 NCCL 搶奪 IB 驅動鎖
+            LOG(INFO) << prefix << "[NCCL-FT] GC thread: aborting old communicators...";
+
+            // Brief pause so the new comms can start their bootstrap before
+            // we enter ncclCommAbort, which competes for the IB driver lock.
             std::this_thread::sleep_for(std::chrono::seconds(5));
 
-            // 在這裡執行 reset()，這會觸發 ~NCCLFTComm() 與 ncclCommDestroy()
-            // 💡 如果底層驅動永久卡死，只會卡住這條獨立執行緒，完全不影響主訓練！
+            if (dead_proxy && !dead_proxy->isAborted()) {
+                dead_proxy->abort("FT GC - retiring old proxy comm");
+            }
+            if (dead_local && !dead_local->isAborted()) {
+                dead_local->abort("FT GC - retiring old local NVLink comm");
+            }
+            // Reset triggers ~NCCLFTComm(); abort() above already set
+            // aborted_=true so the destructor's WARN_ONCE is suppressed.
             dead_proxy.reset();
             dead_local.reset();
-            
-            LOG(INFO) << prefix << "[NCCL-FT] 背景 GC 執行緒成功回收資源並退出！";
+
+            LOG(INFO) << prefix << "[NCCL-FT] GC thread: old communicators retired.";
         }).detach();
     }
     /* ===================================================================== */
@@ -4288,7 +4331,11 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     LOG(INFO) << logPrefix() << "[NCCL-FT] IB 驅動快取已重置，準備重建 Local NVLink Comm...";
 
     // 4. 所有 Rank (包含 Faulty) 重建全新的、無毒的 NVLink comm
-    initLocalNvlinkComm();
+    // Pass ft_round_+1 as the attempt index.  ft_round_ is 2PC-agreed and
+    // identical on every rank, so all ranks use the same key set.  Using +1
+    // (instead of ft_round_ directly) guarantees this is always distinct from
+    // the lazy-init call which uses attempt=0, even when ft_round_==0.
+    initLocalNvlinkComm(/*attempt=*/ft_round_ + 1);
 
     // 5. 重建 Proxy Global Comm (只有健康節點參與)
     if (!is_faulty) {
@@ -4452,34 +4499,24 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
     if (is_faulty) {
         // ----------------------------------------------------------------
         // FAULTY role:
-        //   Step 1: 將未聚合的梯度送給 Proxy (對應 Proxy 的 Step 1)
+        //   Step 1: send unaggregate gradient to Proxy
+        //   Step 4: receive the globally-reduced result back from Proxy
         // ----------------------------------------------------------------
-        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (FAULTY) 執行 Step 1: ncclSend";
         C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
         C10D_NCCL_FT_CHECK(
             ncclSend(input.data_ptr(), numel, ncclDataType,
                      my_proxy, nvlink_comm, stream.stream()),
             std::nullopt);
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
-        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (FAULTY) Step 1 ncclSend 成功！";
 
-        // （此時 Proxy 正在執行 Step 2 的本機聚合與 Step 3 的跨節點 AllReduce，
-        //   FAULTY 節點的 CPU 會繼續往下走，並將接下來的 Recv 壓入 CUDA Stream 佇列中等待）
-
-        // ----------------------------------------------------------------
-        //   Step 4: 接收 Proxy 算完的全域最終結果 (對應 Proxy 的 Step 4)
-        // ----------------------------------------------------------------
-        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (FAULTY) 執行 Step 4: ncclRecv";
         C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
         C10D_NCCL_FT_CHECK(
             ncclRecv(output.data_ptr(), numel, ncclDataType,
                      my_proxy, nvlink_comm, stream.stream()),
             std::nullopt);
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
-        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (FAULTY) Step 4 ncclRecv 成功！";
         LOG(INFO) << logPrefix()
-          << "[NCCL-FT][FAULTY] Steps 1+4 enqueued via proxy="
-          << my_proxy;
+                  << "[NCCL-FT][FAULTY] Steps 1+4 enqueued via proxy=" << my_proxy;
 
     } else if (is_proxy) {
         // ----------------------------------------------------------------
@@ -4492,8 +4529,6 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         // ----------------------------------------------------------------
 
         // Step 1: receive all wards' tensors in a single ncclGroup.
-        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (PROXY) 準備呼叫 ncclGroupEnd (等待 NVLink 連線)...";
-
         std::vector<at::Tensor> ward_bufs;
         ward_bufs.reserve(my_wards.size());
         for (size_t i = 0; i < my_wards.size(); ++i) {
@@ -4510,8 +4545,6 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
                 std::nullopt);
         }
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
-
-        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (PROXY) 成功跨越 NVLink ncclGroupEnd！準備進行 Proxy AllReduce...";
 
         // Step 2: pre-aggregate.
         // [NCCL-FT Bug 7 fix] ATen copy_/add_ must be enqueued on the same
@@ -4560,16 +4593,12 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         }
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
         LOG(INFO) << logPrefix()
-                  << "[NCCL-FT][PROXY] All steps enqueued for wards=["
-                  << wards_str << "]";
-        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (PROXY) 全部任務完成！";          
+                  << "[NCCL-FT][PROXY] All steps enqueued for wards=[" << wards_str << "]";
 
     } else {
         // ----------------------------------------------------------------
         // HEALTHY (non-proxy) role: straight cross-node AllReduce.
         // ----------------------------------------------------------------
-        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (HEALTHY) 準備呼叫 ncclAllReduce (等待 Proxy 全域連線)...";
-
         C10D_NCCL_FT_CHECK(
             ncclAllReduce(input.data_ptr(), output.data_ptr(),
                           numel, ncclDataType, nccl_proxy_op,
@@ -4583,8 +4612,6 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         }
         LOG(INFO) << logPrefix()
                   << "[NCCL-FT][HEALTHY] ncclAllReduce enqueued on proxy_global_comm_.";
-        LOG(INFO) << "[DEBUG-HANG] Rank " << rank_ << " (HEALTHY) 成功跨越 ncclAllReduce！";
-    
     }
 }
 
@@ -5134,7 +5161,9 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
                 << ncclComm->repr();
     }
     try {
-      initLocalNvlinkComm();
+      // Lazy-init always uses attempt=0.  The recovery path uses ft_round_+1,
+      // so these two sets of keys are always distinct and never collide.
+      initLocalNvlinkComm(/*attempt=*/0);
     } catch (const std::exception& e) {
       // If initLocalNvlinkComm throws (e.g., the global comm entered
       // ncclRemoteError before the first collective completed), log and
@@ -5475,16 +5504,31 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
                 "NCCL_FT_PROXY_READY_" + round_str + "_" + std::to_string(this->rank_));
         }
 
-        // 清除 initLocalNvlinkComm 的 all-ready barrier key (每個 rank 清自己的)
-        // initLocalNvlinkComm 只在 ft_round_==0 時呼叫一次，所以只需清 ROUND_0。
-        if (cur_round == 0) {
-            int node_id = this->rank_ / this->localDeviceCount_;
+        // Clean up initLocalNvlinkComm keys for the attempts used in this and
+        // all prior rounds.  Attempt numbering:
+        //   attempt=0          : lazy-init (always the first call)
+        //   attempt=r+1        : recovery call for fault round r
+        // After ft_round_++ above, ft_round_ == cur_round+1, so the recovery
+        // attempt for this round was (cur_round+1) == ft_round_.
+        // We clean attempt=0 (lazy-init) only on the first fault round.
+        {
+            int node_id    = this->rank_ / this->localDeviceCount_;
             int local_rank = this->rank_ % this->localDeviceCount_;
-            this->globalStore_->deleteKey(
-                "NCCL_FT_LOCAL_READY_NODE_" + std::to_string(node_id) +
-                "_PG_" + std::to_string(this->getUid()) +
-                "_ROUND_0" +
-                "_LR_" + std::to_string(local_rank));
+            // Attempts to clean: lazy-init (0) if this is round 0, plus
+            // all recovery attempts 1..ft_round_ (inclusive).
+            uint64_t first_att = (cur_round == 0) ? 0 : 1;
+            for (uint64_t att = first_att; att <= this->ft_round_; ++att) {
+                std::string sfx = "NODE_" + std::to_string(node_id)
+                                + "_PG_" + std::to_string(this->getUid())
+                                + "_ATT_" + std::to_string(att);
+                // Each rank only deletes its own per-rank keys.
+                this->globalStore_->deleteKey(
+                    "NCCL_FT_LOCAL_ARRIVE_" + sfx
+                    + "_LR_" + std::to_string(local_rank));
+                this->globalStore_->deleteKey(
+                    "NCCL_FT_LOCAL_READY_" + sfx
+                    + "_LR_" + std::to_string(local_rank));
+            }
         }
 
         // rank 0 負責清除共用 keys
@@ -5497,6 +5541,13 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     } catch (const std::exception& e) {
         LOG(WARNING) << logPrefix() << "[NCCL-FT] TCPStore cleanup failed (non-fatal): " << e.what();
     }
+
+    // Reset the per-round pending shadow-seq sentinel so that the next fault
+    // round starts fresh.  Without this, the side-car would include the stale
+    // checkpoint from the previous round in its PROPOSE message for round 1+,
+    // giving an incorrect agreed_ss and potentially replaying already-completed
+    // ops or missing in-flight ones.
+    this->pending_shadow_seq_.store(UINT64_MAX, std::memory_order_release);
 
     this->final_commit_op_.store(0, std::memory_order_release);
     LOG(INFO) << logPrefix() << "[NCCL-FT] 全域重播完成！系統準備進入下一回合: " << this->ft_round_;
@@ -6141,18 +6192,14 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
   //   can verify the CPU buffer is complete before using it for restore.
   auto shadow_pre = [this, &tensor, opts](at::cuda::CUDAStream& /* nccl_stream */, c10::intrusive_ptr<WorkNCCLFT>& work) {
     if (ft_disabled_) return;
-    
-    uint64_t current_seq = work->seq_; 
-    // 👇 加入這行：追蹤 CPU 瘋狂派發任務與索求記憶體的瞬間
-    LOG(INFO) << "[DEBUG-RUNAWAY] 正在為 seq=" << current_seq << " 準備分配 Shadow Context 記憶體...";
 
+    uint64_t current_seq = work->seq_;
     ShadowContext ctx = get_or_allocate_shadow_context(tensor);
-    // 綁定 Tensor 與 Op 資訊，供稍後重播使用
     ctx.original_input = tensor;
-    ctx.original_output = tensor; // AllReduce 通常 in-place
+    ctx.original_output = tensor; // AllReduce is in-place
     ctx.reduce_op = opts.reduceOp;
-    ctx.work_ptr = work;          // 綁定 Work 指標，讓 Inline GC 知道要檢查誰
-    
+    ctx.work_ptr = work;
+
     {
         std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
         in_flight_shadow_bufs_[current_seq] = ctx;
@@ -6164,11 +6211,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::allreduce_impl(
 
     auto prev = at::cuda::getCurrentCUDAStream(shadow_copy_stream_.device_index());
     at::cuda::setCurrentCUDAStream(shadow_copy_stream_);
-    
-    // 加上 .flatten() 確保多維梯度可以安全寫入 1D buffer
     ctx.buffer.narrow(0, 0, tensor.numel()).copy_(tensor.flatten(), /*non_blocking=*/true);
-    ctx.copy_event->record(shadow_copy_stream_); // Per-seq 精準紀錄！
-    
+    ctx.copy_event->record(shadow_copy_stream_);
     at::cuda::setCurrentCUDAStream(prev);
     this->shadow_seq_.store(current_seq, std::memory_order_release);
   };

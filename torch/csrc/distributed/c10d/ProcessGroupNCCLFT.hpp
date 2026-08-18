@@ -1224,7 +1224,14 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
 
   void start_ft_negotiator_thread();
   uint64_t calculate_safe_buffer();
-  void initLocalNvlinkComm();
+  // attempt: caller-assigned index that is identical across all ranks for a
+  // given invocation.  Lazy-init passes 0; recovery passes (ft_round_ + 1),
+  // which is globally agreed via 2PC and therefore consistent on every rank.
+  // Using a caller-provided value (instead of a per-instance counter) avoids
+  // the mismatch that would occur when some ranks complete lazy-init (counter=1)
+  // while others fail and stay at 0, causing them to use different key sets in
+  // the subsequent recovery call.
+  void initLocalNvlinkComm(uint64_t attempt);
   void rebuild_shadow_ping_pong_topology();
   
   void execute_shadow_allreduce(

@@ -1,6 +1,6 @@
 # ProcessGroupNCCLFT — System Architecture
 
-> 依據 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實際程式碼撰寫，2026-08（最新修訂）。
+> 依據 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實際程式碼撰寫，2026-08（第三次修訂）。
 
 ---
 
@@ -210,12 +210,15 @@ if (opts.reduceOp == ReduceOp::SUM && !is_degraded_) {
 **global comm（`devNCCLCommMap_`）：**
 - 由 `initNCCLComm()` 在第一個 collective 建立
 
-**local_nvlink_comm_（行 4077-4150）：**
-- Lazy init，在第一個 collective 執行（行 5039-5076）
+**local_nvlink_comm_（行 4043-4160）：**
+- Lazy init，在第一個 collective 執行（行 5159）；recovery 路徑由 `rebuild_shadow_ping_pong_topology()` 再次呼叫
 - 使用 `NCCLFTComm::create` 完整從頭建立（**不用 ncclCommSplit**，因為 global comm 可能在第一個 collective 期間就死掉）
-- local_rank == 0 生成 `ncclUniqueId`，寫入 TCPStore（key: `NCCL_FT_LOCAL_COMM_ID_NODE_<node_id>_PG_<uid>`）
-- 其他 local rank 從 TCPStore 讀取
-- **N-to-N all-ready barrier**（行 4071-4093）：每個 local rank 讀取 ID 後先寫自己的 ready key（`NCCL_FT_LOCAL_READY_NODE_<node_id>_PG_<uid>_ROUND_<ft_round_>_LR_<lr>`），再 wait 所有 `localDeviceCount_` 個 ready key，確保全部 local rank 同時進入 `NCCLFTComm::create`（防止 bootstrap 永久阻塞）
+- 呼叫者傳入 `attempt`，lazy-init 傳 0，recovery 傳 `ft_round_+1`，確保每次呼叫使用獨立的 TCPStore key 集合，消除 lazy-init 殘留 key 干擾 recovery
+- **三屏障設計（行 4058-4132）：**
+  1. **Entry-arrival barrier**（Phase 0）：所有 local rank 先寫 `NCCL_FT_LOCAL_ARRIVE_NODE_<n>_PG_<uid>_ATT_<attempt>_LR_<lr>`，再 wait 全部 local rank 到達；確保 local_rank=0 不會提前生成 ID 並進入 bootstrap（120 秒超時）
+  2. **ID 生成**（Phase 1）：local_rank=0 生成 `ncclUniqueId`，寫入 `NCCL_FT_LOCAL_COMM_ID_NODE_<n>_PG_<uid>_ATT_<attempt>`；其他 local rank wait 30 秒後讀取
+  3. **All-ready barrier**（Phase 2）：每個 local rank 讀取 ID 後先寫 ready key（`NCCL_FT_LOCAL_READY_..._LR_<lr>`），再 wait 所有 ready key，確保全部 local rank 同時進入 `NCCLFTComm::create`（60 秒超時）
+- all-ready barrier 通過後，local_rank=0 立即 `deleteKey(local_id_key)` 清除 Store 殘留
 
 **proxy_global_comm_（行 4261-4293）：**
 - 在 `rebuild_shadow_ping_pong_topology()` 中建立
@@ -238,8 +241,9 @@ proxy_comm_rank_：重新對健康 rank 編號（跳過 faulty_devs）
 
 | 情況 | abort 呼叫者 | 原因 |
 |------|-------------|------|
-| 2PC committed | side-car thread（行 4858-4865） | 強制喚醒卡在 ncclAllReduce 的主執行緒 |
-| recover_and_replay_inflight_ops() 開始 | 側車（recover 在側車內執行）（行 5309-5313） | 確保舊 comm 徹底死亡再 rebuild |
+| 2PC committed | side-car thread（行 4981） | 強制喚醒卡在 ncclAllReduce 的主執行緒 |
+| recover_and_replay_inflight_ops() 開始 | 側車（recover 在側車內執行）（行 5432-5435） | 確保舊 global comm 徹底死亡再 rebuild |
+| rebuild 完成後（舊 local/proxy comm） | GC 執行緒（行 4228-4232） | `~NCCLFTComm()` 不自動 abort/destroy；GC 執行緒在 5 秒 sleep 後明確呼叫 abort() 再 reset()，避免 NCCL 資源洩漏 |
 
 ---
 
@@ -687,25 +691,29 @@ T5: 後續所有 AllReduce 走降級路徑
 | Bug | 說明 | 修復位置 |
 |-----|------|---------|
 | Bug 1 | collective() 降級路徑 execute_shadow_allreduce 被呼叫兩次 | 清理為乾淨二分支 |
-| Bug 2 | catch NCCLFaultToleranceError 的 early return 未設 work->future_ | future_ 移到 pre() 前初始化（行 5165-5170） |
-| Bug 3 | recover_and_replay seq 邊界（確認 `>=` 是正確的） | 行 5327：保留 `>=` |
-| Bug 4 | get_or_allocate_shadow_context 在鎖內呼叫 pin_memory() | 三段式設計（行 4894-4978） |
+| Bug 2 | catch NCCLFaultToleranceError 的 early return 未設 work->future_ | future_ 移到 pre() 前初始化 |
+| Bug 3 | recover_and_replay seq 邊界（確認 `>=` 是正確的） | 保留 `>=`，~5447 |
+| Bug 4 | get_or_allocate_shadow_context 在鎖內呼叫 pin_memory() | 三段式設計，~5012 |
 | Bug 5 | 降級後 shadow_pre 仍執行 D2H copy | **設計決定**，不是 bug |
-| Bug 6 | 降級模式下 intraNodeComm fast-path 繞過 FT 邏輯 | allreduce() 加 `!is_degraded_` 條件（行 6114） |
-| Bug 7 | proxy 的 ATen 算術未在正確 stream 執行 | setCurrentCUDAStream + restore（行 4461-4468） |
-| Bug 10 | 降級模式下 work->ncclComm_ 指向錯誤 comm | collective() 行 5194-5208：依角色選 comm |
-| Bug 12 | 多 NIC 同時故障 CAS 丟失 bit | 改為 fetch_or bitmask（trigger_fault_proposal） |
-| Bug A | ft_round_ 從未遞增 | recover_and_replay 末尾 ft_round_++ |
+| Bug 6 | 降級模式下 intraNodeComm fast-path 繞過 FT 邏輯 | allreduce() 加 `!is_degraded_` 條件，~6281 |
+| Bug 7 | proxy 的 ATen 算術未在正確 stream 執行 | setCurrentCUDAStream + restore，~4563 |
+| Bug 10 | 降級模式下 work->ncclComm_ 指向錯誤 comm | collective() 依角色選 comm，~5317 |
+| Bug 12 | 多 NIC 同時故障 CAS 丟失 bit | 改為 fetch_or bitmask，~4651 |
+| Bug A | ft_round_ 從未遞增 | recover_and_replay 末尾 ft_round_++，~5511 |
 | Bug B | rollback_done_ 永遠不重置 | 改用 final_commit_op_ == 0 判斷 |
 | Bug C | faulty_local_devs_ 第二輪不更新 | side-car Phase 1b OR 累積更新 |
-| shadow_seq_ 資料競爭 | shadow_seq_ 是普通 uint64_t，主執行緒寫、NCCL callback thread 讀 | 改為 `std::atomic<uint64_t>`，load(acquire) / store(release) |
-| logPrefix() static Bug | function-local static 第一次呼叫後固定不變 | 移除 `static` 關鍵字（行 724 有保留警告注解，但 static 仍在！見待修復） |
+| shadow_seq_ 資料競爭 | shadow_seq_ 是普通 uint64_t，主執行緒寫、NCCL callback thread 讀 | 改為 `std::atomic<uint64_t>` |
+| logPrefix() static Bug | function-local static 第一次呼叫後固定不變 | 移除 `static` 關鍵字 |
 | 多維 Tensor copy_ Shape Mismatch | H2D 還原及 D2H copy 對多維 tensor 直接操作造成 shape 不符 | 兩處均加 `.flatten()` |
 | 迴圈內 CUDAEvent 重複 create/destroy | recover_and_replay 每次迭代原本建立新 restore_done event | 迴圈外宣告 `restore_done`，迴圈內 `record()` 複用 |
-| Watchdog 例外清除後無 GC 保底 | FT clearing path 清除 exception 後 stash 無處釋放 | 加入保底 GC：push 到 `shelvesToUnstash_`（行 2679-2681） |
-| compute_done event per-call create | shadow_pre 每次建立 CUDAEvent | 提升為 ShadowContext::compute_event，在 get_or_allocate 時建立並複用 |
+| Watchdog 例外清除後無 GC 保底 | FT clearing path 清除 exception 後 stash 無處釋放 | 加入保底 GC：push 到 `shelvesToUnstash_` |
+| compute_done event per-call create | shadow_pre 每次建立 CUDAEvent | 提升為 ShadowContext::compute_event 複用 |
 | ncclCommSplit 在 RemoteError comm 上失敗 | local_nvlink_comm_ 的建立依賴 parent comm | 改用 NCCLFTComm::create（TCPStore rendezvous，完全獨立） |
 | 側車依賴主執行緒才能啟動重播 | 主執行緒若卡死，重播永遠不啟動 | 側車在 2PC 完成後直接呼叫 recover_and_replay_inflight_ops() |
+| **initLocalNvlinkComm key 衝突（lazy-init vs recovery 共用 ROUND_0 key）** | NIC 在第一個 collective 期間故障時，lazy-init 失敗的 rank 沒有寫入 `LOCAL_READY` key；recovery 路徑使用相同的 key，進入 bootstrap 時缺少某些 rank，永久卡住 | `initLocalNvlinkComm(attempt)` 使用呼叫者傳入的 attempt（lazy=0, recovery=ft_round+1）作為 key 後綴；加入 entry-arrival barrier 確保所有 local rank 同時進入 |
+| **GC 執行緒不呼叫 abort()，造成 NCCL 資源洩漏** | `~NCCLFTComm()` 只印警告，不 ncclCommAbort/Destroy；舊版 GC 執行緒直接 reset() 等於靜默洩漏 | GC 執行緒在 sleep 後先呼叫 `abort()`（設 aborted_=true 以抑制警告），再 reset() |
+| **`pending_shadow_seq_` 在 recovery 後未重置** | 第二次故障的 PROPOSE 帶著第一輪的 checkpoint seq，agreed_ss 錯誤，可能重播已完成的 op | `recover_and_replay_inflight_ops()` 末尾在 `final_commit_op_.store(0)` 前重置 `pending_shadow_seq_` 為 `UINT64_MAX` |
+| **DEBUG-HANG / DEBUG-RUNAWAY log 殘留** | 暫時性調試輸出混入生產 log，干擾問題分析 | 移除所有 `[DEBUG-HANG]` 和 `[DEBUG-RUNAWAY]` log |
 
 ### ❓ 待確認 / 待修復
 
