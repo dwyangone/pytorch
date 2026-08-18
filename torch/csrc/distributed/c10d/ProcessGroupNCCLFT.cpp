@@ -4289,6 +4289,11 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         LOG(INFO) << logPrefix() << "[NCCL-FT] 建立全新的 proxy_global_comm_ (Size="
                   << proxy_comm_size_ << " Rank=" << proxy_comm_rank_ << ")";
         
+        // 讓側車執行緒在這裡死等或 Sleep 500ms ~ 1s
+        // 這段時間是為了讓出 CPU，讓 NCCL 背景的 Progress Thread 有充裕的時間
+        // 把核心空間的 ibv_destroy_qp 徹底做完並釋放 Mellanox 驅動鎖！
+        //add sleep before create to prevent block from nccl
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));          
         // 從頭建立全新的降級群組 (Re-Init)
         // 此時 NCCL 底層的 ncclTopoGetSystem 會掃描網卡，但會因為前面的 ncclCommBanNic 而跳過壞卡！
         proxy_global_comm_ = NCCLFTComm::create(proxy_comm_size_, proxy_comm_rank_, proxyId, device.index(), config);

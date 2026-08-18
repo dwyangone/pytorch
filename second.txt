@@ -1,0 +1,664 @@
+css-host-158:244964:244964 [1] NCCL INFO ncclCommInitRankConfig comm 0x650bc5b01850 rank 1 nranks 16 cudaDev 1 nvmlDev 1 busId 1css-host-158:244968:244968 [5] NCCL INFO ncclCommInitRankConfig comm 0x568523c44560 rank 5 nranks 16 cudaDev 5 nvmlDev 5 busId 8f000 commId 0xdd76d379c4999590 - Init COMPLETE
+6000 commId 0xdd76d379c4999590 - Init COMPLETE
+css-host-158:244969:244969 [6] NCCL INFO ncclCommInitRankConfig comm 0x60b2574d3020 rank 6 nranks 16 cudaDev 6 nvmlDev 6 busId c6000 commId 0xdd76d379c4999590 - Init COMPLETE
+css-host-158:244965:244965 [2] NCCL INFO ncclCommInitRankConfig comm 0x6250b2f58080 rank 2 nranks 16 cudaDev 2 nvmlDev 2 busId 49000 commId 0xdd76d379c4999590 - Init COMPLETE
+css-host-158:244966:244966 [3] NCCL INFO ncclCommInitRankConfig comm 0x60cbf55ef160 rank 3 nranks 16 cudaDev 3 nvmlDev 3 busId 4d000 commId 0xdd76d379c4999590 - Init COMPLETE
+css-host-158:244970:244970 [7] NCCL INFO ncclCommInitRankConfig comm 0x5b55e1780e30 rank 7 nranks 16 cudaDev 7 nvmlDev 7 busId ca000 commId 0xdd76d379c4999590 - Init COMPLETE
+css-host-158:244963:244963 [0] NCCL INFO ncclCommInitRankConfig comm 0x5732f0a93c40 rank 0 nranks 16 cudaDev 0 nvmlDev 0 busId 10000 commId 0xdd76d379c4999590 - Init COMPLETE
+css-host-158:244967:244967 [4] NCCL INFO ncclCommInitRankConfig comm 0x560da3a3c800 rank 4 nranks 16 cudaDev 4 nvmlDev 4 busId 8a000 commId 0xdd76d379c4999590 - Init COMPLETE
+css-host-158:244967:244967 [4] NCCL INFO ncclCommInitRankConfig comm 0x560daa3c64e0 rank 4 nranks 8 cudaDev 4 nvmlDev 4 busId 8acss-host-158:244963:244963 [0] NCCL INFO ncclCommInitRankConfig comm 0x5732f72bd4b0 rank 0 nranks 8 cudaDev 0 nvmlDev 0 busId 10000 commId 0xb3c387bb9e804d9a - Init COMPLETE
+000 commId 0xb3c387bb9e804d9a - Init COMPLETE
+css-host-158:244969:244969 [6] NCCL INFO ncclCommInitRankConfig comm 0x60b25de5c8c0 rank 6 nranks 8 cudaDev 6 nvmlDev 6 busId c6000 commId 0xb3c387bb9e804d9a - Init COMPLETE
+css-host-158:244965:244965 [2] NCCL INFO ncclCommInitRankConfig comm 0x6250b98fa280 rank 2 nranks 8 cudaDev 2 nvmlDev 2 busId 49000 commId 0xb3c387bb9e804d9a - Init COMPLETE
+css-host-158:244968:244968 [5] NCCL INFO ncclCommInitRankConfig comm 0x56852a5e62a0 rank 5 nranks 8 cudaDev 5 nvmlDev 5 busId 8fcss-host-158:244964:244964 [1] NCCL INFO ncclCommInitRankConfig comm 0x650bcc48b020 rank 1 nranks 8 cudaDev 1 nvmlDev 1 busId 16000 commId 0xb3c387bb9e804d9a - Init COMPLETE
+000 commId 0xb3c387bb9e804d9a - Init COMPLETE
+css-host-158:244966:244966 [3] NCCL INFO ncclCommInitRankConfig comm 0x60cbfbf9ce20 rank 3 nranks 8 cudaDev 3 nvmlDev 3 busId 4d000 commId 0xb3c387bb9e804d9a - Init COMPLETE
+000 commId 0xb3c387bb9e804d9a - Init COMPLETE
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (recv comm=0x7b0018021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the recv communicator (comm=0x7b0018021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the recv communicator (comm=0x7b0018021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be pre-posted
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (recv comm=0x704c9c021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (send comm=0x789750021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the recv communicator (comm=0x704c9c021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the recv communicatcss-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on tor (comm=0x704c9c021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the send communicatcss-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be pre-posted
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (recv comm=0x735244021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x704c9c021000) is configured with 2 local devices and 2 remote devices
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x704c9c021000) is configured with 2 probing QPs
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on tcss-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x704c9c021000) is configured with 0 recovery QPs
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the recv communicator (comm=0x735244021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be pre-posted
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (recv comm=0x704c9c06b000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the recv communicator (comm=0x704c9c06b000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (recv comm=0x73524406b000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the recv communicator (comm=0x704c9c06b000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the recv communicator (comm=0x73524406b000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be pre-posted
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the recv communicator (comm=0x73524406b000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be pre-posted
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x704c9c06b000) is configured with 2 local devices and 2 remote devices
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x704c9c06b000) is configured with 2 probing QPs
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x704c9c06b000) is configured with 0 recovery QPs
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (send comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the send communicator (comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the send communicator (comm=0x789750072000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (recv comm=0x7b001806b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the recv communicator (comm=0x7b001806b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the recv communicator (comm=0x7b001806b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be pre-posted
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7b0018021000) is configured with 2 local devices and 2 remote devices
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7b0018021000) is configured with 2 probing QPs
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7b0018021000) is configured with 0 recovery QPs
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7b001806b000) is configured with 2 local devices and 2 remote devices
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7b001806b000) is configured with 2 probing QPs
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7b001806b000) is configured with 0 recovery QPs
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 0 for recv communicator (comm=0x704c9c021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for recv communicator (comm=0x704c9c021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (recv comm=0x704c9c021000, cq_size=1)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x704c9c067010) on device 0 for resiliency context (recv comm=0x704c9c021000, cq_size=1)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 1 for recv communicator (comm=0x704c9c021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for recv communicator (comm=0x704c9c021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (recv comm=0x704c9c021000, cq_size=1)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x704c9c0675d0) on device 1 for resiliency context (recv comm=0x704c9c021000, cq_size=1)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=4 devName=mlx5_4 ndevs=8 nmdevs=12 qp_num=507 pkey=0 pd=0x704c9c020c50 oooRq=0
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 0 for recv communicator (comm=0x7b0018021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=5 devName=mlx5_5 ndevs=8 nmdevs=12 qp_num=760 pkey=0 pd=0x704c9c067270 oooRq=0
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (send comm=0x7ec24c021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the send communicator (comm=0x7ec24c021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the send communicator (comm=0x7ec24c021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (send comm=0x784a30021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the send communicator (comm=0x784a30021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the send communicator (comm=0x784a30021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (recv comm=0x770d58021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the recv communicator (comm=0x770d58021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the recv communicator (comm=0x770d58021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be pre-posted
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (send comm=0x7ec24c072000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the send communicator (comm=0x7ec24c072000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the send communicator (comm=0x7ec24c072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (send comm=0x784a30072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the send communicator (comm=0x784a30072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the send communicator (comm=0x784a30072000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (recv comm=0x770d5806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the recv communicator (comm=0x770d5806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the recv communicator (comm=0x770d5806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be pre-posted
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x784a30021000) is configured with 2 local devices and 2 remote devices
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x784a30021000) is configured with 2 probing QPs
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x784a30021000) is configured with 0 recovery QPs
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 0 for send communicator (comm=0x784a30021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=4 devName=mlx5_4 ndevs=8 nmdevs=12 qp_num=508 pkey=0 pd=0x704c9c020c50
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for send communicator (comm=0x784a30021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for recv communicator (comm=0x7b0018021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (recv comm=0x7b0018021000, cq_size=1)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x784a300659f0) on device 0 for resiliency context (comm=0x784a30021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (send comm=0x784a30021000, cq_size=256)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7b0018067010) on device 0 for resiliency context (recv comm=0x7b0018021000, cq_size=1)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x784a3006e010) on device 0 forcss-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 1 for recv comm resiliency context (send comm=0x784a30021000, cq_size=256)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 1 for send communicator (comm=0x784a30021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for send communicator (comm=0x784a30021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for recv communicator (comm=0x7b0018021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (recv comm=0x7b0018021000, cq_size=1)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x784a300659f0) on device 1 for resiliency context (comm=0x784a30021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (send comm=0x784a30021000, cq_size=256)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7b0018067570) on device 1 for resiliency context (recv comm=0x7b0018021000, cq_size=1)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x784a3006e4d0) on device 1 for resiliency context (send comm=0x784a30021000, cq_size=256)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=5 devName=mlx5_5 ndevs=8 nmdevs=12 qp_num=761 pkey=0 pd=0x704c9c067270
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x735244021000) is configured with 2 local devices and 2 remote devices
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x735244021000) is configured with 2 probing QPs
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x735244021000) is configured with 0 recovery QPs
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=0 devName=mlx5_0 ndevs=8 nmdevs=12 qp_num=396 pkey=0 pd=0x7b0018020bf0 oooRq=0
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=0 devName=mlx5_0 ndevs=8 nmdevs=12 qp_num=397 pkey=0 pd=0x784a30020a70 oooRq=0
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x789750021000) is configured with 2 local devices and 2 remote devices
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x789750021000) is configured with 2 probing QPs
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x789750021000) is configured with 0 recovery QPs
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7ec24c021000) is configured with 2 local devices and 2 remote devices
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 0 for send communicator (comm=0x789750021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7ec24c021000) is configured with 2 probing QPs
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7ec24c021000) is configured with 0 recovery QPs
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 0 for send communicator (comm=0x7ec24c021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x770d58021000) is configured with 2 local devices and 2 remote devices
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x770d58021000) is configured with 2 probing QPs
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x770d58021000) is configured with 0 recovery QPs
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for send communicator (comm=0x789750021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7897500659f0) on device 0 for resiliency context (comm=0x789750021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (send comm=0x789750021000, cq_size=256)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=0, qp_num=509, dest_qp_num=508, deviceIndex=0, comm=0x704c9c021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for send communicator (comm=0x7ec24c021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7ec24c0659f0) on device 0 for resiliency context (comm=0x7ec24c021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (send comm=0x7ec24c021000, cq_size=256)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x78975006e010) on device 0 for resiliency context (send comm=0x789750021000, cq_size=256)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 1 for send communicator (comm=0x789750021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x770d5806b000) is configured with 2 local devices and 2 remote devices
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x770d5806b000) is configured with 2 probing QPs
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x770d5806b000) is configured with 0 recovery QPs
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7ec24c06e010) on device 0 for resiliency context (send comm=0x7ec24c021000, cq_size=256)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 1 for send communicator (comm=0x7ec24c021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=1 devName=mlx5_1 ndevs=8 nmdevs=12 qp_num=667 pkey=0 pd=0x784a30020e20 oooRq=0
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for send communicator (comm=0x789750021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7897500659f0) on device 1 for resiliency context (comm=0x789750021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (send comm=0x789750021000, cq_size=256)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for send communicator (comm=0x7ec24c021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7ec24c0659f0) on device 1 for resiliency context (comm=0x7ec24c021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (send comm=0x7ec24c021000, cq_size=256)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=1, qp_num=762, dest_qp_num=761, deviceIndex=1, comm=0x704c9c021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=507, comm=0x704c9c021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=760, comm=0x704c9c021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x78975006e4d0) on device 1 for resiliency context (send comm=0x789750021000, cq_size=256)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 0 for recv communicator (comm=0x704c9c06b000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7ec24c06e4d0) on device 1 for resiliency context (send comm=0x7ec24c021000, cq_size=256)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=4 devName=mlx5_4 ndevs=8 nmdevs=12 qp_num=510 pkey=0 pd=0x789750020ab0 oooRq=0
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 8 IbDev 0 Port 1 qp_num 397 mtu 5 GID 3 (0/9E010A0AFFFF0000) ctsFifoRkey=0x183bfa ctsFifoLkey=0x183bfa
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbConnect: IbDev 0 Port 1 qp_num 397 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 8 IbDev 1 Port 1 qp_num 667 mtu 5 GID 3 (0/9E020A0AFFFF0000) ctsFifoRkey=0x1bfaf8 ctsFifoLkey=0x1bfaf8
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbConnect: IbDev 1 Port 1 qp_num 667 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for recv communicator (comm=0x704c9c06b000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (recv comm=0x704c9c06b000, cq_size=1)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=2 devName=mlx5_2 ndevs=8 nmdevs=12 qp_num=407 pkey=0 pd=0x7ec24c020a90 oooRq=0
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x704c9c163960) on device 0 for resiliency context (recv comm=0x704c9c06b000, cq_size=1)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 1 for recv communicator (comm=0x704c9c06b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=1 devName=mlx5_1 ndevs=8 nmdevs=12 qp_num=669 pkey=0 pd=0x7b0018020f50 oooRq=0
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=5 devName=mlx5_5 ndevs=8 nmdevs=12 qp_num=763 pkey=0 pd=0x789750020e60 oooRq=0
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for recv communicator (comm=0x704c9c06b000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (recv comm=0x704c9c06b000, cq_size=1)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=3 devName=mlx5_3 ndevs=8 nmdevs=12 qp_num=660 pkey=0 pd=0x7ec24c020e40 oooRq=0
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x704c9c182050) on device 1 for resiliency context (recv comm=0x704c9c06b000, cq_size=1)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=4 devName=mlx5_4 ndevs=8 nmdevs=12 qp_num=512 pkey=0 pd=0x704c9c020c50 oooRq=0
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 0 for recv communicator (comm=0x735244021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 10 IbDev 4 Port 1 qp_num 510 mtu 5 GID 3 (0/9E050A0AFFFF0000) ctsFifoRkey=0x1821df ctsFifoLkey=0x1821df
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbConnect: IbDev 4 Port 1 qp_num 510 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 10 IbDev 5 Port 1 qp_num 763 mtu 5 GID 3 (0/9E060A0AFFFF0000) ctsFifoRkey=0x1bebe9 ctsFifoLkey=0x1bebe9
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbConnect: IbDev 5 Port 1 qp_num 763 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x789750072000) is configured with 2 local devices and 2 remote devices
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x789750072000) is configured with 2 probing QPs
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x789750072000) is configured with 0 recovery QPs
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 0 for send communicator (comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for send communicator (comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7897500b69f0) on device 0 for resiliency context (comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (send comm=0x789750072000, cq_size=256)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 9 IbDev 2 Port 1 qp_num 407 mtu 5 GID 3 (0/9E030A0AFFFF0000) ctsFifoRkey=0x1836f4 ctsFifoLkey=0x1836f4
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbConnect: IbDev 2 Port 1 qp_num 407 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 9 IbDev 3 Port 1 qp_num 660 mtu 5 GID 3 (0/9E040A0AFFFF0000) ctsFifoRkey=0x1beded ctsFifoLkey=0x1beded
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for recvcss-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbConnect: IbDev 3 Port 1 qp_num 660 query_ece={supported=1, vendor_id=0x15 communicator (comm=0x735244021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (recv comm=0x735244021000, cq_size=1)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=5 devName=mlx5_5 ndevs=8 nmdevs=12 qp_num=765 pkey=0 pd=0x704c9c067270 oooRq=0
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7ec24c072000) is configured with 2 local devices and 2 remote devices
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7ec24c072000) is configured with 2 probing QPs
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7ec24c072000) is configured with 0 recovery QPs
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 0 for send communicator (comm=0x7ec24c072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x789750180050) on device 0 for resiliency context (send comm=0x789750072000, cq_size=256)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 1 for send communicator (comm=0x789750072000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x735244067010) on device 0 for resiliency context (recv comm=0x735244021000, cq_size=1)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=0 devName=mlx5_0 ndevs=8 nmdevs=12 qp_num=399 pkey=0 pd=0x7b0018020bf0
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 1 for recv communicator (comm=0x735244021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for send communicator (comm=0x7ec24c072000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7ec24c0b69f0) on device 0 for resiliency context (comm=0x7ec24c072000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (send comm=0x7ec24c072000, cq_size=256)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for send communicator (comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7897500b69f0) on device 1 for resiliency context (comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (send comm=0x789750072000, cq_size=256)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7ec24c180050) on device 0 for resiliency context (send comm=0x7ec24c072000, cq_size=256)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for recvcss-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 1 for send comm communicator (comm=0x735244021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (recv comm=0x735244021000, cq_size=1)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x789750180510) on device 1 for resiliency context (send comm=0x789750072000, cq_size=256)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=4 devName=mlx5_4 ndevs=8 nmdevs=12 qp_num=513 pkey=0 pd=0x704c9c020c50
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7352440675d0) on device 1 for resiliency context (recv comm=0x735244021000, cq_size=1)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=1 devName=mlx5_1 ndevs=8 nmdevs=12 qp_num=670 pkey=0 pd=0x7b0018020f50
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for send communicator (comm=0x7ec24c072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=4 devName=mlx5_4 ndevs=8 nmdevs=12 qp_num=514 pkey=0 pd=0x789750020ab0 oooRq=0
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7ec24c0b69f0) on device 1 for resiliency context (comm=0x7ec24c072000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (send comm=0x7ec24c072000, cq_size=256)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 0 for recv communicator (comm=0x770d58021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=6 devName=mlx5_6 ndevs=8 nmdevs=12 qp_num=407 pkey=0 pd=0x735244020c50 oooRq=0
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7ec24c180510) on device 1 for resiliency context (send comm=0x7ec24c072000, cq_size=256)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=5 devName=mlx5_5 ndevs=8 nmdevs=12 qp_num=766 pkey=0 pd=0x789750020e60 oooRq=0
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=5 devName=mlx5_5 ndevs=8 nmdevs=12 qp_num=767 pkey=0 pd=0x704c9c067270
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for recv communicator (comm=0x770d58021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (recv comm=0x770d58021000, cq_size=1)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=2 devName=mlx5_2 ndevs=8 nmdevs=12 qp_num=409 pkey=0 pd=0x7ec24c020a90 oooRq=0
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x770d58067010) on device 0 for resiliency context (recv comm=0x770d58021000, cq_size=1)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 1 for recv communicator (comm=0x770d58021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=3 devName=mlx5_3 ndevs=8 nmdevs=12 qp_num=662 pkey=0 pd=0x7ec24c020e40 oooRq=0
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for recv communicator (comm=0x770d58021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (recv comm=0x770d58021000, cq_size=1)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=0, qp_num=400, dest_qp_num=408, deviceIndex=0, comm=0x7b0018021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 10 IbDev 4 Port 1 qp_num 514 mtu 5 GID 3 (0/9E050A0AFFFF0000) ctsFifoRkey=0x1838f7 ctsFifoLkey=0x1838f7
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbConnect: IbDev 4 Port 1 qp_num 514 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=7 devName=mlx5_7 ndevs=8 nmdevs=12 qp_num=696 pkey=0 pd=0x735244067270 oooRq=0
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 10 IbDev 5 Port 1 qp_num 766 mtu 5 GID 3 (0/9E060A0AFFFF0000) ctsFifoRkey=0x1beaea ctsFifoLkey=0x1beaea
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbConnect: IbDev 5 Port 1 qp_num 766 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x770d580675d0) on device 1 for resiliency context (recv comm=0x770d58021000, cq_size=1)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=0, qp_num=516, dest_qp_num=510, deviceIndex=0, comm=0x704c9c06b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=2 devName=mlx5_2 ndevs=8 nmdevs=12 qp_num=411 pkey=0 pd=0x770d58020c50 oooRq=0
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=1, qp_num=671, dest_qp_num=661, deviceIndex=1, comm=0x7b0018021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=396, comm=0x7b0018021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=669, comm=0x7b0018021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 0 for recv communicator (comm=0x7b001806b000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 9 IbDev 2 Port 1 qp_num 409 mtu 5 GID 3 (0/9E030A0AFFFF0000) ctsFifoRkey=0x180ecd ctsFifoLkey=0x180ecd
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbConnect: IbDev 2 Port 1 qp_num 409 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 9 IbDev 3 Port 1 qp_num 662 mtu 5 GID 3 (0/9E040A0AFFFF0000) ctsFifoRkey=0x1bd6d5 ctsFifoLkey=0x1bd6d5
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbConnect: IbDev 3 Port 1 qp_num 662 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=1, qp_num=769, dest_qp_num=763, deviceIndex=1, comm=0x704c9c06b000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=512, comm=0x704c9c06b000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=765, comm=0x704c9c06b000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=6 devName=mlx5_6 ndevs=8 nmdevs=12 qp_num=408 pkey=0 pd=0x735244020c50
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for recv communicator (comm=0x7b001806b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (recv comm=0x7b001806b000, cq_size=1)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7b00181638c0) on device 0 for resiliency context (recv comm=0x7b001806b000, cq_size=1)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 1 for recv communicator (comm=0x7b001806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=3 devName=mlx5_3 ndevs=8 ncss-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for recvmdevs=12 qp_num=664 pkey=0 pd=0x770d58067270 oooRq=0
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (recv comm=0x7b001806b000, cq_size=1)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7b0018163d80) on device 1 for resiliency context (recv comm=0x7b001806b000, cq_size=1)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=7 devName=mlx5_7 ndevs=8 nmdevs=12 qp_num=697 pkey=0 pd=0x735244067270
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=0 devName=mlx5_0 ndevs=8 nmdevs=12 qp_num=401 pkey=0 pd=0x7b0018020bf0 oooRq=0
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=2 devName=mlx5_2 ndecss-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=1 devName=mlx5_1 ndevs=8 nvs=8 nmdevs=12 qp_num=412 pkey=0 pd=0x770d58020c50
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=0, qp_num=409, dest_qp_num=408, deviceIndex=0, comm=0x735244021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=0 devName=mlx5_0 ndevs=8 nmdevs=12 qp_num=402 pkey=0 pd=0x7b0018020bf0
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=3 devName=mlx5_3 ndecss-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info vs=8 nmdevs=12 qp_num=665 pkey=0 pd=0x770d58067270
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x784a30062000, addr=0x78335805ab30, rkey=0x23bdbb)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 0 Port 1 qp_num 397 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (send comm=0x7dd994021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the send communicator (comm=0x7dd994021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the send communicator (comm=0x7dd994021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x789750062000, addr=0x7bb87005ab30, rkey=0x1ffcba)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x789750062000, addr=0x7bb87005ab30, rkey=0x23bbb9)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 4 Port 1 qp_num 510 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 1 Port 1 qp_num 667 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7dd994021000) is configured with 2 local devices and 2 remote devices
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7dd994021000) is configured with 2 probing QPs
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7dd994021000) is configured with 0 recovery QPs
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 0 for send communicator (comm=0x7dd994021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=1, qp_num=698, dest_qp_num=661, deviceIndex=1, comm=0x735244021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=407, comm=0x735244021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=696, comm=0x735244021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=1 devName=mlx5_1 ndevs=8 nmdevs=12 qp_num=673 pkey=0 pd=0x7b0018020f50
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 5 Port 1 qp_num 763 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for send communicator (comm=0x7dd994021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7dd9940659f0) on device 0 for resiliency context (comm=0x7dd994021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (send comm=0x7dd994021000, cq_size=256)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=0, qp_num=398, dest_qp_num=413, deviceIndex=0, comm=0x784a30021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7dd9940207c0) on device 0 for resiliency context (send comm=0x7dd994021000, cq_size=256)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 1 for send communicator (comm=0x7dd994021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=0, qp_num=511, dest_qp_num=513, deviceIndex=0, comm=0x789750021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=1, qp_num=668, dest_qp_num=666, deviceIndex=1, comm=0x784a30021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=0, qp_num=413, dest_qp_num=408, deviceIndex=0, comm=0x770d58021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=1, qp_num=764, dest_qp_num=766, deviceIndex=1, comm=0x789750021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for send communicator (comm=0x7dd994021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7dd9940659f0) on device 1 for resiliency context (comm=0x7dd994021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (send comm=0x7dd994021000, cq_size=256)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x7ec24c062000, addr=0x7cc6ec05ab30, rkey=0x1ffab9)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x7ec24c062000, addr=0x7cc6ec05ab30, rkey=0x23bdbb)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=0, qp_num=403, dest_qp_num=410, deviceIndex=0, comm=0x7b001806b000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 2 Port 1 qp_num 407 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7dd99406e010) on device 1 for resiliency context (send comm=0x7dd994021000, cq_size=256)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 3 Port 1 qp_num 660 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=1, qp_num=666, dest_qp_num=661, deviceIndex=1, comm=0x770d58021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=411, comm=0x770d58021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=664, comm=0x770d58021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=6 devName=mlx5_6 ndevs=8 nmdevs=12 qp_num=410 pkey=0 pd=0x7dd994020410 oooRq=0
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 0 for recv communicator (comm=0x770d5806b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=1, qp_num=674, dest_qp_num=663, deviceIndex=1, comm=0x7b001806b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=401, comm=0x7b001806b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=672, comm=0x7b001806b000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=0, qp_num=408, dest_qp_num=413, deviceIndex=0, comm=0x7ec24c021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for recv communicator (comm=0x770d5806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (recv comm=0x770d5806b000, cq_size=1)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=7 devName=mlx5_7 ndevs=8 nmdevs=12 qp_num=699 pkey=0 pd=0x7dd994020a20 oooRq=0
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=1, qp_num=661, dest_qp_num=666, deviceIndex=1, comm=0x7ec24c021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x770d58163960) on device 0 for resiliency context (recv comm=0x770d5806b000, cq_size=1)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 1 for recv communicator (comm=0x770d5806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for recv communicator (comm=0x770d5806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (recv comm=0x770d5806b000, cq_size=1)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x770d58182050) on device 1 for resiliency context (recv comm=0x770d5806b000, cq_size=1)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 11 IbDev 6 Port 1 qp_num 410 mtu 5 GID 3 (0/9E070A0AFFFF0000) ctsFifoRkey=0x1841ff ctsFifoLkey=0x1841ff
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbConnect: IbDev 6 Port 1 qp_num 410 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 11 IbDev 7 Port 1 qp_num 699 mtu 5 GID 3 (0/9E080A0AFFFF0000) ctsFifoRkey=0x1c02f2 ctsFifoLkey=0x1c02f2
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbConnect: IbDev 7 Port 1 qp_num 699 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=2 devName=mlx5_2 ndevs=8 nmdevs=12 qp_num=414 pkey=0 pd=0x770d58020c50 oooRq=0
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=3 devName=mlx5_3 ndevs=8 nmdevs=12 qp_num=667 pkey=0 pd=0x770d58067270 oooRq=0
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=2 devName=mlx5_2 ndevs=8 nmdevs=12 qp_num=415 pkey=0 pd=0x770d58020c50
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x7897500b3000, addr=0x7bb8700a4b30, rkey=0x1ff1af)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x7897500b3000, addr=0x7bb8700a4b30, rkey=0x23b2b0)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 4 Port 1 qp_num 514 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=3 devName=mlx5_3 ndevs=8 nmdevs=12 qp_num=668 pkey=0 pd=0x770d58067270
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 5 Port 1 qp_num 766 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=0, qp_num=515, dest_qp_num=516, deviceIndex=0, comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=1, qp_num=768, dest_qp_num=769, deviceIndex=1, comm=0x789750072000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=0, qp_num=416, dest_qp_num=412, deviceIndex=0, comm=0x770d5806b000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x7ec24c0b3000, addr=0x7cc6ec0a4b30, rkey=0x1ffcba)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x7ec24c0b3000, addr=0x7cc6ec0a4b30, rkey=0x23b6b4)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 2 Port 1 qp_num 409 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x784a30072000) is configured with 2 local devices and 2 remote devices
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x784a30072000) is configured with 2 probing QPs
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x784a30072000) is configured with 0 recovery QPs
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 0 for send communicator (comm=0x784a30072000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 3 Port 1 qp_num 662 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=1, qp_num=669, dest_qp_num=664, deviceIndex=1, comm=0x770d5806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=414, comm=0x770d5806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=667, comm=0x770d5806b000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for send communicator (comm=0x784a30072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x784a300b69f0) on device 0 for resiliency context (comm=0x784a30072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (send comm=0x784a30072000, cq_size=256)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x784a30020120) on device 0 for resiliency context (send comm=0x784a30072000, cq_size=256)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 1 for send communicator (comm=0x784a30072000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=0, qp_num=410, dest_qp_num=416, deviceIndex=0, comm=0x7ec24c072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for send communicator (comm=0x784a30072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x784a300b69f0) on device 1 for resiliency context (comm=0x784a30072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (send comm=0x784a30072000, cq_size=256)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=1, qp_num=663, dest_qp_num=669, deviceIndex=1, comm=0x7ec24c072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x784a300718b0) on device 1 for resiliency context (send comm=0x784a30072000, cq_size=256)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=0 devName=mlx5_0 ndevs=8 nmdevs=12 qp_num=404 pkey=0 pd=0x784a30020a70 oooRq=0
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=1 devName=mlx5_1 ndevs=8 nmdevs=12 qp_num=675 pkey=0 pd=0x784a30020e20 oooRq=0
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x7dd994062000, addr=0x7e345805ab30, rkey=0x1ff8b6)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x7dd994062000, addr=0x7e345805ab30, rkey=0x23bab8)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 6 Port 1 qp_num 410 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 8 IbDev 0 Port 1 qp_num 404 mtu 5 GID 3 (0/9E010A0AFFFF0000) ctsFifoRkey=0x1822e1 ctsFifoLkey=0x1822e1
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbConnect: IbDev 0 Port 1 qp_num 404 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 8 IbDev 1 Port 1 qp_num 675 mtu 5 GID 3 (0/9E020A0AFFFF0000) ctsFifoRkey=0x1bebe9 ctsFifoLkey=0x1bebe9
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbConnect: IbDev 1 Port 1 qp_num 675 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 7 Port 1 qp_num 699 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=0, qp_num=411, dest_qp_num=411, deviceIndex=0, comm=0x7dd994021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=1, qp_num=700, dest_qp_num=664, deviceIndex=1, comm=0x7dd994021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x784a300b3000, addr=0x78335819ab30, rkey=0x1ffbb9)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x784a300b3000, addr=0x78335819ab30, rkey=0x23bbb9)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 0 Port 1 qp_num 404 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 1 Port 1 qp_num 675 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=0, qp_num=405, dest_qp_num=416, deviceIndex=0, comm=0x784a30072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=1, qp_num=676, dest_qp_num=669, deviceIndex=1, comm=0x784a30072000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x73524406b000) is configured with 2 local devices and 2 remote devices
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x73524406b000) is configured with 2 probing QPs
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x73524406b000) is configured with 0 recovery QPs
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (send comm=0x7dd994156000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the send communicator (comm=0x7dd994156000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the send communicator (comm=0x7dd994156000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 0 for recv communicator (comm=0x73524406b000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7dd994156000) is configured with 2 local devices and 2 remote devices
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7dd994156000) is configured with 2 probing QPs
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x7dd994156000) is configured with 0 recovery QPs
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 0 for send communicator (comm=0x7dd994156000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for send communicator (comm=0x7dd994156000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for recv communicator (comm=0x73524406b000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (recv comm=0x73524406b000, cq_size=1)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7dd99419a9f0) on device 0 for resiliency context (comm=0x7dd994156000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (send comm=0x7dd994156000, cq_size=256)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7352440202b0) on device 0 for resiliency context (recv comm=0x73524406b000, cq_size=1)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 1 for recv communicator (comm=0x73524406b000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7dd9940d16b0) on device 0 for resiliency context (send comm=0x7dd994156000, cq_size=256)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 1 for send communicator (comm=0x7dd994156000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for send communicator (comm=0x7dd994156000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7dd99419a9f0) on device 1 for resiliency context (comm=0x7dd994156000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (send comm=0x7dd994156000, cq_size=256)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for recv communicator (comm=0x73524406b000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (recv comm=0x73524406b000, cq_size=1)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7dd9940d1b70) on device 1 for resiliency context (send comm=0x7dd994156000, cq_size=256)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x7352441a9690) on device 1 for resiliency context (recv comm=0x73524406b000, cq_size=1)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=6 devName=mlx5_6 ndevs=8 nmdevs=12 qp_num=412 pkey=0 pd=0x735244020c50 oooRq=0
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=6 devName=mlx5_6 ndevs=8 nmdevs=12 qp_num=413 pkey=0 pd=0x7dd994020410 oooRq=0
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=7 devName=mlx5_7 ndevs=8 nmdevs=12 qp_num=701 pkey=0 pd=0x7dd994020a20 oooRq=0
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=7 devName=mlx5_7 ndevs=8 nmdevs=12 qp_num=703 pkey=0 pd=0x735244067270 oooRq=0
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=6 devName=mlx5_6 ndevs=8 nmdevs=12 qp_num=415 pkey=0 pd=0x735244020c50
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 11 IbDev 6 Port 1 qp_num 413 mtu 5 GID 3 (0/9E070A0AFFFF0000) ctsFifoRkey=0x1832f2 ctsFifoLkey=0x1832f2
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbConnect: IbDev 6 Port 1 qp_num 413 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 11 IbDev 7 Port 1 qp_num 701 mtu 5 GID 3 (0/9E080A0AFFFF0000) ctsFifoRkey=0x1bd6c7 ctsFifoLkey=0x1bd6c7
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbConnect: IbDev 7 Port 1 qp_num 701 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=7 devName=mlx5_7 ndevs=8 nmdevs=12 qp_num=705 pkey=0 pd=0x735244067270
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=0, qp_num=416, dest_qp_num=413, deviceIndex=0, comm=0x73524406b000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=1, qp_num=706, dest_qp_num=666, deviceIndex=1, comm=0x73524406b000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=412, comm=0x73524406b000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=703, comm=0x73524406b000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x7dd994197000, addr=0x7e34580a4b30, rkey=0x1ffdbb)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x7dd994197000, addr=0x7e34580a4b30, rkey=0x23bdbb)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 6 Port 1 qp_num 413 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 7 Port 1 qp_num 701 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=0, qp_num=414, dest_qp_num=416, deviceIndex=0, comm=0x7dd994156000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=1, qp_num=704, dest_qp_num=669, deviceIndex=1, comm=0x7dd994156000)
+css-host-158:244966:244966 [3] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+css-host-158:244967:244967 [4] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+css-host-158:244968:244968 [5] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+css-host-158:244965:244965 [2] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+css-host-158:244964:244964 [1] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+css-host-158:244969:244969 [6] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+css-host-158:244970:244970 [7] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+css-host-158:244963:244963 [0] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+css-host-158:244967:245153 [4] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x704c9c06b2a8, comm=0x704c9c06b000, id=25834, wc.wr_id=234, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=512, wc.imm_data=25834)
+css-host-158:244963:245151 [0] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x7b001806b2a8, comm=0x7b001806b000, id=21369, wc.wr_id=121, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=672, wc.imm_data=21369)
+css-host-158:244967:245153 [4] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x704c9c021168, comm=0x704c9c021000, id=47635, wc.wr_id=19, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=760, wc.imm_data=47635)
+css-host-158:244967:245153 [4] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x704c9c0213e8, comm=0x704c9c021000, id=50915, wc.wr_id=227, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=760, wc.imm_data=50916)
+css-host-158:244967:245153 [4] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x704c9c06b3e8, comm=0x704c9c06b000, id=50915, wc.wr_id=227, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=765, wc.imm_data=50916)
+css-host-158:244963:245151 [0] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x7b00180212a8, comm=0x7b0018021000, id=86422, wc.wr_id=150, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=396, wc.imm_data=86422)
+css-host-158:244967:245153 [4] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x704c9c021028, comm=0x704c9c021000, id=121120, wc.wr_id=32, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=507, wc.imm_data=121121)
+css-host-158:244967:245153 [4] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x704c9c06b3e8, comm=0x704c9c06b000, id=121796, wc.wr_id=196, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=512, wc.imm_data=121797)
+css-host-158:244969:245156 [6] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x7352440213e8, comm=0x735244021000, id=125765, wc.wr_id=69, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=696, wc.imm_data=125765)
+css-host-158:244969:245156 [6] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x73524406b168, comm=0x73524406b000, id=127641, wc.wr_id=153, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=703, wc.imm_data=127641)
+css-host-158:244965:245157 [2] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x770d580213e8, comm=0x770d58021000, id=133678, wc.wr_id=46, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=411, wc.imm_data=133678)
+css-host-158:244967:245153 [4] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x704c9c06b3e8, comm=0x704c9c06b000, id=160103, wc.wr_id=103, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=765, wc.imm_data=160104)
+css-host-158:244963:245151 [0] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x7b0018021028, comm=0x7b0018021000, id=168454, wc.wr_id=6, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=396, wc.imm_data=168456)
+css-host-158:244965:245157 [2] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x770d580212a8, comm=0x770d58021000, id=197614, wc.wr_id=238, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=411, wc.imm_data=197614)
+css-host-158:244967:245153 [4] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x704c9c021028, comm=0x704c9c021000, id=199774, wc.wr_id=94, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=507, wc.imm_data=199775)
+css-host-158:244969:245156 [6] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x73524406b3e8, comm=0x73524406b000, id=220131, wc.wr_id=227, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=703, wc.imm_data=220132)
+css-host-158:244969:245156 [6] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x7352440213e8, comm=0x735244021000, id=255047, wc.wr_id=71, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=696, wc.imm_data=255047)
+css-host-158:244969:245156 [6] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x73524406b3e8, comm=0x73524406b000, id=254497, wc.wr_id=33, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=703, wc.imm_data=254497)
+css-host-158:244963:245151 [0] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x7b00180213e8, comm=0x7b0018021000, id=256593, wc.wr_id=81, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=669, wc.imm_data=256593)
+css-host-158:244969:245156 [6] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x7352440213e8, comm=0x735244021000, id=262015, wc.wr_id=127, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=696, wc.imm_data=262015)
+css-host-158:244963:245151 [0] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x7b00180212a8, comm=0x7b0018021000, id=265970, wc.wr_id=242, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=396, wc.imm_data=265970)
+css-host-158:244969:245156 [6] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x7352440213e8, comm=0x735244021000, id=273807, wc.wr_id=143, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=696, wc.imm_data=273807)
+css-host-158:244967:245153 [4] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x704c9c0213e8, comm=0x704c9c021000, id=284911, wc.wr_id=239, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=760, wc.imm_data=284916)
+css-host-158:244963:245151 [0] NCCL INFO NET/IB: ncclIbCompletionEventProcess: Receiver got a completion for a CTS but retrieved an 'unused' request (req=0x7b001806b028, comm=0x7b001806b000, id=300954, wc.wr_id=154, wc.opcode=IBV_WC_RDMA_WRITE(1), wc.qp_num=401, wc.imm_data=300955)
+css-host-158:244964:245152 [1] NCCL INFO NET/IB: ncclIbResiliencyHandleCompletionError: Got completion with error (devIndex=0, wc->status=(IBV_WC_RETRY_EXC_ERR)12, wc->opcode=(IBV_WC_RDMA_WRITE)1, wc->wr_id=127, wc->qp_num=404, wc->byte_len=2)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for send communicator (comm=0x784a30021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (send comm=0x784a30021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x784a30122418, qp_num=398) for resiliency context (comm=0x784a30021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x784a301227e8, qp_num=668) for resiliency context (comm=0x784a30021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x784a3006e010) on device 0 for resiliency context (comm=0x784a30021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x784a300659f0) on device 0 for resiliency context (comm=0x784a30021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x784a3006e4d0) on device 1 for resiliency context (comm=0x784a30021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x784a300659f0) on device 1 for resiliency context (comm=0x784a30021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for send communicator (comm=0x789750021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (send comm=0x789750021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x789750122418, qp_num=511) for resiliency context (comm=0x789750021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x7897501227e8, qp_num=764) for resiliency context (comm=0x789750021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x78975006e010) on device 0 for resiliency context (comm=0x789750021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x7897500659f0) on device 0 for resiliency context (comm=0x789750021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x78975006e4d0) on device 1 for resiliency context (comm=0x789750021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x7897500659f0) on device 1 for resiliency context (comm=0x789750021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for send communicator (comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (send comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x789750153058, qp_num=515) for resiliency context (comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x789750153428, qp_num=768) for resiliency context (comm=0x789750072000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for recv communicator (comm=0x704c9c021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (recv comm=0x704c9c021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x704c9c143bc8, qp_num=509) for resiliency context (comm=0x704c9c021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x789750180050) on device 0 for resiliency context (comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x7897500b69f0) on device 0 for resiliency context (comm=0x789750072000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x704c9c163068, qp_num=762) for resiliency context (comm=0x704c9c021000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x789750180510) on device 1 for resiliency context (comm=0x789750072000)
+css-host-158:244968:245117 [5] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x7897500b69f0) on device 1 for resiliency context (comm=0x789750072000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x704c9c067010) on device 0 for resiliency context (comm=0x704c9c021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x704c9c0675d0) on device 1 for resiliency context (comm=0x704c9c021000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for recv communicator (comm=0x704c9c06b000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (recv comm=0x704c9c06b000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x704c9c24d428, qp_num=516) for resiliency context (comm=0x704c9c06b000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x704c9c24d7f8, qp_num=769) for resiliency context (comm=0x704c9c06b000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x704c9c163960) on device 0 for resiliency context (comm=0x704c9c06b000)
+css-host-158:244967:245129 [4] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x704c9c182050) on device 1 for resiliency context (comm=0x704c9c06b000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for recv communicator (comm=0x7css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for send communicator (comm=0x735244021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (recv cocss-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (send comm=0x735244021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x735244143bc8, qp_nucss-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x7dd99406eab8, qp_num=409) for resiliency context (comm=0x735244021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x735244163068, qp_num=698) for resiliency context (comm=0x735244021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x7dd99412f058, qp_num=700) for resiliency context (comm=0x7dd994021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7dd9940207c0) on device 0 for resiliency context (comm=0x7dd994021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x7dd9940659f0) on device 0 for resiliency context (comm=0x7dd994021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7dd99406e010) on device 1 for resiliency context (comm=0x7dd994021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x7dd9940659f0) on device 1 for resiliency context (comm=0x7dd994021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x735244067010) on device 0 for resiliency context (comm=0x735244021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7352440675d0) on device 1 for resiliency context (comm=0x735244021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for send communicator (comm=0x7dd994156000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (send comm=0x7dd994156000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x7dd9940927b8, qp_num=414) for resiliency context (comm=0x7dd994156000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x7dd994092b88, qp_num=704) for resiliency context (comm=0x7dd994156000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for send communicator (comm=0x7css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for recv communicator (comm=0x770d58021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (recv comm=0x770d58021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (send comm=0x7ec24c021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x770d58143bc8, qp_num=413) for resiliency context (comm=0x770d58021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x7ec24c122418, qp_num=408) for resiliency context (comm=0x7ec24c021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x770d58163068, qp_num=666) for resiliency context (comm=0x770d58021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x7ec24c1227e8, qp_num=661) for resiliency context (comm=0x7ec24c021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7dd9940d16b0) on device 0 for resiliency context (comm=0x7dd994156000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for recv communicator (comm=0x73524406b000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (recv comm=0x73524406b000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x735244232bb8, qp_nucss-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x7dd99419a9f0m=416) for resiliency context (comm=0x73524406b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for recv communicator (comm=0x7b0018021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (recv comm=0x7b0018021000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x7b0018143bc8, qp_num=400) for resiliency context (comm=0x7b0018021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7ec24c06e010) on device 0 for resiliency context (comm=0x7ec24c021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x7ec24c0659f0) on device 0 for resiliency context (comm=0x7ec24c021000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7dd9940d1b70) on device 1 for resiliency context (comm=0x7dd994156000)
+css-host-158:244970:245126 [7] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x7dd99419a9f0) on device 1 for resiliency context (comm=0x7dd994156000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x7b0018163068, qp_num=671) for resiliency context (comm=0x7b0018021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x73524424a058, qp_num=706) for resiliency context (comm=0x73524406b000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7ec24c06e4d0) on device 1 for resiliency context (comm=0x7ec24c021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x7ec24c0659f0) on device 1 for resiliency context (comm=0x7ec24c021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x770d58067010) on device 0 for resiliency context (comm=0x770d58021000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x770d580675d0) on device 1 for resiliency context (comm=0x770d58021000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for send communicator (comm=0x7ec24c072000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (send comm=0x7ec24c072000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x7ec24c153058, qp_num=410) for resiliency context (comm=0x7ec24c072000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7b0018067010) on device 0 for resiliency context (comm=0x7b0018021000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7352440202b0) on device 0 for resiliency context (comm=0x73524406b000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x7ec24c153428, qp_num=663) for resiliency context (comm=0x7ec24c072000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for recv communicator (comm=0x770d5806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (recv comm=0x770d5806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x770d5824d428, qp_num=416) for resiliency context (comm=0x770d5806b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7b0018067570) on device 1 for resiliency context (comm=0x7b0018021000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for send communicator (comm=0x784a30072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (send comm=0x784a30072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x784a30180608, qp_num=405) for resiliency context (comm=0x784a30072000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7ec24c180050) on device 0 for resiliency context (comm=0x7ec24c072000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x7ec24c0b69f0) on device 0 for resiliency context (comm=0x7ec24c072000)
+css-host-158:244969:245119 [6] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7352441a9690) on device 1 for resiliency context (comm=0x73524406b000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x784a301809d8, qp_num=676) for resiliency context (comm=0x784a30072000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x770d5824d7f8, qp_num=669) for resiliency context (comm=0x770d5806b000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7ec24c180510) on device 1 for resiliency context (comm=0x7ec24c072000)
+css-host-158:244966:245121 [3] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x7ec24c0b69f0) on device 1 for resiliency context (comm=0x7ec24c072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x784a30020120) on device 0 for resiliency context (comm=0x784a30072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x784a300b69f0) on device 0 for resiliency context (comm=0x784a30072000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyClose: Resiliency context close for recv communicator (comm=0x7b001806b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying 2 probing QPs for resiliency context (recv comm=0x7b001806b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=0, qp=0x7b001824d428, qp_num=403) for resiliency context (comm=0x7b001806b000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x784a300718b0) on device 1 for resiliency context (comm=0x784a30072000)
+css-host-158:244964:245125 [1] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Deregistered probing results memory (0x784a300b69f0) on device 1 for resiliency context (comm=0x784a30072000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyClose: Destroying probing QP (index=1, qp=0x7b001824d7f8, qp_num=674) for resiliency context (comm=0x7b001806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x770d58163960) on device 0 for resiliency context (comm=0x770d5806b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7b00181638c0) on device 0 for resiliency context (comm=0x7b001806b000)
+css-host-158:244965:245122 [2] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x770d58182050) on device 1 for resiliency context (comm=0x770d5806b000)
+css-host-158:244963:245131 [0] NCCL INFO NET/IB: ncclIbResiliencyDevDestroy: Destroyed probing CQ (cq=0x7b0018163d80) on device 1 for resiliency context (comm=0x7b001806b000)
+css-host-158:244968:244997 [5] NCCL INFO ncclCommInitRankConfig comm 0x7897a40042b0 rank 4 nranks 14 cudaDev 5 nvmlDev 5 busId 8f000 commId 0xde3b8769f1d1ddbd - Init COMPLETE
+css-host-158:244964:245018 [1] NCCL INFO ncclCommInitRankConfig comm 0x784a80004320 rank 0 nranks 14 cudaDev 1 nvmlDev 1 busId 16000 commId 0xde3b8769f1d1ddbd - Init COMPLETE
+9000 commId 0xde3b8769f1d1ddbd - Init COMPLETE
+d000 commId 0xde3b8769f1d1ddbd - Init COMPLETE
+css-host-158:244967:245005 [4] NCCL INFO ncclCommInitRankConfig comm 0x704ce80042b0 rank 3 nranks 14 cudaDev 4 nvmlDev 4 busId 8css-host-158:244969:245012 [6] NCCL INFO ncclCommInitRankConfig comm 0x7352740042b0 rank 5 nranks 14 cudaDev 6 nvmlDev 6 busId ca000 commId 0xde3b8769f1d1ddbd - Init COMPLETE
+6000 commId 0xde3b8769f1d1ddbd - Init COMPLETE
+css-host-158:244970:245001 [7] NCCL INFO ncclCommInitRankConfig comm 0x7dd9e40042b0 rank 6 nranks 14 cudaDev 7 nvmlDev 7 busId ca000 commId 0xde3b8769f1d1ddbd - Init COMPLETE
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (send comm=0x789748020000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the send communicator (comm=0x789748020000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the send communicator (comm=0x789748020000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (send comm=0x789748071000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the send communicator (comm=0x789748071000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the send communicator (comm=0x789748071000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x789748020000) is conficss-host-158:244966:244994 [3] NCCL INFO Channel 06/0 : 2[3] -> 1[2] via P2P/CUMEM/read
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x789748020000) is configured with 2 probing QPs
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x789748020000) is configured with 0 recovery QPs
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 0 for send communicator (comm=0x789748020000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for send communicator (comm=0x789748020000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7897480649f0) on device 0 for resiliency context (comm=0x789748020000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (send comm=0x789748020000, cq_size=256)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x78974806d940) on device 0 for resiliency context (send comm=0x789748020000, cq_size=256)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 1 for send communicator (comm=0x789748020000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for send communicator (comm=0x789748020000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7897480649f0) on device 1 for resiliency context (comm=0x789748020000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (send comm=0x789748020000, cq_size=256)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x789748070010) on device 1 for resiliency context (send comm=0x789748020000, cq_size=256)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=4 devName=mlx5_4 ndevs=8 nmdevs=12 qp_num=517 pkey=0 pd=0x78974806d590 oooRq=0
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=5 devName=mlx5_5 ndevs=8 nmdevs=12 qp_num=770 pkey=0 pd=0x78974806dba0 oooRq=0
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (recv comm=0x704c90021000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the recv communicator (comm=0x704c90021000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the recv communicator (comm=0x704c90021000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be pre-posted
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x704c90021000) is configured with 2 local devices and 2 remote devices
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x704c90021000) is configured with 2 probing QPs
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x704c90021000) is configured with 0 recovery QPs
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbPortRecoveryInit: Port recovery disabled (recv comm=0x704c9006b000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyInit: Port recovery is disabled for the resiliency context on the recv communicator (comm=0x704c9006b000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency context was initialized on the recv communicator (comm=0x704c9006b000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be pre-posted
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x704c9006b000) is configured with 2 local devices and 2 remote devices
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x704c9006b000) is configured with 2 probing QPs
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x704c9006b000) is configured with 0 recovery QPs
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 10 IbDev 4 Port 1 qp_num 517 mtu 5 GID 3 (0/9E050A0AFFFF0000) ctsFifoRkey=0x1ff8b7 ctsFifoLkey=0x1ff8b7
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbConnect: IbDev 4 Port 1 qp_num 517 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 10 IbDev 5 Port 1 qp_num 770 mtu 5 GID 3 (0/9E060A0AFFFF0000) ctsFifoRkey=0x23b7b5 ctsFifoLkey=0x23b7b5
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbConnect: IbDev 5 Port 1 qp_num 770 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x789748071000) is configured with 2 local devices and 2 remote devices
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x789748071000) is configured with 2 probing QPs
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDeviceNumSet: Resiliency context (comm=0x789748071000) is configured with 0 recovery QPs
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 0 for send communicator (comm=0x789748071000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for send communicator (comm=0x789748071000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7897480b59f0) on device 0 for resiliency context (comm=0x789748071000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (send comm=0x789748071000, cq_size=256)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x78974817f680) on device 0 for resiliency context (send comm=0x789748071000, cq_size=256)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 1024 on device 1 for send communicator (comm=0x789748071000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for send communicator (comm=0x789748071000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Registered probing results memory (0x7897480b59f0) on device 1 for resiliency context (comm=0x789748071000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (send comm=0x789748071000, cq_size=256)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x78974817fb40) on device 1 for resiliency context (send comm=0x789748071000, cq_size=256)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=4 devName=mlx5_4 ndevs=8 nmdevs=12 qp_num=519 pkey=0 pd=0x78974806d590 oooRq=0
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=5 devName=mlx5_5 ndevs=8 nmdevs=12 qp_num=772 pkey=0 pd=0x78974806dba0 oooRq=0
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 0 for recv communicator (comm=0x704c90021000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 10 IbDev 4 Port 1 qp_num 519 mtu 5 GID 3 (0/9E050A0AFFFF0000) ctsFifoRkey=0x1821df ctsFifoLkey=0x1821df
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbConnect: IbDev 4 Port 1 qp_num 519 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbConnect: NCCL Dev 10 IbDev 5 Port 1 qp_num 772 mtu 5 GID 3 (0/9E060A0AFFFF0000) ctsFifoRkey=0x1bebe9 ctsFifoLkey=0x1bebe9
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbConnect: IbDev 5 Port 1 qp_num 772 query_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for recv communicator (comm=0x704c90021000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (recv comm=0x704c90021000, cq_size=1)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x704c90020a40) on device 0 for resiliency context (recv comm=0x704c90021000, cq_size=1)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 1 for recv communicator (comm=0x704c90021000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for recv communicator (comm=0x704c90021000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (recv comm=0x704c90021000, cq_size=1)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x704c90067010) on device 1 for resiliency context (recv comm=0x704c90021000, cq_size=1)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=4 devName=mlx5_4 ndevs=8 nmdevs=12 qp_num=521 pkey=0 pd=0x704c900206e0 oooRq=0
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=5 devName=mlx5_5 ndevs=8 nmdevs=12 qp_num=774 pkey=0 pd=0x704c90020ca0 oooRq=0
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=4 devName=mlx5_4 ndevs=8 nmdevs=12 qp_num=522 pkey=0 pd=0x704c900206e0
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x789748061000, addr=0x7bb87005ab30, rkey=0x1ffdbb)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x789748061000, addr=0x7bb87005ab30, rkey=0x23bdbb)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 4 Port 1 qp_num 517 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=5 devName=mlx5_5 ndevs=8 nmdevs=12 qp_num=775 pkey=0 pd=0x704c90020ca0
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 5 Port 1 qp_num 770 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=0, qp_num=518, dest_qp_num=523, deviceIndex=0, comm=0x789748020000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=1, qp_num=771, dest_qp_num=776, deviceIndex=1, comm=0x789748020000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=0, qp_num=523, dest_qp_num=518, deviceIndex=0, comm=0x704c90021000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=1, qp_num=776, dest_qp_num=771, deviceIndex=1, comm=0x704c90021000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=521, comm=0x704c90021000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=774, comm=0x704c90021000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 0 for recv communicator (comm=0x704c9006b000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 0 for recv communicator (comm=0x704c9006b000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 0 for resiliency context (recv comm=0x704c9006b000, cq_size=1)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x704c90182050) on device 0 for resiliency context (recv comm=0x704c9006b000, cq_size=1)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDataCqSizeGet: CQ size should be 2048 on device 1 for recv communicator (comm=0x704c9006b000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Initializing resiliency context on devIndex 1 for recv communicator (comm=0x704c9006b000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Creating probing CQ on device 1 for resiliency context (recv comm=0x704c9006b000, cq_size=1)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyDevInit: Created probing CQ (cq=0x704c90182510) on device 1 for resiliency context (recv comm=0x704c9006b000, cq_size=1)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=4 devName=mlx5_4 ndevs=8 nmdevs=12 qp_num=524 pkey=0 pd=0x704c900206e0 oooRq=0
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=5 devName=mlx5_5 ndevs=8 nmdevs=12 qp_num=777 pkey=0 pd=0x704c90020ca0 oooRq=0
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=4 devName=mlx5_4 ndevs=8 nmdevs=12 qp_num=525 pkey=0 pd=0x704c900206e0
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x7897480b2000, addr=0x7bb8701bcb30, rkey=0x1fefad)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencyRemoteCompletionRecordsSet: Set remote completion records info (comm=0x7897480b2000, addr=0x7bb8701bcb30, rkey=0x23b0ae)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 4 Port 1 qp_num 519 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=5 devName=mlx5_5 ndevs=8 nmdevs=12 qp_num=778 pkey=0 pd=0x704c90020ca0
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 5 Port 1 qp_num 772 set_ece={supported=1, vendor_id=0x15b3, options=0x30000003, comp_mask=0x0}
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=0, qp_num=520, dest_qp_num=526, deviceIndex=0, comm=0x789748071000)
+css-host-158:244968:245389 [5] NCCL INFO NET/IB: ncclIbResiliencySenderQpsToRts: Send to RTS done on probing QP (index=1, qp_num=773, dest_qp_num=779, deviceIndex=1, comm=0x789748071000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=0, qp_num=526, dest_qp_num=522, deviceIndex=0, comm=0x704c9006b000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbResiliencyReceiverQpsCreateToRts: Recv to RTS done on probing QP (index=1, qp_num=779, dest_qp_num=774, deviceIndex=1, comm=0x704c9006b000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=524, comm=0x704c9006b000)
+css-host-158:244967:245388 [4] NCCL INFO NET/IB: ncclIbPostReceiveWorkRequestsOnQp: Pre-posting 512 Receive WQEs on QP (qp_num=777, comm=0x704c9006b000)
