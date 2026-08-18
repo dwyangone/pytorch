@@ -345,6 +345,7 @@ extern "C" void nccl_ft_global_fault_callback(int dev_idx) {
 extern "C" {
     // 宣告我們在 NCCL src/init.cc 中新增的黑名單 API
     ncclResult_t ncclCommBanNic(int dev_idx);
+    void nccl_ft_reset_ib_cache();
 }
 /* ========================================================================= */
 
@@ -4050,8 +4051,9 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm() {
 
     // 1. Generate or retrieve the NCCL Unique ID for this specific node
     ncclUniqueId localId;
-    std::string local_id_key = "NCCL_FT_LOCAL_COMM_ID_NODE_" + std::to_string(node_id) 
-                               + "_PG_" + std::to_string(this->getUid());
+std::string local_id_key = "NCCL_FT_LOCAL_COMM_ID_NODE_" + std::to_string(node_id) 
+                               + "_PG_" + std::to_string(this->getUid())
+                               + "_ROUND_" + std::to_string(this->ft_round_);
 
     if (local_rank == 0) {
         // 本機的 GPU 0 負責產生這台機器的專屬 ID
@@ -4229,20 +4231,42 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 
     /* ===================================================================== */
     /* --- [NCCL-FT: 執行對稱物理黑名單遮蔽] --- */
-    // All ranks (faulty and healthy alike) ban the same NIC indices so that
-    // NCCL topology discovery is symmetric.  The ban call is collective in
-    // effect: every rank excludes the same device set before NCCLFTComm::create.
-    //
-    // NOTE: healthy ranks must NOT call ncclCommBanNic a second time inside the
-    // if (!is_faulty) block below — that would be a duplicate call.  The loop
-    // here is sufficient for all roles.
     for (int d : faulty_devs) {
         LOG(INFO) << logPrefix() << "[NCCL-FT] 呼叫底層 API ncclCommBanNic，將 NIC " << d << " 徹底遮蔽";
         ncclCommBanNic(d);
     }
     /* ===================================================================== */
 
-    // 刪除原本的 NCCLFTComm::split，改為以下全新建立的邏輯：
+    // 1. 為了確保驅動鎖被釋放，讓「所有 Rank (包含 Faulty)」都進行排空等待
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+    // 2. 銷毀舊的、有毒的 NVLink comm
+    if (this->local_nvlink_comm_ && !this->local_nvlink_comm_->isAborted()) {
+        this->local_nvlink_comm_->abort("FT Recovery - Aborting dead nvlink comm");
+    }
+    this->local_nvlink_comm_.reset();
+
+    // 3. 動態組合硬性黑名單環境變數 (Hard-Ban)
+    std::string hca_ban_str = "";
+    for (int d : faulty_devs) {
+        // "^" 在 NCCL_IB_HCA 中代表「排除」
+        hca_ban_str += "^mlx5_" + std::to_string(d) + ",";
+    }
+    if (!hca_ban_str.empty()) {
+        hca_ban_str.pop_back(); // 移除最後一個逗號
+        // 將環境變數設為 ^mlx5_0，強制 IB 驅動無視這張網卡！
+        setenv("NCCL_IB_HCA", hca_ban_str.c_str(), 1); 
+        LOG(INFO) << logPrefix() << "[NCCL-FT] 已動態設定環境變數 NCCL_IB_HCA=" << hca_ban_str;
+    }
+
+    // 4. 強制重置 IB 快取，讓上面的環境變數立刻生效！
+    nccl_ft_reset_ib_cache();
+    LOG(INFO) << logPrefix() << "[NCCL-FT] IB 驅動快取已重置，準備重建 Local NVLink Comm...";
+
+    // 5. 所有 Rank (包含 Faulty) 重建全新的、無毒的 NVLink comm
+    initLocalNvlinkComm();
+
+    // 6. 重建 Proxy Global Comm (只有健康節點參與)
     if (!is_faulty) {
         // 重新分配一個 Unique ID 給新的降級群組
         ncclUniqueId proxyId;
@@ -4262,11 +4286,6 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         }
 
         // N-to-N all-ready barrier：確保所有健康 rank 都已到達此處再進入
-        // ncclCommInitRankConfig，避免先到的 rank 在 bootstrap 中永久等待。
-        //
-        // 每個健康 rank 寫自己的 ready key，然後 wait 所有其他健康 rank 的 key。
-        // 故障 rank 不參與（它們的 local_rank 在 faulty_devs 中），因此只收集
-        // global rank 不在故障集合內的那些 rank。
         {
             std::string my_ready_key = "NCCL_FT_PROXY_READY_" +
                 std::to_string(ft_round_) + "_" + std::to_string(rank_);
@@ -4288,14 +4307,8 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 
         LOG(INFO) << logPrefix() << "[NCCL-FT] 建立全新的 proxy_global_comm_ (Size="
                   << proxy_comm_size_ << " Rank=" << proxy_comm_rank_ << ")";
-        
-        // 讓側車執行緒在這裡死等或 Sleep 500ms ~ 1s
-        // 這段時間是為了讓出 CPU，讓 NCCL 背景的 Progress Thread 有充裕的時間
-        // 把核心空間的 ibv_destroy_qp 徹底做完並釋放 Mellanox 驅動鎖！
-        //add sleep before create to prevent block from nccl
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));          
+
         // 從頭建立全新的降級群組 (Re-Init)
-        // 此時 NCCL 底層的 ncclTopoGetSystem 會掃描網卡，但會因為前面的 ncclCommBanNic 而跳過壞卡！
         proxy_global_comm_ = NCCLFTComm::create(proxy_comm_size_, proxy_comm_rank_, proxyId, device.index(), config);
         
         LOG(INFO) << logPrefix() << "[NCCL-FT] proxy_global_comm_ ready!";
