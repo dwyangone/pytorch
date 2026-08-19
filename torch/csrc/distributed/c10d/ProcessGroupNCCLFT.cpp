@@ -4751,8 +4751,32 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
             output.div_(static_cast<double>(size_));
             at::cuda::setCurrentCUDAStream(prev_stream);
         }
+
+        // [P0 fix] Synchronise on the stream so that any IB/transport error
+        // surfaced by NCCL's progress thread (e.g. ibv_modify_qp on a dead
+        // NIC) is promoted to a C++ exception here, inside this call frame.
+        // Without this sync the AllReduce enqueue returns ncclSuccess even
+        // when the underlying QP setup fails asynchronously; the side-car
+        // never sees an error and this rank never enters rebuild attempt=N,
+        // causing the pre-rebuild global barrier to deadlock.
+        cudaError_t cuda_err = cudaStreamSynchronize(stream.stream());
+        if (cuda_err != cudaSuccess) {
+            throw ::c10::Error(
+                {__func__, __FILE__, static_cast<uint32_t>(__LINE__)},
+                std::string("[NCCL-FT][HEALTHY] cudaStreamSynchronize failed: ") +
+                    cudaGetErrorString(cuda_err));
+        }
+        ncclResult_t async_err = ncclSuccess;
+        ncclCommGetAsyncError(proxy_comm, &async_err);
+        if (async_err != ncclSuccess) {
+            std::string err = "NCCL error in: " + std::string(__FILE__) + ":" +
+                std::to_string(__LINE__) + ", " + ncclGetErrorWithVersion(async_err) +
+                "\n" + getNcclErrorDetailStr(async_err, std::nullopt);
+            throw ::c10::NCCLFaultToleranceError(
+                {__func__, __FILE__, static_cast<uint32_t>(__LINE__)}, err);
+        }
         LOG(INFO) << logPrefix()
-                  << "[NCCL-FT][HEALTHY] ncclAllReduce enqueued on proxy_global_comm_.";
+                  << "[NCCL-FT][HEALTHY] ncclAllReduce completed on proxy_global_comm_.";
     }
 }
 
