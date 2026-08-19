@@ -36,7 +36,8 @@ export NCCL_ROOT=/home/twyang/nccl/build
 export NCCL_INCLUDE_DIR=/home/twyang/nccl/build/include
 export NCCL_LIB_DIR=/home/twyang/nccl/build/lib
 #export NCCL_LIBRARY=/home/twyang/nccl/build/lib/libnccl.so
-
+export USE_XPU=0
+export USE_SYCL=0
 # === 5. 功能開關 (A100 優化) ===
 export USE_ROCM=0
 export USE_CUDA=1

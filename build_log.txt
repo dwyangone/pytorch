@@ -1,0 +1,878 @@
+Starting PyTorch compilation with FIXED include paths...
+Using pip 25.3 from /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages/pip (python 3.11)
+Obtaining file:///home/twyang/pytorch
+  Checking if build backend supports build_editable: started
+  Running command Checking if build backend supports build_editable
+  Checking if build backend supports build_editable: finished with status 'done'
+  Preparing editable metadata (pyproject.toml): started
+  Running command Preparing editable metadata (pyproject.toml)
+  Building wheel torch-2.13.0a0+git64f4408
+  Found cmake (/home/twyang/miniconda3/envs/pytorch_build/bin/cmake) version: 4.2.1 (>=3.27)
+  /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages/setuptools/dist.py:484: SetuptoolsDeprecationWarning: Cannot find any files for the given pattern.
+  !!
+
+          ********************************************************************************
+          Pattern 'third_party/**/COPYING.BSD' did not match any files.
+
+          This deprecation is overdue, please update your project and remove deprecated
+          calls to avoid build errors in the future.
+          ********************************************************************************
+
+  !!
+    for path in sorted(cls._find_pattern(pattern, enforce_match))
+  running dist_info
+  creating /tmp/pip-modern-metadata-uy7bbzus/torch.egg-info
+  writing /tmp/pip-modern-metadata-uy7bbzus/torch.egg-info/PKG-INFO
+  writing dependency_links to /tmp/pip-modern-metadata-uy7bbzus/torch.egg-info/dependency_links.txt
+  writing entry points to /tmp/pip-modern-metadata-uy7bbzus/torch.egg-info/entry_points.txt
+  writing requirements to /tmp/pip-modern-metadata-uy7bbzus/torch.egg-info/requires.txt
+  writing top-level names to /tmp/pip-modern-metadata-uy7bbzus/torch.egg-info/top_level.txt
+  writing manifest file '/tmp/pip-modern-metadata-uy7bbzus/torch.egg-info/SOURCES.txt'
+  reading manifest file '/tmp/pip-modern-metadata-uy7bbzus/torch.egg-info/SOURCES.txt'
+  reading manifest template 'MANIFEST.in'
+  warning: no directories found matching 'ios'
+  no previously-included directories found matching 'third_party/nccl/pkg/debian'
+  no previously-included directories found matching 'third_party/opentelemetry-cpp/third_party/prometheus-cpp/cmake/project-import-*'
+  no previously-included directories found matching 'torchgen/packaged'
+  no previously-included directories found matching '**/.gitlab'
+  warning: no previously-included files matching '*.o' found anywhere in distribution
+  warning: no previously-included files matching '*.obj' found anywhere in distribution
+  warning: no previously-included files matching '*.so' found anywhere in distribution
+  warning: no previously-included files matching '*.dylib' found anywhere in distribution
+  warning: no previously-included files matching '*.a' found anywhere in distribution
+  warning: no previously-included files matching '*.swp' found anywhere in distribution
+  warning: no previously-included files matching '*~' found anywhere in distribution
+  adding license file 'LICENSE'
+  adding license file 'third_party/FP16/LICENSE'
+  adding license file 'third_party/FXdiv/LICENSE'
+  adding license file 'third_party/NNPACK/LICENSE'
+  adding license file 'third_party/XNNPACK/LICENSE'
+  adding license file 'third_party/aiter/3rdparty/composable_kernel/LICENSE'
+  adding license file 'third_party/aiter/LICENSE'
+  adding license file 'third_party/benchmark/LICENSE'
+  adding license file 'third_party/composable_kernel/LICENSE'
+  adding license file 'third_party/cpp-httplib/LICENSE'
+  adding license file 'third_party/cpuinfo/LICENSE'
+  adding license file 'third_party/cpuinfo/deps/clog/LICENSE'
+  adding license file 'third_party/fbgemm/LICENSE'
+  adding license file 'third_party/fbgemm/external/composable_kernel/LICENSE'
+  adding license file 'third_party/fbgemm/external/cpuinfo/LICENSE'
+  adding license file 'third_party/fbgemm/external/cpuinfo/deps/clog/LICENSE'
+  adding license file 'third_party/fbgemm/external/googletest/LICENSE'
+  adding license file 'third_party/fbgemm/fbgemm_gpu/experimental/hstu/LICENSE'
+  adding license file 'third_party/fbgemm/fbgemm_gpu/src/quantize_ops/mx/LICENSE'
+  adding license file 'third_party/fbgemm/fbgemm_gpu/test/quantize/mx/LICENSE'
+  adding license file 'third_party/flash-attention/LICENSE'
+  adding license file 'third_party/flash-attention/csrc/composable_kernel/LICENSE'
+  adding license file 'third_party/flash-attention/flash_attn/cute/LICENSE'
+  adding license file 'third_party/flash-attention/third_party/aiter/3rdparty/composable_kernel/LICENSE'
+  adding license file 'third_party/flash-attention/third_party/aiter/LICENSE'
+  adding license file 'third_party/flatbuffers/LICENSE'
+  adding license file 'third_party/flatbuffers/dart/LICENSE'
+  adding license file 'third_party/flatbuffers/swift/LICENSE'
+  adding license file 'third_party/fmt/LICENSE'
+  adding license file 'third_party/gemmlowp/gemmlowp/LICENSE'
+  adding license file 'third_party/gloo/LICENSE'
+  adding license file 'third_party/googletest/LICENSE'
+  adding license file 'third_party/ideep/LICENSE'
+  adding license file 'third_party/ideep/mkl-dnn/LICENSE'
+  adding license file 'third_party/ideep/mkl-dnn/third_party/gtest/LICENSE'
+  adding license file 'third_party/ideep/mkl-dnn/third_party/opencl/LICENSE'
+  adding license file 'third_party/kineto/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/DCGM/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/cpr/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/cpr/test/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/googletest/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/json/third_party/cpplint/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/pfs/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/prometheus-cpp/3rdparty/civetweb/examples/rest/cJSON/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/prometheus-cpp/3rdparty/googletest/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/prometheus-cpp/3rdparty/googletest/googlemock/scripts/generator/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/prometheus-cpp/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/fmt/LICENSE'
+  adding license file 'third_party/kineto/libkineto/third_party/googletest/LICENSE'
+  adding license file 'third_party/mimalloc/LICENSE'
+  adding license file 'third_party/miniz-3.0.2/LICENSE'
+  adding license file 'third_party/mslk/LICENSE'
+  adding license file 'third_party/mslk/external/composable_kernel/LICENSE'
+  adding license file 'third_party/mslk/external/googletest/LICENSE'
+  adding license file 'third_party/mslk/mslk/attention/flash_attn/LICENSE'
+  adding license file 'third_party/onnx/LICENSE'
+  adding license file 'third_party/onnx/third_party/pybind11/LICENSE'
+  adding license file 'third_party/protobuf/LICENSE'
+  adding license file 'third_party/protobuf/third_party/benchmark/LICENSE'
+  adding license file 'third_party/protobuf/third_party/googletest/LICENSE'
+  adding license file 'third_party/protobuf/third_party/googletest/googlemock/LICENSE'
+  adding license file 'third_party/protobuf/third_party/googletest/googlemock/scripts/generator/LICENSE'
+  adding license file 'third_party/protobuf/third_party/googletest/googletest/LICENSE'
+  adding license file 'third_party/psimd/LICENSE'
+  adding license file 'third_party/pthreadpool/LICENSE'
+  adding license file 'third_party/pybind11/LICENSE'
+  adding license file 'third_party/tensorpipe/third_party/googletest/LICENSE'
+  adding license file 'third_party/tensorpipe/third_party/googletest/googlemock/LICENSE'
+  adding license file 'third_party/tensorpipe/third_party/googletest/googlemock/scripts/generator/LICENSE'
+  adding license file 'third_party/tensorpipe/third_party/googletest/googletest/LICENSE'
+  adding license file 'third_party/tensorpipe/third_party/libnop/LICENSE'
+  adding license file 'third_party/tensorpipe/third_party/libuv/LICENSE'
+  adding license file 'third_party/tensorpipe/third_party/pybind11/LICENSE'
+  adding license file 'third_party/torch-xpu-ops/LICENSE'
+  adding license file 'third_party/NVTX/LICENSE.txt'
+  adding license file 'third_party/NVTX/docs/LICENSE.txt'
+  adding license file 'third_party/NVTX/python/LICENSE.txt'
+  adding license file 'third_party/VulkanMemoryAllocator/LICENSE.txt'
+  adding license file 'third_party/cudnn_frontend/LICENSE.txt'
+  adding license file 'third_party/cutlass/LICENSE.txt'
+  adding license file 'third_party/cutlass/python/LICENSE.txt'
+  adding license file 'third_party/fbgemm/external/cutlass/LICENSE.txt'
+  adding license file 'third_party/fbgemm/external/cutlass/python/LICENSE.txt'
+  adding license file 'third_party/fbgemm/external/hipify_torch/LICENSE.txt'
+  adding license file 'third_party/flash-attention/csrc/cutlass/LICENSE.txt'
+  adding license file 'third_party/flash-attention/csrc/cutlass/python/LICENSE.txt'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/DCGM/testing/python3/libs_3rdparty/colorama/LICENSE.txt'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/json/test/thirdparty/doctest/LICENSE.txt'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/prometheus-cpp/3rdparty/civetweb/src/third_party/duktape-1.5.2/LICENSE.txt'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/prometheus-cpp/3rdparty/civetweb/src/third_party/duktape-1.8.0/LICENSE.txt'
+  adding license file 'third_party/llvm-openmp/LICENSE.txt'
+  adding license file 'third_party/mslk/external/cutlass/LICENSE.txt'
+  adding license file 'third_party/mslk/external/cutlass/python/LICENSE.txt'
+  adding license file 'third_party/mslk/external/hipify_torch/LICENSE.txt'
+  adding license file 'third_party/sleef/LICENSE.txt'
+  adding license file 'third_party/tensorpipe/LICENSE.txt'
+  adding license file 'third_party/kineto/libkineto/third_party/dynolog/third_party/fmt/LICENSE.rst'
+  adding license file 'third_party/python-peachpy/LICENSE.rst'
+  writing manifest file '/tmp/pip-modern-metadata-uy7bbzus/torch.egg-info/SOURCES.txt'
+  creating '/tmp/pip-modern-metadata-uy7bbzus/torch-2.13.0a0+git64f4408.dist-info'
+  Preparing editable metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: filelock in /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages (from torch==2.13.0a0+git64f4408) (3.20.2)
+Requirement already satisfied: typing-extensions>=4.10.0 in /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages (from torch==2.13.0a0+git64f4408) (4.15.0)
+Requirement already satisfied: setuptools<82 in /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages (from torch==2.13.0a0+git64f4408) (79.0.1)
+Requirement already satisfied: sympy>=1.13.3 in /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages (from torch==2.13.0a0+git64f4408) (1.14.0)
+Requirement already satisfied: networkx>=2.5.1 in /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages (from torch==2.13.0a0+git64f4408) (3.6.1)
+Requirement already satisfied: jinja2 in /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages (from torch==2.13.0a0+git64f4408) (3.1.6)
+Requirement already satisfied: fsspec>=0.8.5 in /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages (from torch==2.13.0a0+git64f4408) (2026.1.0)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages (from sympy>=1.13.3->torch==2.13.0a0+git64f4408) (1.3.0)
+Requirement already satisfied: MarkupSafe>=2.0 in /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages (from jinja2->torch==2.13.0a0+git64f4408) (3.0.3)
+Building wheels for collected packages: torch
+  Building editable for torch (pyproject.toml): started
+  Running command Building editable for torch (pyproject.toml)
+  Building wheel torch-2.13.0a0+git64f4408
+  Found cmake (/home/twyang/miniconda3/envs/pytorch_build/bin/cmake) version: 4.2.1 (>=3.27)
+  -- Building version 2.13.0a0+git64f4408
+  cmake -GNinja -DBUILD_PYTHON=True -DBUILD_TEST=True -DCMAKE_INSTALL_PREFIX=/home/twyang/pytorch/torch -DPython_EXECUTABLE=/home/twyang/miniconda3/envs/pytorch_build/bin/python -DPython_NumPy_INCLUDE_DIR=/home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages/numpy/_core/include -DTORCH_BUILD_VERSION=2.13.0a0+git64f4408 -DUSE_NUMPY=True /home/twyang/pytorch
+  CMake Deprecation Warning at CMakeLists.txt:3 (cmake_policy):
+    The OLD behavior for policy CMP0126 will be removed from a future version
+    of CMake.
+
+    The cmake-policies(7) manual explains that the OLD behaviors of all
+    policies are deprecated and that a policy should be set to OLD only under
+    specific short-term circumstances.  Projects should be ported to the NEW
+    behavior and not rely on setting a policy to OLD.
+
+
+  -- Found Python: /home/twyang/miniconda3/envs/pytorch_build/bin/python (found version "3.11.6") found components: Interpreter
+  -- Current compiler supports avx2 extension. Will build perfkernels.
+  -- No SVE support on this machine.
+  -- Compiler does not support SVE extension. Will not build perfkernels.
+  -- PyTorch: CUDA detected: 12.8
+  -- PyTorch: CUDA nvcc is: /home/twyang/miniconda3/envs/pytorch_build/bin/nvcc
+  -- PyTorch: CUDA toolkit directory: /home/twyang/miniconda3/envs/pytorch_build
+  -- PyTorch: Header version is: 12.8
+  -- /home/twyang/miniconda3/envs/pytorch_build/lib/libnvrtc.so shorthash is 6c9e40f1
+  -- USE_CUSPARSELT is set to 0. Compiling without cuSPARSELt support
+  -- Could NOT find CUDSS (missing: CUDSS_LIBRARY_PATH CUDSS_INCLUDE_PATH)
+  CMake Warning at cmake/public/cuda.cmake:243 (message):
+    Cannot find CUDSS library.  Turning the option off
+  Call Stack (most recent call first):
+    cmake/Dependencies.cmake:44 (include)
+    CMakeLists.txt:945 (include)
+
+
+  CMake Warning at cmake/public/cuda.cmake:332 (message):
+    pytorch is not compatible with `CMAKE_CUDA_ARCHITECTURES` and will ignore
+    its value.  Please configure `TORCH_CUDA_ARCH_LIST` instead.
+  Call Stack (most recent call first):
+    cmake/Dependencies.cmake:44 (include)
+    CMakeLists.txt:945 (include)
+
+
+  -- Added CUDA NVCC flags for: -gencode;arch=compute_80,code=sm_80
+  CMake Warning (dev) at /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages/cmake/data/share/cmake-4.2/Modules/FindPackageHandleStandardArgs.cmake:493 (message):
+    The package name passed to find_package_handle_standard_args() (SYCL) does
+    not match the name of the calling package (SYCLToolkit).  This can lead to
+    problems in calling code that expects find_package() result variables
+    (e.g., `_FOUND`) to follow a certain pattern.
+  Call Stack (most recent call first):
+    cmake/Modules/FindSYCLToolkit.cmake:168 (find_package_handle_standard_args)
+    cmake/public/xpu.cmake:26 (find_package)
+    cmake/Dependencies.cmake:99 (include)
+    CMakeLists.txt:945 (include)
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+  -- Found SYCL: /opt/intel/oneapi/compiler/latest/include;/opt/intel/oneapi/compiler/latest/include/sycl (found version "20260101")
+  -- Building using own protobuf under third_party per request.
+  -- Use custom protobuf build.
+  CMake Warning at cmake/ProtoBuf.cmake:37 (message):
+    Ancient protobuf forces CMake compatibility
+  Call Stack (most recent call first):
+    cmake/ProtoBuf.cmake:87 (custom_protobuf_find)
+    cmake/Dependencies.cmake:113 (include)
+    CMakeLists.txt:945 (include)
+
+
+  CMake Deprecation Warning at third_party/protobuf/cmake/CMakeLists.txt:2 (cmake_minimum_required):
+    Compatibility with CMake < 3.10 will be removed from a future version of
+    CMake.
+
+    Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+    to tell CMake that the project requires at least <min> but has been updated
+    to work with policies introduced by <max> or earlier.
+
+
+  --
+  -- 3.13.0.0
+  -- Caffe2 protobuf include directory: $<BUILD_INTERFACE:/home/twyang/pytorch/third_party/protobuf/src>$<INSTALL_INTERFACE:include>
+  -- Trying to find preferred BLAS backend of choice: MKL
+  -- MKL_THREADING = OMP
+  CMake Warning (dev) at /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages/cmake/data/share/cmake-4.2/Modules/FindPackageHandleStandardArgs.cmake:493 (message):
+    The package name passed to find_package_handle_standard_args() (OpenMP_C)
+    does not match the name of the calling package (OpenMP).  This can lead to
+    problems in calling code that expects find_package() result variables
+    (e.g., `_FOUND`) to follow a certain pattern.
+  Call Stack (most recent call first):
+    cmake/Modules/FindOpenMP.cmake:635 (find_package_handle_standard_args)
+    cmake/Modules/FindMKL.cmake:283 (FIND_PACKAGE)
+    cmake/Modules/FindMKL.cmake:385 (CHECK_ALL_LIBRARIES)
+    cmake/Dependencies.cmake:215 (find_package)
+    CMakeLists.txt:945 (include)
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+  CMake Warning (dev) at /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages/cmake/data/share/cmake-4.2/Modules/FindPackageHandleStandardArgs.cmake:493 (message):
+    The package name passed to find_package_handle_standard_args() (OpenMP_CXX)
+    does not match the name of the calling package (OpenMP).  This can lead to
+    problems in calling code that expects find_package() result variables
+    (e.g., `_FOUND`) to follow a certain pattern.
+  Call Stack (most recent call first):
+    cmake/Modules/FindOpenMP.cmake:635 (find_package_handle_standard_args)
+    cmake/Modules/FindMKL.cmake:283 (FIND_PACKAGE)
+    cmake/Modules/FindMKL.cmake:385 (CHECK_ALL_LIBRARIES)
+    cmake/Dependencies.cmake:215 (find_package)
+    CMakeLists.txt:945 (include)
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+  -- MKL libraries: /home/twyang/miniconda3/envs/pytorch_build/lib/libmkl_intel_lp64.a;/home/twyang/miniconda3/envs/pytorch_build/lib/libmkl_gnu_thread.a;/home/twyang/miniconda3/envs/pytorch_build/lib/libmkl_core.a;-fopenmp;/home/twyang/miniconda3/envs/pytorch_build/x86_64-conda-linux-gnu/sysroot/usr/lib/libpthread.a;/home/twyang/miniconda3/envs/pytorch_build/x86_64-conda-linux-gnu/sysroot/usr/lib/libm.so;/home/twyang/miniconda3/envs/pytorch_build/x86_64-conda-linux-gnu/sysroot/usr/lib/libdl.a
+  -- MKL include directory: /home/twyang/miniconda3/envs/pytorch_build/include
+  -- MKL OpenMP type: GNU
+  -- MKL OpenMP library: -fopenmp
+  CMake Deprecation Warning at third_party/pthreadpool/CMakeLists.txt:10 (CMAKE_MINIMUM_REQUIRED):
+    Compatibility with CMake < 3.10 will be removed from a future version of
+    CMake.
+
+    Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+    to tell CMake that the project requires at least <min> but has been updated
+    to work with policies introduced by <max> or earlier.
+
+
+  -- Using ccache: /home/twyang/miniconda3/envs/pytorch_build/bin/ccache
+  CMake Deprecation Warning at third_party/FXdiv/CMakeLists.txt:1 (CMAKE_MINIMUM_REQUIRED):
+    Compatibility with CMake < 3.10 will be removed from a future version of
+    CMake.
+
+    Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+    to tell CMake that the project requires at least <min> but has been updated
+    to work with policies introduced by <max> or earlier.
+
+
+  CMake Warning at aten/src/ATen/native/quantized/cpu/qnnpack/CMakeLists.txt:399 (message):
+    Ancient psimd/FP16 forces CMake compatibility
+
+
+  CMake Deprecation Warning at third_party/psimd/CMakeLists.txt:1 (CMAKE_MINIMUM_REQUIRED):
+    Compatibility with CMake < 3.10 will be removed from a future version of
+    CMake.
+
+    Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+    to tell CMake that the project requires at least <min> but has been updated
+    to work with policies introduced by <max> or earlier.
+
+
+  CMake Deprecation Warning at third_party/FP16/CMakeLists.txt:1 (CMAKE_MINIMUM_REQUIRED):
+    Compatibility with CMake < 3.10 will be removed from a future version of
+    CMake.
+
+    Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+    to tell CMake that the project requires at least <min> but has been updated
+    to work with policies introduced by <max> or earlier.
+
+
+  -- Brace yourself, we are building NNPACK
+  CMake Warning at cmake/External/nnpack.cmake:66 (message):
+    Ancient nnpack forces CMake compatibility
+  Call Stack (most recent call first):
+    cmake/Dependencies.cmake:519 (include)
+    CMakeLists.txt:945 (include)
+
+
+  CMake Deprecation Warning at third_party/NNPACK/CMakeLists.txt:1 (CMAKE_MINIMUM_REQUIRED):
+    Compatibility with CMake < 3.10 will be removed from a future version of
+    CMake.
+
+    Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+    to tell CMake that the project requires at least <min> but has been updated
+    to work with policies introduced by <max> or earlier.
+
+
+  CMake Warning (dev) at third_party/NNPACK/CMakeLists.txt:110 (FIND_PACKAGE):
+    Policy CMP0148 is not set: The FindPythonInterp and FindPythonLibs modules
+    are removed.  Run "cmake --help-policy CMP0148" for policy details.  Use
+    the cmake_policy command to set the policy and suppress this warning.
+
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+  -- NNPACK backend is x86-64
+  -- Using ccache: /home/twyang/miniconda3/envs/pytorch_build/bin/ccache
+  -- Building for XNNPACK_TARGET_PROCESSOR: x86_64
+  -- Generating microkernels.cmake
+  No microkernel found in src/reference/binary-elementwise.cc
+  No microkernel found in src/reference/unary-elementwise.cc
+  No microkernel found in src/reference/packing.cc
+  Duplicate microkernel definition: src/qs8-qc4w-packw/gen/qs8-qc4w-packw-x8c8-gemm-goi-avxvnni.c and src/qs8-qc4w-packw/gen/qs8-qc4w-packw-x8c8-gemm-goi-scalar.c
+  Duplicate microkernel definition: src/qs8-qc4w-packw/gen/qs8-qc4w-packw-x8c8-gemm-goi-avxvnni.c and src/qs8-qc4w-packw/gen/qs8-qc4w-packw-x8c8-gemm-goi-avx256vnni.c (1th function)
+  -- Failed to find LLVM FileCheck
+  -- Google Benchmark version: v1.9.3, normalized to 1.9.3
+  -- Performing Test HAVE_STD_REGEX -- success
+  -- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile
+  -- Performing Test HAVE_POSIX_REGEX -- success
+  -- Performing Test HAVE_STEADY_CLOCK -- success
+  -- Performing Test HAVE_PTHREAD_AFFINITY -- success
+
+
+  ================================================================================
+  Default C++ compiler flags
+  (values may be overridden by CMAKE_CXX_STANDARD and CXX_STANDARD):
+
+  CMAKE_CXX_FLAGS: -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/twyang/miniconda3/envs/pytorch_build/include  -I/home/twyang/miniconda3/envs/pytorch_build/targets/x86_64-linux/include -fvisibility-inlines-hidden -DUSE_PTHREADPOOL
+
+  CMAKE_CXX_FLAGS_DEBUG: -g
+
+  CMAKE_CXX_FLAGS_RELEASE: -O3 -DNDEBUG
+  ================================================================================
+
+  -- CXX_AVX_FLAGS: -mavx
+  -- CXX_AVX2_FLAGS: -mavx2 -mfma -mf16c
+  -- CXX_AVX512_FLAGS: -mavx512f -mavx512dq -mavx512vl -mavx512bw -mfma
+  CMake Warning (dev) at /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages/cmake/data/share/cmake-4.2/Modules/FindPackageHandleStandardArgs.cmake:493 (message):
+    The package name passed to find_package_handle_standard_args() (OpenMP_C)
+    does not match the name of the calling package (OpenMP).  This can lead to
+    problems in calling code that expects find_package() result variables
+    (e.g., `_FOUND`) to follow a certain pattern.
+  Call Stack (most recent call first):
+    cmake/Modules/FindOpenMP.cmake:635 (find_package_handle_standard_args)
+    third_party/fbgemm/CMakeLists.txt:139 (find_package)
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+  -- Found OpenMP_C: -fopenmp
+  CMake Warning (dev) at /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages/cmake/data/share/cmake-4.2/Modules/FindPackageHandleStandardArgs.cmake:493 (message):
+    The package name passed to find_package_handle_standard_args() (OpenMP_CXX)
+    does not match the name of the calling package (OpenMP).  This can lead to
+    problems in calling code that expects find_package() result variables
+    (e.g., `_FOUND`) to follow a certain pattern.
+  Call Stack (most recent call first):
+    cmake/Modules/FindOpenMP.cmake:635 (find_package_handle_standard_args)
+    third_party/fbgemm/CMakeLists.txt:139 (find_package)
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+  -- Found OpenMP_CXX: -fopenmp
+  -- OpenMP found: OpenMP_C_INCLUDE_DIRS =
+
+
+  ================================================================================
+  CPP Library Target: fbgemm_generic (OBJECT)
+
+  SRCS:
+  src/EmbeddingSpMDM.cc
+  src/EmbeddingSpMDMNBit.cc
+  src/ExecuteKernel.cc
+  src/ExecuteKernelU8S8.cc
+  src/Fbgemm.cc
+  src/FbgemmBfloat16Convert.cc
+  src/FbgemmConv.cc
+  src/FbgemmFPCommon.cc
+  src/FbgemmFP16.cc
+  src/FbgemmFloat16Convert.cc
+  src/FbgemmI64.cc
+  src/FbgemmSparseDense.cc
+  src/FbgemmI8Spmdm.cc
+  src/FbgemmPackMatrixB.cc
+  src/GenerateKernelDirectConvU8S8S32ACC32.cc
+  src/GenerateKernel.cc
+  src/GenerateKernelU8S8S32ACC16.cc
+  src/GenerateKernelU8S8S32ACC16Avx512.cc
+  src/GenerateKernelU8S8S32ACC16Avx512VNNI.cc
+  src/GenerateKernelU8S8S32ACC32.cc
+  src/GenerateKernelU8S8S32ACC32Avx512VNNI.cc
+  src/GroupwiseConv.cc
+  src/GroupwiseConvAcc32Avx2.cc
+  src/GroupwiseConvAcc32Avx512.cc
+  src/PackAMatrix.cc
+  src/PackAWithIm2Col.cc
+  src/PackAWithQuantRowOffset.cc
+  src/PackAWithRowOffset.cc
+  src/PackBMatrix.cc
+  src/PackMatrix.cc
+  src/PackWeightMatrixForGConv.cc
+  src/PackWeightsForConv.cc
+  src/PackWeightsForDirectConv.cc
+  src/QuantUtils.cc
+  src/RowWiseSparseAdagradFused.cc
+  src/SparseAdagrad.cc
+  src/spmmUtils.cc
+  src/TransposeUtils.cc
+  src/GenerateI8Depthwise.cc
+  src/RefImplementations.cc
+  src/Utils.cc
+  src/fp32/FbgemmFP32.cc
+
+  CC_FLAGS:
+
+
+  MSVC_FLAGS:
+  /wd4717
+  /bigobj
+
+  DEFINITIONS:
+  FBGEMM_STATIC
+
+  ENABLE_IPO:
+
+
+  INCLUDE_DIRS:
+  $<BUILD_INTERFACE:/home/twyang/pytorch/third_party/fbgemm>
+  $<BUILD_INTERFACE:/home/twyang/pytorch/third_party/fbgemm/include>
+  $<BUILD_INTERFACE:/home/twyang/pytorch/third_party/fbgemm/bench>
+
+  Library Dependencies:
+  $<BUILD_INTERFACE:cpuinfo>
+  $<BUILD_INTERFACE:asmjit>
+
+  Output Library:
+  fbgemm_generic
+
+  Install Destination:
+  lib
+  ================================================================================
+
+  -- Processor is x86_64; will build AVX2 target
+
+
+  ================================================================================
+  CPP Library Target: fbgemm_avx2 (OBJECT)
+
+  SRCS:
+  src/EmbeddingSpMDMAvx2.cc
+  src/FbgemmBfloat16ConvertAvx2.cc
+  src/FbgemmFloat16ConvertAvx2.cc
+  src/FbgemmI8Depthwise3DAvx2.cc
+  src/FbgemmI8DepthwiseAvx2.cc
+  src/FbgemmI8DepthwisePerChannelQuantAvx2.cc
+  src/FbgemmSparseDenseAvx2.cc
+  src/FbgemmSparseDenseInt8Avx2.cc
+  src/OptimizedKernelsAvx2.cc
+  src/PackDepthwiseConvMatrixAvx2.cc
+  src/QuantUtilsAvx2.cc
+  src/spmmUtilsAvx2.cc
+  src/UtilsAvx2.cc
+  src/fp32/FbgemmFP32UKernelsAvx2.cc
+  src/FbgemmFP16UKernelsAvx2.cc
+
+  CC_FLAGS:
+  -m64
+  -mf16c
+  -mfma
+  -mavx2
+  -mfma
+  -mf16c
+
+  MSVC_FLAGS:
+  -mavx2
+  -mfma
+  -mf16c
+
+  DEFINITIONS:
+
+
+  ENABLE_IPO:
+
+
+  INCLUDE_DIRS:
+
+
+  Library Dependencies:
+  $<BUILD_INTERFACE:cpuinfo>
+  $<BUILD_INTERFACE:asmjit>
+  fbgemm_generic
+
+  Output Library:
+  fbgemm_avx2
+
+  Install Destination:
+  lib
+  ================================================================================
+
+  -- Processor is x86_64; will build AVX512 target
+
+
+  ================================================================================
+  CPP Library Target: fbgemm_avx512 (OBJECT)
+
+  SRCS:
+  src/FbgemmBfloat16ConvertAvx512.cc
+  src/EmbeddingSpMDMAvx512.cc
+  src/FbgemmFloat16ConvertAvx512.cc
+  src/FbgemmSparseDenseAvx512.cc
+  src/FbgemmSparseDenseInt8Avx512.cc
+  src/FbgemmSparseDenseVectorInt8Avx512.cc
+  src/QuantUtilsAvx512.cc
+  src/UtilsAvx512.cc
+  src/FbgemmFP16UKernelsAvx512.cc
+  src/FbgemmFP16UKernelsAvx512_256.cc
+  src/fp32/FbgemmFP32UKernelsAvx512.cc
+  src/fp32/FbgemmFP32UKernelsAvx512_256.cc
+
+  CC_FLAGS:
+  -m64
+  -mfma
+  -mavx512f
+  -mavx512dq
+  -mavx512vl
+  -mavx512bw
+  -mfma
+  -mavx2
+  -mfma
+  -mf16c
+
+  MSVC_FLAGS:
+  -mavx512f
+  -mavx512dq
+  -mavx512vl
+  -mavx512bw
+  -mfma
+  -mavx2
+  -mfma
+  -mf16c
+
+  DEFINITIONS:
+
+
+  ENABLE_IPO:
+
+
+  INCLUDE_DIRS:
+
+
+  Library Dependencies:
+  $<BUILD_INTERFACE:cpuinfo>
+  $<BUILD_INTERFACE:asmjit>
+  fbgemm_generic
+
+  Output Library:
+  fbgemm_avx512
+
+  Install Destination:
+  lib
+  ================================================================================
+
+  -- Processor is x86_64; will NOT build Neon target
+  -- Processor is x86_64; will NOT build SVE target
+  -- Will build autovec target
+
+
+  ================================================================================
+  CPP Library Target: fbgemm_autovec (OBJECT)
+
+  SRCS:
+  src/EmbeddingSpMDMAutovec.cc
+  src/EmbeddingStatsTracker.cc
+
+  CC_FLAGS:
+
+
+  MSVC_FLAGS:
+
+
+  DEFINITIONS:
+
+
+  ENABLE_IPO:
+  OFF
+
+  INCLUDE_DIRS:
+
+
+  Library Dependencies:
+  $<BUILD_INTERFACE:cpuinfo>
+  $<BUILD_INTERFACE:asmjit>
+  fbgemm_generic
+
+  Output Library:
+  fbgemm_autovec
+
+  Install Destination:
+  lib
+  ================================================================================
+
+
+
+  ================================================================================
+  CPP Library Target: fbgemm (STATIC)
+
+  SRCS:
+
+
+  CC_FLAGS:
+
+
+  MSVC_FLAGS:
+
+
+  DEFINITIONS:
+
+
+  ENABLE_IPO:
+
+
+  INCLUDE_DIRS:
+
+
+  Library Dependencies:
+  fbgemm_generic
+  fbgemm_avx2
+  fbgemm_avx512
+  fbgemm_autovec
+
+  Output Library:
+  fbgemm
+
+  Install Destination:
+  lib
+  ================================================================================
+
+  -- Dependency: adding libc (Linux, BSD, or other UNIX/POSIX environment)
+  -- Dependency: libpthread provided by libc (not linking to libpthread)
+  -- Dependency: shm_open provided by libc (not linking to librt)
+  ** AsmJit Summary **
+     ASMJIT_DIR=/home/twyang/pytorch/third_party/fbgemm/external/asmjit
+     ASMJIT_TEST=FALSE
+     ASMJIT_TARGET_TYPE=STATIC
+     ASMJIT_DEPS=c
+     ASMJIT_LIBS=asmjit;c
+     ASMJIT_CFLAGS=-DASMJIT_STATIC
+     ASMJIT_PRIVATE_CFLAGS=-Wall;-Wextra;-Wconversion;-fno-math-errno;-fno-threadsafe-statics;-fno-semantic-interposition;-DASMJIT_STATIC
+     ASMJIT_PRIVATE_CFLAGS_DBG=
+     ASMJIT_PRIVATE_CFLAGS_REL=-O2;-fmerge-all-constants;-fno-enforce-eh-specs
+  -- Found Numa  (include: /home/twyang/miniconda3/envs/pytorch_build/include, library: /home/twyang/miniconda3/envs/pytorch_build/lib/libnuma.so)
+  CMake Deprecation Warning at third_party/ittapi/CMakeLists.txt:7 (cmake_minimum_required):
+    Compatibility with CMake < 3.10 will be removed from a future version of
+    CMake.
+
+    Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+    to tell CMake that the project requires at least <min> but has been updated
+    to work with policies introduced by <max> or earlier.
+
+
+  -- Using third party subdirectory Eigen.
+  -- Found Python: /home/twyang/miniconda3/envs/pytorch_build/bin/python (found version "3.11.6") found components: Interpreter Development.Module NumPy
+  -- Using third_party/pybind11.
+  -- pybind11 include dirs: /home/twyang/pytorch/cmake/../third_party/pybind11/include
+  -- MPI support found
+  -- MPI compile flags: -pthread
+  -- MPI include path: /home/twyang/miniconda3/envs/pytorch_build/include
+  -- MPI LINK flags path: -Wl,--allow-shlib-undefined -Wl,-rpath -Wl,/home/twyang/miniconda3/envs/pytorch_build/lib -pthread
+  -- MPI libraries: /home/twyang/miniconda3/envs/pytorch_build/lib/libmpi.so
+  -- Found OpenMPI with CUDA support built.
+  -- Adding OpenMP CXX_FLAGS: -fopenmp
+  -- Will link against OpenMP libraries: /home/twyang/miniconda3/envs/pytorch_build/lib/libgomp.so
+  -- Determining NCCL version from /home/twyang/nccl/build/include/nccl.h...
+  -- Found NCCL (include: /home/twyang/nccl/build/include, library: /home/twyang/nccl/build/lib/libnccl.so)
+  -- Converting CMAKE_CUDA_FLAGS to CUDA_NVCC_FLAGS:
+      CUDA_NVCC_FLAGS                = -DLIBCUDACXX_ENABLE_SIMPLIFIED_COMPLEX_OPERATIONS;-Xfatbin;-compress-all;-DONNX_NAMESPACE=onnx_torch;-gencode;arch=compute_80,code=sm_80;-Xcudafe;--diag_suppress=cc_clobber_ignored,--diag_suppress=field_without_dll_interface,--diag_suppress=base_class_has_different_dll_interface,--diag_suppress=dll_interface_conflict_none_assumed,--diag_suppress=dll_interface_conflict_dllexport_assumed,--diag_suppress=bad_friend_decl;--expt-relaxed-constexpr;--expt-extended-lambda
+      CUDA_NVCC_FLAGS_DEBUG          = -g
+      CUDA_NVCC_FLAGS_RELEASE        = -O3;-DNDEBUG
+      CUDA_NVCC_FLAGS_RELWITHDEBINFO = -O2;-g;-DNDEBUG
+      CUDA_NVCC_FLAGS_MINSIZEREL     = -O1;-DNDEBUG
+  -- summary of build options:
+      Install prefix:  /home/twyang/pytorch/torch
+      Target system:   Linux
+      Compiler:
+        C compiler:    /home/twyang/miniconda3/envs/pytorch_build/bin/x86_64-conda-linux-gnu-gcc (GNU)
+        CFLAGS:         -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/twyang/miniconda3/envs/pytorch_build/include  -I/home/twyang/miniconda3/envs/pytorch_build/targets/x86_64-linux/include
+
+  -- Gloo build as SHARED library
+  -- MPI include path: /home/twyang/miniconda3/envs/pytorch_build/include
+  -- MPI libraries: /home/twyang/miniconda3/envs/pytorch_build/lib/libmpi.so
+  -- Found CUDAToolkit: /home/twyang/miniconda3/envs/pytorch_build/targets/x86_64-linux/include (found suitable version "12.8.93", minimum required is "7.0")
+  -- CUDA detected: 12.8.93
+  -- GLOO_USE_TORCH_DTYPES : 1 /home/twyang/pytorch;/home/twyang/pytorch/build
+  -- ONNX_PROTOC_EXECUTABLE: $<TARGET_FILE:protobuf::protoc>
+  -- Protobuf_VERSION: Protobuf_VERSION_NOTFOUND
+  Generated: /home/twyang/pytorch/build/third_party/onnx/onnx/onnx_onnx_torch-ml.proto
+  Generated: /home/twyang/pytorch/build/third_party/onnx/onnx/onnx-operators_onnx_torch-ml.proto
+  Generated: /home/twyang/pytorch/build/third_party/onnx/onnx/onnx-data_onnx_torch.proto
+  --
+  -- ******** Summary ********
+  --   CMake version                     : 4.2.1
+  --   CMake command                     : /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages/cmake/data/bin/cmake
+  --   System                            : Linux
+  --   C++ compiler                      : /home/twyang/miniconda3/envs/pytorch_build/bin/x86_64-conda-linux-gnu-g++
+  --   C++ compiler version              : 13.4.0
+  --   CXX flags                         : -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/twyang/miniconda3/envs/pytorch_build/include  -I/home/twyang/miniconda3/envs/pytorch_build/targets/x86_64-linux/include -fvisibility-inlines-hidden -DUSE_PTHREADPOOL -Wnon-virtual-dtor
+  --   Build type                        : Release
+  --   Compile definitions               : ONNX_ML=1;ONNXIFI_ENABLE_EXT=1
+  --   CMAKE_PREFIX_PATH                 : /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages;/home/twyang/miniconda3/envs/pytorch_build:/home/twyang/miniconda3/envs/pytorch_build:/home/twyang/miniconda3/envs/pytorch_build/x86_64-conda-linux-gnu/sysroot/usr;/home/twyang/miniconda3/envs/pytorch_build;/home/twyang/miniconda3/envs/pytorch_build/x86_64-conda-linux-gnu/sysroot/usr;/home/twyang/miniconda3/envs/pytorch_build;/home/twyang/miniconda3/envs/pytorch_build;/home/twyang/miniconda3/envs/pytorch_build
+  --   CMAKE_INSTALL_PREFIX              : /home/twyang/pytorch/torch
+  --   CMAKE_MODULE_PATH                 : /home/twyang/pytorch/cmake/Modules;/home/twyang/pytorch/cmake/public/../Modules_CUDA_fix
+  --
+  --   ONNX version                      : 1.18.0
+  --   ONNX NAMESPACE                    : onnx_torch
+  --   ONNX_USE_LITE_PROTO               : OFF
+  --   USE_PROTOBUF_SHARED_LIBS          : OFF
+  --   ONNX_DISABLE_EXCEPTIONS           : OFF
+  --   ONNX_DISABLE_STATIC_REGISTRATION  : OFF
+  --   ONNX_WERROR                       : OFF
+  --   ONNX_BUILD_TESTS                  : OFF
+  --   BUILD_SHARED_LIBS                 : OFF
+  --
+  --   Protobuf compiler                 : $<TARGET_FILE:protobuf::protoc>
+  --   Protobuf includes                 :
+  --   Protobuf libraries                :
+  --   ONNX_BUILD_PYTHON                 : OFF
+  -- Found CUDA with FP16 support, compiling with torch.cuda.HalfTensor
+  -- Adding -DNDEBUG to compile flags
+  -- Compiling with MAGMA support
+  -- MAGMA INCLUDE DIRECTORIES: /home/twyang/miniconda3/envs/pytorch_build/include
+  -- MAGMA LIBRARIES: /home/twyang/miniconda3/envs/pytorch_build/lib/libmagma.a
+  -- MAGMA V2 check: 1
+  -- Found a library with LAPACK API (mkl).
+  disabling ROCM because NOT USE_ROCM is set
+  -- MIOpen not found. Compiling without MIOpen support
+  -- Will build oneDNN Graph
+  -- Will build oneDNN UKERNEL
+  -- MKLDNN_CPU_RUNTIME = OMP
+  -- DNNL_TARGET_ARCH: X64
+  -- DNNL_LIBRARY_NAME: dnnl
+  CMake Warning (dev) at /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages/cmake/data/share/cmake-4.2/Modules/FindPackageHandleStandardArgs.cmake:493 (message):
+    The package name passed to find_package_handle_standard_args() (OpenMP_C)
+    does not match the name of the calling package (OpenMP).  This can lead to
+    problems in calling code that expects find_package() result variables
+    (e.g., `_FOUND`) to follow a certain pattern.
+  Call Stack (most recent call first):
+    cmake/Modules/FindOpenMP.cmake:635 (find_package_handle_standard_args)
+    third_party/ideep/mkl-dnn/cmake/OpenMP.cmake:41 (find_package)
+    third_party/ideep/mkl-dnn/CMakeLists.txt:94 (include)
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+  -- Found OpenMP_C: -fopenmp
+  CMake Warning (dev) at /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages/cmake/data/share/cmake-4.2/Modules/FindPackageHandleStandardArgs.cmake:493 (message):
+    The package name passed to find_package_handle_standard_args() (OpenMP_CXX)
+    does not match the name of the calling package (OpenMP).  This can lead to
+    problems in calling code that expects find_package() result variables
+    (e.g., `_FOUND`) to follow a certain pattern.
+  Call Stack (most recent call first):
+    cmake/Modules/FindOpenMP.cmake:635 (find_package_handle_standard_args)
+    third_party/ideep/mkl-dnn/cmake/OpenMP.cmake:41 (find_package)
+    third_party/ideep/mkl-dnn/CMakeLists.txt:94 (include)
+  This warning is for project developers.  Use -Wno-dev to suppress it.
+
+  -- Found OpenMP_CXX: -fopenmp
+  -- Enabled testing coverage: CI
+  -- Enabled workload: TRAINING
+  -- Enabled primitives: ALL
+  -- Enabled primitive CPU ISA: ALL
+  -- Enabled primitive GPU ISA: ALL
+  -- Enabled GeMM kernels ISA: ALL
+  -- Primitive cache is enabled
+  -- Experimental functionality for ukernels is enabled
+  -- Graph component is enabled
+  -- Found MKL-DNN: TRUE
+  -- <FindZVECTOR>
+  -- ZVECTOR flags were NOT set.
+  -- </FindZVECTOR>
+  -- {fmt} version: 12.1.0
+  -- Build type: Release
+  -- Using Kineto with CUPTI support
+  -- Configuring Kineto dependency:
+  --   KINETO_SOURCE_DIR = /home/twyang/pytorch/third_party/kineto/libkineto
+  --   KINETO_BUILD_TESTS = OFF
+  --   KINETO_LIBRARY_TYPE = static
+  --   KINETO_BACKEND = cuda
+  --  ROCM_SOURCE_DIR =
+  -- KINETO_BACKEND = cuda
+  -- Found CUDAToolkit: /home/twyang/miniconda3/envs/pytorch_build/targets/x86_64-linux/include (found version "12.8.93")
+  -- Found CUPTI
+  --  Building with cupti
+  --  DYNOLOG_INCLUDE_DIR = /home/twyang/pytorch/third_party/kineto/libkineto/third_party/dynolog/
+  --  IPCFABRIC_INCLUDE_DIR = /home/twyang/pytorch/third_party/kineto/libkineto/third_party/dynolog//dynolog/src/ipcfabric/
+  -- Configured Kineto
+  -- GCC 13.4.0: Adding gcc and gcc_s libs to link line
+  -- NUMA paths:
+  -- /home/twyang/miniconda3/envs/pytorch_build/include
+  -- /home/twyang/miniconda3/envs/pytorch_build/lib/libnuma.so
+  -- headers outputs:
+  -- sources outputs:
+  -- declarations_yaml outputs:
+  -- Using ATen parallel backend: OMP
+  -- Support for OpenMP disabled by CMake option
+  -- Configuring build for SLEEF-v3.8.0
+     Target system: Linux-6.8.0-137-generic
+     Target processor: x86_64
+     Host system: Linux-6.8.0-137-generic
+     Host processor: x86_64
+     Detected C compiler: GNU @ /home/twyang/miniconda3/envs/pytorch_build/bin/x86_64-conda-linux-gnu-gcc
+     CMake: 4.2.1
+     Make program: /home/twyang/miniconda3/envs/pytorch_build/bin/ninja
+  -- Using option `-Wall -Wno-unused-function -Wno-attributes -Wno-unused-result -Wno-psabi -ffp-contract=off -fno-math-errno -fno-trapping-math` to compile libsleef
+  -- Building shared libs : OFF
+  -- Building static test bins: OFF
+  -- MPFR : LIB_MPFR-NOTFOUND
+  -- GMP : /home/twyang/miniconda3/envs/pytorch_build/lib/libgmp.so
+  -- RT : /home/twyang/miniconda3/envs/pytorch_build/x86_64-conda-linux-gnu/sysroot/usr/lib/librt.a
+  -- FFTW3 : LIBFFTW3-NOTFOUND
+  -- OPENSSL : 3.6.0
+  -- SDE : SDE_COMMAND-NOTFOUND
+  -- COMPILER_SUPPORTS_OPENMP :
+  AT_INSTALL_INCLUDE_DIR include/ATen/core
+  core header install: /home/twyang/pytorch/build/aten/src/ATen/core/TensorBody.h
+  core header install: /home/twyang/pytorch/build/aten/src/ATen/core/aten_interned_strings.h
+  -- NVSHMEM_HOME set to:  ''
+  -- NVSHMEM wheel installed at:  ''
+  -- NVSHMEM_HOST_LIB:  'NVSHMEM_HOST_LIB-NOTFOUND'
+  -- NVSHMEM_DEVICE_LIB:  'NVSHMEM_DEVICE_LIB-NOTFOUND'
+  -- NVSHMEM_INCLUDE_DIR:  'NVSHMEM_INCLUDE_DIR-NOTFOUND'
+  -- NVSHMEM not found, not building with NVSHMEM support.
+  -- Found SYCL: /opt/intel/oneapi/compiler/latest/include;/opt/intel/oneapi/compiler/latest/include/sycl;/opt/intel/oneapi/compiler/latest/include/sycl (found version "20260101")
+  SYCL: feature test compile failed!!
+  compile output is:
+  CMake Error at third_party/torch-xpu-ops/cmake/Modules/FindSYCLToolkit.cmake:192 (message):
+    Can not build SYCL_CMPLR_TEST
+  Call Stack (most recent call first):
+    third_party/torch-xpu-ops/cmake/SYCL.cmake:13 (include)
+    third_party/torch-xpu-ops/CMakeLists.txt:46 (include)
+
+
+  -- Configuring incomplete, errors occurred!
+  error: subprocess-exited-with-error
+  
+  × Building editable for torch (pyproject.toml) did not run successfully.
+  │ exit code: 1
+  ╰─> No available output.
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+  full command: /home/twyang/miniconda3/envs/pytorch_build/bin/python /home/twyang/miniconda3/envs/pytorch_build/lib/python3.11/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py build_editable /tmp/tmpts7x44mt
+  cwd: /home/twyang/pytorch
+  Building editable for torch (pyproject.toml): finished with status 'error'
+  ERROR: Failed building editable for torch
+Failed to build torch
+error: failed-wheel-build-for-install
+
+× Failed to build installable wheels for some pyproject.toml based projects
+╰─> torch
