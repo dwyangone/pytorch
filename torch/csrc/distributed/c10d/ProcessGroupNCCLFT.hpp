@@ -1092,6 +1092,18 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   std::atomic<bool> is_degraded_{false};
   std::atomic<uint64_t> ft_round_{0};
 
+  // Per-rebuild-attempt counter.  Unlike ft_round_, this increments on every
+  // entry into rebuild_shadow_ping_pong_topology(), including retries within
+  // the same fault round (when execute_shadow_allreduce throws and the
+  // side-car catches and retries).  Used to give each rebuild attempt its own
+  // unique TCPStore key namespace so stale keys from a failed attempt do not
+  // cause later ranks to read wrong data and hang at the barrier wait.
+  // Written and read only from recover_and_replay_inflight_ops() (side-car
+  // thread); no concurrent writers, so std::atomic with relaxed ordering is
+  // sufficient for the counter itself.  The TCPStore set/wait calls provide
+  // the necessary cross-rank visibility.
+  std::atomic<uint64_t> rebuild_attempt_{0};
+
   // Pending fault signal from NCCL callback / Watchdog.
   // Bitmask: bit i is set when local device i has a pending NIC fault.
   // 0 means no pending fault.

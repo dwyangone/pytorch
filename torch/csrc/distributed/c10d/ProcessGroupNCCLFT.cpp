@@ -4101,10 +4101,22 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
     }
 
     ncclUniqueId localId;
-    std::string local_id_key = "NCCL_FT_LOCAL_COMM_ID_" + key_suffix;
+    std::string local_id_key  = "NCCL_FT_LOCAL_COMM_ID_" + key_suffix;
+    // Sentinel key: id_generator writes "ERR" here if ncclGetUniqueId fails so
+    // waiting ranks abort immediately instead of hanging for 30 s.
+    std::string local_err_key = "NCCL_FT_LOCAL_COMM_ERR_" + key_suffix;
 
     if (local_rank == id_generator) {
-        C10D_NCCL_FT_CHECK(ncclGetUniqueId(&localId), std::nullopt);
+        ncclResult_t uid_ret = ncclGetUniqueId(&localId);
+        if (uid_ret != ncclSuccess) {
+            // Notify waiting ranks so they can abort the barrier and retry.
+            std::string err = "ERR";
+            try {
+                this->globalStore_->set(local_err_key,
+                    std::vector<uint8_t>(err.begin(), err.end()));
+            } catch (...) {}
+            C10D_NCCL_FT_CHECK(uid_ret, std::nullopt); // throws
+        }
         auto vec = std::vector<uint8_t>(
             reinterpret_cast<uint8_t*>(&localId),
             reinterpret_cast<uint8_t*>(&localId) + NCCL_UNIQUE_ID_BYTES);
@@ -4114,7 +4126,30 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
                   << " (first healthy) generated and stored NVLink Comm ID for Node "
                   << node_id << " (attempt=" << attempt << ")";
     } else {
-        this->globalStore_->wait({local_id_key}, std::chrono::seconds(30));
+        // Wait for either the comm ID or the error sentinel, whichever arrives
+        // first.  check() on both every 100 ms avoids a separate wait() that
+        // would block for the full 30 s if the id_generator already wrote ERR.
+        bool got_id = false;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (this->globalStore_->check({local_err_key})) {
+                C10_THROW_ERROR(DistBackendError,
+                    c10::str(logPrefix(),
+                        "[NCCL-FT] id_generator (local_rank=", id_generator,
+                        ") failed to generate NVLink Comm ID (attempt=", attempt, ")"));
+            }
+            if (this->globalStore_->check({local_id_key})) {
+                got_id = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!got_id) {
+            C10_THROW_ERROR(DistBackendError,
+                c10::str(logPrefix(),
+                    "[NCCL-FT] Timed out waiting for NVLink Comm ID "
+                    "(local_id_key=", local_id_key, ", attempt=", attempt, ")"));
+        }
         auto vec = this->globalStore_->get(local_id_key);
         std::memcpy(&localId, vec.data(), vec.size());
     }
@@ -4391,10 +4426,40 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         }
     }
 
+    // Global cross-node barrier: ensure ALL ranks (on both nodes) reach this
+    // point before any rank enters initLocalNvlinkComm.  Without this, Node 0
+    // and Node 1 can start their rebuild at very different times, causing the
+    // entry-arrival barrier inside initLocalNvlinkComm to time out waiting for
+    // ranks that are still in the previous exception handler sleep.
+    //
+    // We use a fresh TCPStore key per rebuild_attempt_ so that retries are
+    // fully isolated from previous attempts.
+    {
+        uint64_t cur_attempt = rebuild_attempt_.load(std::memory_order_relaxed);
+        std::string my_sync_key = "NCCL_FT_REBUILD_SYNC_ATT_" +
+            std::to_string(cur_attempt) + "_R" + std::to_string(rank_);
+        std::string one = "1";
+        this->globalStore_->set(my_sync_key,
+            std::vector<uint8_t>(one.begin(), one.end()));
+
+        std::vector<std::string> all_sync_keys;
+        all_sync_keys.reserve(size_);
+        for (int r = 0; r < size_; ++r) {
+            all_sync_keys.push_back("NCCL_FT_REBUILD_SYNC_ATT_" +
+                std::to_string(cur_attempt) + "_R" + std::to_string(r));
+        }
+        this->globalStore_->wait(all_sync_keys, std::chrono::seconds(120));
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT] Pre-rebuild global barrier passed (attempt=" << cur_attempt << ").";
+    }
+
     // 4. All ranks (including faulty) rebuild a fresh NVLink-only local comm.
-    // Pass ft_round_+1 as the attempt index so keys are distinct from lazy-init
-    // (attempt=0) and from prior recovery rounds.
-    initLocalNvlinkComm(/*attempt=*/ft_round_ + 1);
+    // Use rebuild_attempt_ as the key namespace so that every retry (including
+    // retries within the same fault round when execute_shadow_allreduce throws)
+    // gets distinct TCPStore keys and cannot race with stale keys from a prior
+    // failed attempt.  rebuild_attempt_ was already incremented by the caller
+    // (recover_and_replay_inflight_ops) before this function was entered.
+    initLocalNvlinkComm(/*attempt=*/rebuild_attempt_.load(std::memory_order_relaxed));
 
     // Phase 3: Rebuild proxy_global_comm_ (healthy ranks only).
     // ncclCommBanNic() called above already marks the faulty NIC in the
@@ -4408,9 +4473,12 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 
     // 5. 重建 Proxy Global Comm (只有健康節點參與)
     if (!is_faulty) {
-        // 重新分配一個 Unique ID 給新的降級群組
+        // Use rebuild_attempt_ (not ft_round_) so that each retry attempt
+        // writes to a fresh key and does not collide with a stale value from
+        // a previous failed attempt in the same fault round.
+        uint64_t cur_attempt = rebuild_attempt_.load(std::memory_order_relaxed);
         ncclUniqueId proxyId;
-        std::string proxy_id_key = "NCCL_FT_PROXY_ID_" + std::to_string(ft_round_);
+        std::string proxy_id_key = "NCCL_FT_PROXY_ID_ATT_" + std::to_string(cur_attempt);
 
         if (proxy_comm_rank_ == 0) {
             ncclGetUniqueId(&proxyId);
@@ -4419,16 +4487,20 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
                 reinterpret_cast<uint8_t*>(&proxyId) + NCCL_UNIQUE_ID_BYTES);
             this->globalStore_->set(proxy_id_key, vec);
         } else {
-            // 其他健康節點等待 Rank 0 廣播的 ID
-            this->globalStore_->wait({proxy_id_key}, std::chrono::seconds(30));
+            // 其他健康節點等待 proxy_comm_rank_==0 廣播的 ID。
+            // Use 120s to match the pre-rebuild global barrier timeout; the
+            // broadcaster may be slow to reach this point if it had to recover
+            // from the previous rebuild attempt's exception handler sleep.
+            this->globalStore_->wait({proxy_id_key}, std::chrono::seconds(120));
             auto vec = this->globalStore_->get(proxy_id_key);
             std::memcpy(&proxyId, vec.data(), vec.size());
         }
 
         // N-to-N all-ready barrier：確保所有健康 rank 都已到達此處再進入
+        // Use cur_attempt in the key so retries don't collide with prior rounds.
         {
-            std::string my_ready_key = "NCCL_FT_PROXY_READY_" +
-                std::to_string(ft_round_) + "_" + std::to_string(rank_);
+            std::string my_ready_key = "NCCL_FT_PROXY_READY_ATT_" +
+                std::to_string(cur_attempt) + "_" + std::to_string(rank_);
             std::string one = "1";
             this->globalStore_->set(my_ready_key,
                 std::vector<uint8_t>(one.begin(), one.end()));
@@ -4436,8 +4508,8 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
             std::vector<std::string> all_ready_keys;
             for (int r = 0; r < size_; ++r) {
                 if (faulty_devs.count(r % localDeviceCount_) == 0) {
-                    all_ready_keys.push_back("NCCL_FT_PROXY_READY_" +
-                        std::to_string(ft_round_) + "_" + std::to_string(r));
+                    all_ready_keys.push_back("NCCL_FT_PROXY_READY_ATT_" +
+                        std::to_string(cur_attempt) + "_" + std::to_string(r));
                 }
             }
             this->globalStore_->wait(all_ready_keys, std::chrono::seconds(60));
@@ -4450,7 +4522,25 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 
         // 從頭建立全新的降級群組 (Re-Init)
         proxy_global_comm_ = NCCLFTComm::create(proxy_comm_size_, proxy_comm_rank_, proxyId, device.index(), config);
-        
+
+        // Verify the new comm is healthy with a zero-element allreduce across
+        // all proxy ranks before marking it ready.  If the IB transport is still
+        // unstable after ncclCommBanNic (root cause of "unhandled system error"
+        // crash at execute_shadow_allreduce:4642), this throws here inside
+        // rebuild_shadow_ping_pong_topology.  The caller
+        // (recover_and_replay_inflight_ops) increments rebuild_attempt_ and
+        // retries, preventing a broken comm from being handed to the replay path.
+        {
+            auto ncclStream = ncclStreams_.at(key);
+            ncclComm_t raw = proxy_global_comm_->getNcclComm();
+            C10D_NCCL_FT_CHECK(
+                ncclAllReduce(nullptr, nullptr, 0,
+                              ncclFloat, ncclSum, raw, ncclStream.stream()),
+                std::nullopt);
+            // Synchronize so any async NCCL error surfaces before we return.
+            C10_CUDA_CHECK(cudaStreamSynchronize(ncclStream.stream()));
+        }
+
         LOG(INFO) << logPrefix() << "[NCCL-FT] proxy_global_comm_ ready!";
     } else {
         proxy_global_comm_.reset();
@@ -5466,11 +5556,11 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
 }
 
 void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
-    std::lock_guard<std::mutex> lock(recovery_mutex_); 
-    
+    std::lock_guard<std::mutex> lock(recovery_mutex_);
+
     uint64_t commit_signal = this->final_commit_op_.load(std::memory_order_acquire);
     if (commit_signal == 0) {
-        return; 
+        return;
     }
 
     LOG(INFO) << logPrefix() << "[NCCL-FT] 啟動全域重播中心！ (容錯回合 Round=" << this->ft_round_ << ")";
@@ -5483,6 +5573,29 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         globalComm->abort("FT Recovery - Aborting dead comm");
     }
 
+    // Increment before calling rebuild so every attempt (including retries
+    // triggered by a failing execute_shadow_allreduce) uses a unique set of
+    // TCPStore keys. rebuild_shadow_ping_pong_topology reads this counter via
+    // rebuild_attempt_.load() to name the barrier and comm-id keys.
+    uint64_t cur_attempt = rebuild_attempt_.fetch_add(1, std::memory_order_relaxed) + 1;
+    LOG(INFO) << logPrefix()
+              << "[NCCL-FT] Starting rebuild attempt=" << cur_attempt
+              << " (ft_round=" << ft_round_ << ")";
+
+    // rebuild_shadow_ping_pong_topology can throw (e.g., the comm verification
+    // barrier fails because IB is still unstable — Fix #1).  If it does, the
+    // exception propagates to the side-car catch block, which retries after
+    // 500 ms.  We must NOT leave final_commit_op_ non-zero when we bail out:
+    // the side-car will see the stale signal on the next loop iteration, call
+    // recover_and_replay_inflight_ops again, and the recovery_mutex_ guard
+    // means it will simply return early (commit_signal == 0 after we clear it).
+    // That is the correct behaviour: rebuild_attempt_ will have been
+    // incremented, so the retry gets a fresh key namespace.
+    //
+    // Note: we do NOT clear final_commit_op_ here.  The side-car re-enters
+    // the 2PC path and calls recover_and_replay_inflight_ops again after the
+    // 500 ms sleep — which is the intended retry mechanism.  The COMMIT key
+    // already exists in TCPStore so the 2PC step completes immediately.
     rebuild_shadow_ping_pong_topology();
     this->is_degraded_ = true;
 
@@ -5556,55 +5669,80 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     }
 
     // 5. 推進容錯回合，並清理 TCPStore
-    uint64_t cur_round = commit_signal - 1; 
-    this->ft_round_++; 
-    
+    uint64_t cur_round = commit_signal - 1;
+    this->ft_round_++;
+
     try {
         std::string round_str = std::to_string(cur_round);
 
         // 每個 rank 清除自己的 per-rank keys
         this->globalStore_->deleteKey("NCCL_FT_PROPOSE_" + std::to_string(this->rank_) + "_" + round_str);
 
-        // 每個健康 rank 清除自己寫的 proxy all-ready barrier key
-        bool is_faulty_rank = (this->faulty_local_devs_.count(
-            this->rank_ % this->localDeviceCount_) > 0);
-        if (!is_faulty_rank) {
-            this->globalStore_->deleteKey(
-                "NCCL_FT_PROXY_READY_" + round_str + "_" + std::to_string(this->rank_));
-        }
-
-        // Clean up initLocalNvlinkComm keys for the attempts used in this and
-        // all prior rounds.  Attempt numbering:
-        //   attempt=0          : lazy-init (always the first call)
-        //   attempt=r+1        : recovery call for fault round r
-        // After ft_round_++ above, ft_round_ == cur_round+1, so the recovery
-        // attempt for this round was (cur_round+1) == ft_round_.
-        // We clean attempt=0 (lazy-init) only on the first fault round.
+        // Clean up all rebuild-attempt-keyed keys written by this rank for
+        // every attempt that was used in this fault round.  rebuild_attempt_
+        // was incremented once per call to recover_and_replay_inflight_ops, so
+        // attempts [prev_attempt+1 .. cur_attempt] belong to this round where
+        // prev_attempt is the value before the first attempt of this round.
+        // For simplicity we track the first attempt of this round via the
+        // value recorded in cur_attempt before the loop above.
         {
             int node_id    = this->rank_ / this->localDeviceCount_;
             int local_rank = this->rank_ % this->localDeviceCount_;
-            // Attempts to clean: lazy-init (0) if this is round 0, plus
-            // all recovery attempts 1..ft_round_ (inclusive).
-            uint64_t first_att = (cur_round == 0) ? 0 : 1;
-            for (uint64_t att = first_att; att <= this->ft_round_; ++att) {
+            bool is_faulty_rank = (this->faulty_local_devs_.count(local_rank) > 0);
+
+            // cur_attempt is the attempt that just succeeded.  All attempts
+            // from 1 up to cur_attempt belong to rebuild calls (attempt=0 is
+            // lazy-init).  Clean them all; non-existent keys are silently
+            // ignored by the store.
+            for (uint64_t att = 1; att <= cur_attempt; ++att) {
+                // Per-rank rebuild sync barrier key.
+                this->globalStore_->deleteKey(
+                    "NCCL_FT_REBUILD_SYNC_ATT_" + std::to_string(att)
+                    + "_R" + std::to_string(this->rank_));
+
+                // initLocalNvlinkComm barrier and sentinel keys (per local-rank).
                 std::string sfx = "NODE_" + std::to_string(node_id)
                                 + "_PG_" + std::to_string(this->getUid())
                                 + "_ATT_" + std::to_string(att);
-                // Each rank only deletes its own per-rank keys.
                 this->globalStore_->deleteKey(
-                    "NCCL_FT_LOCAL_ARRIVE_" + sfx
-                    + "_LR_" + std::to_string(local_rank));
+                    "NCCL_FT_LOCAL_ARRIVE_" + sfx + "_LR_" + std::to_string(local_rank));
                 this->globalStore_->deleteKey(
-                    "NCCL_FT_LOCAL_READY_" + sfx
-                    + "_LR_" + std::to_string(local_rank));
+                    "NCCL_FT_LOCAL_READY_" + sfx + "_LR_" + std::to_string(local_rank));
+                // Error sentinel written by id_generator if ncclGetUniqueId fails.
+                // Only the id_generator rank wrote it, but all ranks try to delete
+                // (non-existent deletes are harmless).
+                this->globalStore_->deleteKey("NCCL_FT_LOCAL_COMM_ERR_" + sfx);
+
+                // Proxy comm keys (healthy ranks only).
+                if (!is_faulty_rank) {
+                    this->globalStore_->deleteKey(
+                        "NCCL_FT_PROXY_READY_ATT_" + std::to_string(att)
+                        + "_" + std::to_string(this->rank_));
+                }
+            }
+
+            // Clean up lazy-init (attempt=0) keys on the first fault round.
+            if (cur_round == 0) {
+                std::string sfx0 = "NODE_" + std::to_string(node_id)
+                                 + "_PG_" + std::to_string(this->getUid())
+                                 + "_ATT_0";
+                this->globalStore_->deleteKey(
+                    "NCCL_FT_LOCAL_ARRIVE_" + sfx0 + "_LR_" + std::to_string(local_rank));
+                this->globalStore_->deleteKey(
+                    "NCCL_FT_LOCAL_READY_" + sfx0 + "_LR_" + std::to_string(local_rank));
             }
         }
 
-        // rank 0 負責清除共用 keys
+        // rank 0 cleans shared round-scoped keys, and the winning proxy-ID key.
         if (this->rank_ == 0) {
             this->globalStore_->deleteKey("NCCL_FT_COMMIT_" + round_str);
             this->globalStore_->deleteKey("NCCL_FT_SS_AGREED_" + round_str);
-            this->globalStore_->deleteKey("NCCL_FT_PROXY_ID_" + round_str);
+            // Clean proxy ID key for every attempt (only the winning one was
+            // actually written, but deleting a non-existent key is harmless).
+            for (uint64_t att = 1; att <= cur_attempt; ++att) {
+                this->globalStore_->deleteKey(
+                    "NCCL_FT_PROXY_ID_ATT_" + std::to_string(att));
+            }
         }
         LOG(INFO) << logPrefix() << "[NCCL-FT] TCPStore keys cleaned for round=" << cur_round;
     } catch (const std::exception& e) {
