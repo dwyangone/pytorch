@@ -1145,7 +1145,7 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   //
   // Lifecycle:
   //   allreduce_impl (main thread):
-  //     get_or_allocate_shadow_buffer() allocates pinned CPU buffer once.
+  // 
   //     shadow_pre lambda runs on shadow_copy_stream_ (independent of NCCL
   //     stream) to copy GPU gradient -> pinned CPU asynchronously.
   //     shadow_copy_event_ is recorded after the D2H copy so the Watchdog

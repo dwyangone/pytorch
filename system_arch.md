@@ -719,7 +719,6 @@ T5: 後續所有 AllReduce 走降級路徑
 
 | 項目 | 嚴重性 | 說明 |
 |------|--------|------|
-| `get_or_allocate_shadow_buffer` 殭屍函式 | **低危** | `at::Tensor get_or_allocate_shadow_buffer(const at::Tensor& t)` 宣告在 hpp 行 1229，與新版 `ShadowContext get_or_allocate_shadow_context` 並存，前者已無實作邏輯或永不被呼叫。應刪除宣告。 |
 | `sscanf` 格式字串可移植性 | **低危** | 行 4752：`%lu`/`%lx` 在 Windows 上對應 32-bit `unsigned long` 而非 64-bit `uint64_t`。應改用 `SCNu64`/`SCNx64`（`<cinttypes>`）。 |
 | `ncclCommBanNic` 作用域 | **待確認** | Process-level global 還是 per-comm？影響是否需要在 reinit 前重複呼叫。 |
 | `NCCLFTComm::create` topo discovery | **待確認** | 呼叫後是否確實跳過被 ban 的 NIC？需要實驗確認。 |

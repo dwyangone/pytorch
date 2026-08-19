@@ -2,9 +2,11 @@
 
 #include <nlohmann/json.hpp>
 #include <exception>
+#include <ifaddrs.h>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <net/if.h>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
@@ -4321,50 +4323,98 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
               << " proxy_comm_rank=" << proxy_comm_rank_;
 
     /* ===================================================================== */
-    /* --- [NCCL-FT: 執行對稱物理黑名單遮蔽] --- */
+    /* --- [NCCL-FT: Phase 1 - Ban faulty NIC (affects IB transport only)] --- */
     for (int d : faulty_devs) {
         LOG(INFO) << logPrefix() << "[NCCL-FT] 呼叫底層 API ncclCommBanNic，將 NIC " << d << " 徹底遮蔽";
         ncclCommBanNic(d);
     }
     /* ===================================================================== */
 
-    // 1. 為了確保驅動鎖被釋放，讓「所有 Rank (包含 Faulty)」都進行排空等待
+    // Brief pause so the IB driver lock is released before ncclCommAbort
+    // competes for it in the GC thread.
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
-    // Force NCCL bootstrap (ncclGetUniqueId / ncclCommInitRank) to use loopback
-    // for intra-node comm creation.  After banning an IB NIC via NCCL_IB_HCA,
-    // NCCL's bootstrap socket would normally re-use the bootstrapNetIfAddr
-    // chosen at process startup (a dead/banned IB NIC), causing ncclSocketInit
-    // to fail.  We must both update the env var AND reset the bootstrap
-    // singleton so bootstrapNetInit() re-runs and picks up "lo".
-    setenv("NCCL_SOCKET_IFNAME", "lo", 1);
-    nccl_ft_reset_bootstrap_net();
-    LOG(INFO) << logPrefix()
-              << "[NCCL-FT] Set NCCL_SOCKET_IFNAME=lo and reset bootstrap net.";
+    // Phase 2: Rebuild local NVLink comm (intra-node, no IB needed).
+    //
+    // local_nvlink_comm_ uses only NVLink — it never touches IB transport.
+    // We must NOT reset the IB cache here, because that would trigger IB
+    // re-discovery with the reduced NIC set, causing NCCL to renumber vNic
+    // indices.  Any GPU whose NCCL-assigned vNic index is >= (total_nics - 1)
+    // would then get "Requested properties for vNic N, only N vNics created".
+    //
+    // For the bootstrap socket (ncclGetUniqueId) we need an AF_INET interface
+    // that is UP, not a loopback, not an IB/RoCE port (mlx5_*), and reachable
+    // by all other ranks on the same host.  We scan getifaddrs() at runtime so
+    // the choice adapts if one Ethernet port goes down.
+    // We deliberately do NOT call nccl_ft_reset_ib_cache() here.
+    {
+        // Scan for the first UP, non-loopback, non-IB AF_INET interface.
+        // Exclusion prefixes: lo, virbr, docker, br_, mlx, ib.
+        // Any surviving enp*/eth*/bond* interface is suitable.
+        auto is_excluded = [](const char* name) {
+            static const char* const skip[] = {
+                "lo", "virbr", "docker", "br_", "mlx", "ib"
+            };
+            for (const char* p : skip) {
+                if (strncmp(name, p, strlen(p)) == 0) return true;
+            }
+            return false;
+        };
 
-    // 2. 動態組合硬性黑名單環境變數 (Hard-Ban)
-    std::string hca_ban_str = "";
-    for (int d : faulty_devs) {
-        // "^" 在 NCCL_IB_HCA 中代表「排除」
-        hca_ban_str += "^mlx5_" + std::to_string(d) + ",";
+        std::string chosen_if;
+        struct ifaddrs* ifa_list = nullptr;
+        if (getifaddrs(&ifa_list) == 0) {
+            for (struct ifaddrs* ifa = ifa_list; ifa != nullptr; ifa = ifa->ifa_next) {
+                if (!ifa->ifa_addr) continue;
+                if (ifa->ifa_addr->sa_family != AF_INET) continue;
+                if (!(ifa->ifa_flags & IFF_UP)) continue;
+                if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+                if (is_excluded(ifa->ifa_name)) continue;
+                chosen_if = ifa->ifa_name;
+                break;
+            }
+            freeifaddrs(ifa_list);
+        }
+
+        if (chosen_if.empty()) {
+            // Fallback: let NCCL pick (original IB address may still be used,
+            // but this is better than hard-failing).
+            LOG(WARNING) << logPrefix()
+                         << "[NCCL-FT] No suitable Ethernet interface found for "
+                         << "bootstrap; leaving NCCL_SOCKET_IFNAME unchanged.";
+        } else {
+            setenv("NCCL_SOCKET_IFNAME", chosen_if.c_str(), 1);
+            nccl_ft_reset_bootstrap_net();
+            LOG(INFO) << logPrefix()
+                      << "[NCCL-FT] Set NCCL_SOCKET_IFNAME=" << chosen_if
+                      << " and reset bootstrap net (IB cache NOT reset).";
+        }
     }
-    if (!hca_ban_str.empty()) {
-        hca_ban_str.pop_back(); // 移除最後一個逗號
-        // 將環境變數設為 ^mlx5_0，強制 IB 驅動無視這張網卡！
-        setenv("NCCL_IB_HCA", hca_ban_str.c_str(), 1); 
-        LOG(INFO) << logPrefix() << "[NCCL-FT] 已動態設定環境變數 NCCL_IB_HCA=" << hca_ban_str;
-    }
 
-    // 3. 強制重置 IB 快取，讓上面的環境變數立刻生效！
-    nccl_ft_reset_ib_cache();
-    LOG(INFO) << logPrefix() << "[NCCL-FT] IB 驅動快取已重置，準備重建 Local NVLink Comm...";
-
-    // 4. 所有 Rank (包含 Faulty) 重建全新的、無毒的 NVLink comm
-    // Pass ft_round_+1 as the attempt index.  ft_round_ is 2PC-agreed and
-    // identical on every rank, so all ranks use the same key set.  Using +1
-    // (instead of ft_round_ directly) guarantees this is always distinct from
-    // the lazy-init call which uses attempt=0, even when ft_round_==0.
+    // 4. All ranks (including faulty) rebuild a fresh NVLink-only local comm.
+    // Pass ft_round_+1 as the attempt index so keys are distinct from lazy-init
+    // (attempt=0) and from prior recovery rounds.
     initLocalNvlinkComm(/*attempt=*/ft_round_ + 1);
+
+    // Phase 3: Now reset IB cache and re-apply NCCL_IB_HCA so that the
+    // subsequent proxy_global_comm creation (which DOES use IB) avoids the
+    // faulty NIC.  This must happen AFTER initLocalNvlinkComm completes so
+    // the NVLink comm's topo path selection is not affected by the reduced
+    // vNic count.
+    {
+        std::string hca_ban_str;
+        for (int d : faulty_devs) {
+            hca_ban_str += "^mlx5_" + std::to_string(d) + ",";
+        }
+        if (!hca_ban_str.empty()) {
+            hca_ban_str.pop_back();
+            setenv("NCCL_IB_HCA", hca_ban_str.c_str(), 1);
+            LOG(INFO) << logPrefix()
+                      << "[NCCL-FT] 已動態設定環境變數 NCCL_IB_HCA=" << hca_ban_str;
+        }
+    }
+    nccl_ft_reset_ib_cache();
+    LOG(INFO) << logPrefix() << "[NCCL-FT] IB 驅動快取已重置，準備重建 proxy_global_comm_...";
 
     // 5. 重建 Proxy Global Comm (只有健康節點參與)
     if (!is_faulty) {
