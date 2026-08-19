@@ -4396,25 +4396,15 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     // (attempt=0) and from prior recovery rounds.
     initLocalNvlinkComm(/*attempt=*/ft_round_ + 1);
 
-    // Phase 3: Now reset IB cache and re-apply NCCL_IB_HCA so that the
-    // subsequent proxy_global_comm creation (which DOES use IB) avoids the
-    // faulty NIC.  This must happen AFTER initLocalNvlinkComm completes so
-    // the NVLink comm's topo path selection is not affected by the reduced
-    // vNic count.
-    {
-        std::string hca_ban_str;
-        for (int d : faulty_devs) {
-            hca_ban_str += "^mlx5_" + std::to_string(d) + ",";
-        }
-        if (!hca_ban_str.empty()) {
-            hca_ban_str.pop_back();
-            setenv("NCCL_IB_HCA", hca_ban_str.c_str(), 1);
-            LOG(INFO) << logPrefix()
-                      << "[NCCL-FT] 已動態設定環境變數 NCCL_IB_HCA=" << hca_ban_str;
-        }
-    }
-    nccl_ft_reset_ib_cache();
-    LOG(INFO) << logPrefix() << "[NCCL-FT] IB 驅動快取已重置，準備重建 proxy_global_comm_...";
+    // Phase 3: Rebuild proxy_global_comm_ (healthy ranks only).
+    // ncclCommBanNic() called above already marks the faulty NIC in the
+    // global banned-mask; topo.cc reads that mask during ncclCommInitRankConfig
+    // topology discovery and zeroes bandwidth on the banned NIC, so NCCL's
+    // path-finder naturally excludes it.  We must NOT call
+    // nccl_ft_reset_ib_cache() here: doing so renumbers the vNic indices
+    // (removing mlx5_0 shifts indices 1-7 down to 0-6), but the comm-init
+    // path still maps GPU N to vNic N, causing "Requested properties for
+    // vNic 7, only 7 vNics have been created" for the highest-indexed GPU.
 
     // 5. 重建 Proxy Global Comm (只有健康節點參與)
     if (!is_faulty) {
