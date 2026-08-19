@@ -4246,56 +4246,38 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 
     // Mark proxy comm not-ready before rebuilding.
     proxy_comm_ready_.store(false, std::memory_order_release);
-    /* ===================================================================== */
-    /* 使用背景非同步執行緒進行垃圾回收 (Async GC) */
-    /* ===================================================================== */
-    // 1. Capture ownership of the old communicators before releasing the
-    //    shared_ptr slots.  The ref count stays >= 1 so the objects are not
-    //    destroyed here.
-    auto dead_proxy = this->proxy_global_comm_;
-    auto dead_local = this->local_nvlink_comm_;
 
-    // 2. Drop the PG's references; the GC thread owns the objects now.
-    this->proxy_global_comm_.reset();
-    this->local_nvlink_comm_.reset();
-
-    // 3. Abort and destroy in a detached background thread so that a
-    //    potentially blocking ncclCommAbort() (e.g. a stuck GPU kernel) never
-    //    stalls the recovery path.
+    // Synchronously abort and release old communicators before calling
+    // ncclCommInitRankConfig for the new ones.  A detached GC thread with a
+    // sleep heuristic races with the new ncclCommInitRankConfig calls: NCCL
+    // rejects initialising a communicator on a GPU that still has another live
+    // communicator mid-abort, returning ncclInvalidUsage.  The original reason
+    // for async GC (avoiding IB driver lock contention) no longer applies here
+    // because we call ncclBanNic first and the new comms do not use the dead
+    // NIC.  Blocking here is safe: the global comm was already aborted by the
+    // 2PC side-car thread before this function is called.
     //
     // Why abort() before reset():
     //   ~NCCLFTComm() intentionally does NOT call ncclCommAbort/Destroy — it
     //   only prints a WARN_ONCE about the leak.  Without an explicit abort()
     //   here, the NCCL comm handle is silently leaked every recovery round.
-    //
-    // dead_local (NVLink-only comm) is healthy — no NIC fault can corrupt it —
-    // but it must still be properly destroyed to free GPU resources.
-    //
-    // dead_proxy may be null on the first recovery round (no prior proxy comm).
-    if (dead_proxy != nullptr || dead_local != nullptr) {
-        std::thread([dead_proxy, dead_local, prefix = this->logPrefix()]() mutable {
-            c10::setThreadName("pt_nccl_gc");
-            LOG(INFO) << prefix << "[NCCL-FT] GC thread: aborting old communicators...";
-
-            // Brief pause so the new comms can start their bootstrap before
-            // we enter ncclCommAbort, which competes for the IB driver lock.
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-
+    {
+        auto dead_proxy = std::move(this->proxy_global_comm_);
+        auto dead_local = std::move(this->local_nvlink_comm_);
+        // shared_ptr slots are now null; no other thread can observe the old
+        // objects through them.
+        if (dead_proxy != nullptr || dead_local != nullptr) {
+            LOG(INFO) << logPrefix() << "[NCCL-FT] GC: aborting old communicators (synchronous)...";
             if (dead_proxy && !dead_proxy->isAborted()) {
                 dead_proxy->abort("FT GC - retiring old proxy comm");
             }
             if (dead_local && !dead_local->isAborted()) {
                 dead_local->abort("FT GC - retiring old local NVLink comm");
             }
-            // Reset triggers ~NCCLFTComm(); abort() above already set
-            // aborted_=true so the destructor's WARN_ONCE is suppressed.
-            dead_proxy.reset();
-            dead_local.reset();
-
-            LOG(INFO) << prefix << "[NCCL-FT] GC thread: old communicators retired.";
-        }).detach();
+            // Destructors run here; aborted_=true suppresses WARN_ONCE.
+            LOG(INFO) << logPrefix() << "[NCCL-FT] GC: old communicators retired.";
+        }
     }
-    /* ===================================================================== */
 
     int local_rank = rank_ % localDeviceCount_;
     bool is_faulty = (faulty_devs.count(local_rank) > 0);
