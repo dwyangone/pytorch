@@ -343,9 +343,12 @@ extern "C" void nccl_ft_global_fault_callback(int dev_idx) {
 
 /* --- [NCCL-FT: C API 到 C++ 實體的全域橋樑] --- */
 extern "C" {
-    // 宣告我們在 NCCL src/init.cc 中新增的黑名單 API
     ncclResult_t ncclCommBanNic(int dev_idx);
     void nccl_ft_reset_ib_cache();
+    // Reset bootstrapNetInitDone so that the next ncclGetUniqueId() re-reads
+    // NCCL_SOCKET_IFNAME.  Must be called after setenv(NCCL_SOCKET_IFNAME)
+    // and before the recovery-round ncclGetUniqueId().
+    void nccl_ft_reset_bootstrap_net();
 }
 /* ========================================================================= */
 
@@ -4080,17 +4083,33 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
     }
 
     // ── Phase 1: generate or retrieve the per-node ncclUniqueId ──────────────
+    // The ID generator must be a healthy rank.  If local_rank==0 is faulty (its
+    // NIC is dead), ncclGetUniqueId() fails because NCCL's bootstrap socket
+    // initialisation picks the banned IB interface.  Use the first local rank
+    // that is NOT in faulty_local_devs_ as the generator instead.
+    int id_generator = 0; // default: local_rank 0
+    {
+        std::lock_guard<std::mutex> lk(faulty_devs_mutex_);
+        for (int lr = 0; lr < localDeviceCount_; ++lr) {
+            if (faulty_local_devs_.count(lr) == 0) {
+                id_generator = lr;
+                break;
+            }
+        }
+    }
+
     ncclUniqueId localId;
     std::string local_id_key = "NCCL_FT_LOCAL_COMM_ID_" + key_suffix;
 
-    if (local_rank == 0) {
+    if (local_rank == id_generator) {
         C10D_NCCL_FT_CHECK(ncclGetUniqueId(&localId), std::nullopt);
         auto vec = std::vector<uint8_t>(
             reinterpret_cast<uint8_t*>(&localId),
             reinterpret_cast<uint8_t*>(&localId) + NCCL_UNIQUE_ID_BYTES);
         this->globalStore_->set(local_id_key, vec);
         LOG(INFO) << logPrefix()
-                  << "[NCCL-FT] Local rank 0 generated and stored NVLink Comm ID for Node "
+                  << "[NCCL-FT] Local rank " << id_generator
+                  << " (first healthy) generated and stored NVLink Comm ID for Node "
                   << node_id << " (attempt=" << attempt << ")";
     } else {
         this->globalStore_->wait({local_id_key}, std::chrono::seconds(30));
@@ -4100,7 +4119,7 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
 
     // N-to-N all-ready barrier: ensure all local ranks on this node have
     // retrieved localId before any of them enters NCCLFTComm::create.
-    // Without this, local_rank==0 may enter create immediately after writing
+    // Without this, the id_generator may enter create immediately after writing
     // the key while other ranks haven't retrieved it yet, causing bootstrap hang.
     {
         std::string my_ready_key = "NCCL_FT_LOCAL_READY_" + key_suffix
@@ -4119,8 +4138,8 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
                   << "[NCCL-FT] All-ready barrier passed for local_nvlink_comm_ (node="
                   << node_id << ").";
 
-        // All ranks have now read localId; local_rank==0 cleans up the ID key.
-        if (local_rank == 0) {
+        // All ranks have now read localId; the id_generator cleans up the ID key.
+        if (local_rank == id_generator) {
             try {
                 this->globalStore_->deleteKey(local_id_key);
             } catch (const std::exception& e) {
@@ -4312,6 +4331,16 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     // 1. 為了確保驅動鎖被釋放，讓「所有 Rank (包含 Faulty)」都進行排空等待
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
+    // Force NCCL bootstrap (ncclGetUniqueId / ncclCommInitRank) to use loopback
+    // for intra-node comm creation.  After banning an IB NIC via NCCL_IB_HCA,
+    // NCCL's bootstrap socket would normally re-use the bootstrapNetIfAddr
+    // chosen at process startup (a dead/banned IB NIC), causing ncclSocketInit
+    // to fail.  We must both update the env var AND reset the bootstrap
+    // singleton so bootstrapNetInit() re-runs and picks up "lo".
+    setenv("NCCL_SOCKET_IFNAME", "lo", 1);
+    nccl_ft_reset_bootstrap_net();
+    LOG(INFO) << logPrefix()
+              << "[NCCL-FT] Set NCCL_SOCKET_IFNAME=lo and reset bootstrap net.";
 
     // 2. 動態組合硬性黑名單環境變數 (Hard-Ban)
     std::string hca_ban_str = "";
