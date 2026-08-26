@@ -1,6 +1,6 @@
 # ProcessGroupNCCLFT — System Architecture
 
-> 依據 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實際程式碼撰寫，2026-08（第三次修訂）。
+> 依據 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實際程式碼撰寫，2026-08（第四次修訂）。
 
 ---
 
@@ -609,6 +609,8 @@ T3: Side-car thread（pt_nccl_ft_side）
           ├─ globalComm->abort()（若還未 abort）
           ├─ rebuild_shadow_ping_pong_topology()
           │    ├─ ncclCommBanNic(0)（所有 rank 都呼叫）
+          │    ├─ [方案二] ncclTopoPopulateNics: NIC 0 speed=0（第一層防護）
+          │    ├─ [方案二] ncclTopoGetLocalNetType: modulo filter 跳過 NIC 0（第二層防護）
           │    └─ proxy_global_comm_ = NCCLFTComm::create(14, new_rank, ...)
           ├─ is_degraded_ = true
           ├─ seqs_to_replay = { seq | seq >= agreed_ss }
@@ -616,6 +618,10 @@ T3: Side-car thread（pt_nccl_ft_side）
           │    ctx.copy_event.sync()
           │    H2D restore (flatten + copy_)
           │    execute_shadow_allreduce
+          │      ├─ PROXY:   ncclGroupStart/End recv wards → AllReduce → ncclGroupStart/End send
+          │      ├─ FAULTY:  ncclSend → ncclRecv (via NVLink through proxy)
+          │      └─ HEALTHY: ncclAllReduce → cudaStreamSynchronize → ncclCommGetAsyncError
+          │                  [P0 fix] 任一失敗即 throw → 側車 catch → 觸發 rebuild attempt=N+1
           │    record replayed_end_event
           │    work_ptr->setException(nullptr)
           │    work_ptr->future_->markCompleted(...)
@@ -639,16 +645,92 @@ T5: 後續所有 AllReduce 走降級路徑
 
 ---
 
-## 十二、NCCL Custom Fork 對應
+## 十二、NCCL Custom Fork 修改說明
 
-| NCCL 修改 | 位置 | 作用 |
-|-----------|------|------|
-| `ncclIbResiliencyHandleDeviceFailure()` | `transport/net_ib/p2p_resiliency.cc` | `ncclSystemError → ncclRemoteError`（讓 PG 可辨識 NIC 故障） |
-| `ncclIbResiliencyProbeHandleCompletionEvent()` | 同上 | `ncclSuccess → ncclRemoteError` |
-| `ncclTopoPopulateNics()` 移除 ban check | `graph/topo.cc` | 允許 `ncclCommBanNic` 在 reinit 時生效（topo discovery 尊重 ban list） |
-| `ncclCommBanNicReset()` | `init.cc` | 重置 ban list（預留 API，目前暫未使用） |
-| `nccl_ft_trigger_fault(dev_idx)` | `init.cc` | 呼叫已註冊的 fault callback |
-| `ncclCommRegisterFaultCallback(comm, cb)` | `init.cc` | 每 comm 可獨立註冊一個 fault callback |
+以下為 `nccl/` 目錄下所有 NCCL-FT 相關的原始碼修改，分為三類：
+
+### 12.1 IB 傳輸層錯誤分類（`transport/net_ib/`）
+
+| 修改位置 | 函式 | 修改內容 |
+|----------|------|---------|
+| `transport/net_ib/p2p_resiliency.cc` | `ncclIbResiliencyHandleDeviceFailure()` | 將原本的 `ncclSystemError` 改回傳 `ncclRemoteError`，讓 ProcessGroupNCCLFT 的 Watchdog 能辨識為可容錯的 NIC 硬體故障，而非致命系統錯誤 |
+| `transport/net_ib/p2p_resiliency.cc` | `ncclIbResiliencyProbeHandleCompletionEvent()` | 探針 QP 偵測到完成錯誤時從 `ncclSuccess` 改為 `ncclRemoteError`，確保 fault callback 被觸發 |
+
+### 12.2 Fault Callback 與 Ban 機制（`init.cc`）
+
+| 函式 / 變數 | 說明 |
+|-------------|------|
+| `g_nccl_ft_banned_nics_mask` | Process-level global `uint64_t`，bit k=1 代表 NIC index k 被 ban。由 `ncclCommBanNic(k)` 設定，`ncclCommBanNicReset()` 清除 |
+| `nccl_ft_is_nic_banned(dev_idx)` | 查詢 global ban mask，在 `ncclTopoPopulateNics` 與 `ncclTopoGetLocalNetType` 中呼叫 |
+| `nccl_ft_is_disabled()` | 檢查 `NCCL_FT_DISABLE` 環境變數，若為 1 則所有 FT 邏輯（包含 ban 和 filter）均跳過 |
+| `ncclCommBanNic(dev_idx)` | 設定 global ban mask bit，process-level 生效（不綁定特定 comm） |
+| `ncclCommBanNicReset()` | 清除整個 global ban mask（預留 API，目前未使用） |
+| `ncclCommRegisterFaultCallback(comm, cb)` | 每個 comm 可獨立註冊 fault callback；故障時 NCCL progress thread 呼叫 callback |
+| `nccl_ft_trigger_fault(dev_idx)` | 在 IB 傳輸層確認故障後呼叫，遍歷所有已註冊的 comm callback |
+
+### 12.3 拓撲路由遮蔽（`graph/topo.cc`）— 方案二（雙重防護）
+
+NCCL 的拓撲路由使用兩個關鍵步驟：（1）建構 topo XML graph，（2）每個 GPU 的每個 channel 從可達 NET 節點中選一個 NIC。兩個步驟都需要排除 banned NIC，方案二同時處理兩者：
+
+**第一層：`ncclTopoPopulateNics()`（`graph/topo.cc` ~行 1435）**
+
+```c
+// 在把每張 NIC 的屬性寫入 XML 之前，若該 NIC 被 ban：
+if (nccl_ft_is_disabled() == 0 && nccl_ft_is_nic_banned(n)) {
+    WARN("NCCL-FT: 軟性物理遮蔽故障網卡 %d (將頻寬設為 0，阻斷路由)", n);
+    props.speed = 0;
+    props.maxComms = 0;
+    props.latency = 999999;
+}
+```
+
+作用：在 topo graph 建構階段將 banned NIC 的頻寬清零，使 NCCL 的 path-finder（BFS/最短路徑）不選擇通過它的路由。每次 `ncclCommInitRankConfig` 都會重新執行此步驟。
+
+**第二層：`ncclTopoGetLocalNetType()`（`graph/topo.cc` ~行 1809）— 方案二新增**
+
+```c
+// ncclTopoGetLocal() 取得 GPU 可達的所有 NET 節點後，
+// 在 modulo 選取之前過濾掉 banned NIC：
+if (nccl_ft_is_disabled() == 0) {
+    int filtered[NCCL_TOPO_MAX_NODES];
+    int filteredCount = 0;
+    for (int i = 0; i < localNetCount; i++) {
+        int net_dev = system->nodes[type].nodes[localNets[i]].net.dev;
+        if (!nccl_ft_is_nic_banned(net_dev)) {
+            filtered[filteredCount++] = localNets[i];
+        }
+    }
+    if (filteredCount > 0) {  // 保護：至少留一張 NIC
+        for (int i = 0; i < filteredCount; i++) localNets[i] = filtered[i];
+        localNetCount = filteredCount;
+    }
+}
+```
+
+作用：`ncclTopoGetLocal()` 回傳的是從 GPU 可達的 NET 節點列表，即使速度已清零，節點仍存在於 graph 中。若不過濾，`net % localNetCount` 的 modulo 仍可能落在 banned NIC 的 index，導致後續 `ncclIbConnect` 建立 QP 時使用死亡設備。此層確保每個 channel 的最終 NIC 分配結果永遠排除 banned NIC。
+
+**為什麼需要雙重防護：**
+
+| 問題 | 第一層解決 | 第二層解決 |
+|------|-----------|-----------|
+| path-finder 選路繞過 banned NIC | ✅ speed=0 讓 BFS 不選此路徑 | — |
+| channel 分配 modulo 落在 banned NIC index | ✗ 節點仍在 graph，modulo 仍可能選到 | ✅ 過濾後 modulo 只在非 banned 節點中選 |
+| 全局 IB device cache（`ncclNIbDevs`）已建立 | ✗ 第一次 init 後 cache 不重建 | ✅ 過濾使用 net.dev index 對比 global ban mask |
+
+### 12.4 方案三（ABI 變更）已 Revert
+
+原本的「方案三」嘗試在 `ncclConfig_t` 新增 `uint64_t bannedNicsMask` 欄位，讓每個 communicator 可以攜帶自己的 NIC ban mask。此方案已被 revert，原因：
+
+1. **ABI 破壞**：`ncclConfig_t` 是公開 ABI struct，新增欄位改變 size，導致用舊 header 編譯的呼叫端存取新欄位時行為未定義。
+2. **冗餘**：global ban mask（`g_nccl_ft_banned_nics_mask`）已是 process-level，所有新 comm 自動繼承；per-comm 版本帶來複雜度卻無額外收益。
+3. **方案二已充分**：第一層（speed=0）+ 第二層（modulo filter）已足以防止 banned NIC 被選中。
+
+已 revert 的檔案：
+- `nccl/src/nccl.h.in`：移除 `bannedNicsMask` 欄位與 initializer
+- `nccl/src/graph/topo.h`：移除 `ncclTopoNetInfo::bannedNicsMask`
+- `nccl/src/graph/topo.cc`：移除 `netInfo.bannedNicsMask` 傳播與 per-comm check
+- `nccl/src/init.cc`：移除 `comm->config.bannedNicsMask` 賦值
+- `torch/csrc/distributed/c10d/ProcessGroupNCCLFT.cpp`：移除 `config.bannedNicsMask |= ...` 迴圈
 
 ---
 
@@ -714,15 +796,15 @@ T5: 後續所有 AllReduce 走降級路徑
 | **GC 執行緒不呼叫 abort()，造成 NCCL 資源洩漏** | `~NCCLFTComm()` 只印警告，不 ncclCommAbort/Destroy；舊版 GC 執行緒直接 reset() 等於靜默洩漏 | GC 執行緒在 sleep 後先呼叫 `abort()`（設 aborted_=true 以抑制警告），再 reset() |
 | **`pending_shadow_seq_` 在 recovery 後未重置** | 第二次故障的 PROPOSE 帶著第一輪的 checkpoint seq，agreed_ss 錯誤，可能重播已完成的 op | `recover_and_replay_inflight_ops()` 末尾在 `final_commit_op_.store(0)` 前重置 `pending_shadow_seq_` 為 `UINT64_MAX` |
 | **DEBUG-HANG / DEBUG-RUNAWAY log 殘留** | 暫時性調試輸出混入生產 log，干擾問題分析 | 移除所有 `[DEBUG-HANG]` 和 `[DEBUG-RUNAWAY]` log |
+| **P0：HEALTHY rank rebuild deadlock（Pre-rebuild global barrier 死鎖）** | attempt=N 失敗後只有 PROXY rank 和直接收到 socket error 的 HEALTHY rank 觸發 rebuild attempt=N+1；其餘 HEALTHY rank 的 ncclAllReduce 非同步完成，side-car 不感知錯誤，不重入 rebuild，導致 Pre-rebuild global barrier 等不到所有 16 rank，永遠死鎖 | `execute_shadow_allreduce` HEALTHY 路徑在 ncclAllReduce enqueue 後加 `cudaStreamSynchronize` + `ncclCommGetAsyncError`；任一失敗即 throw，讓側車 catch 到並重入 rebuild |
+| **P1（方案二）：proxy_global_comm_ 仍使用 banned NIC 建立 QP** | `ncclTopoGetLocal()` 回傳的 NET 節點列表包含速度已清零的 banned NIC；`net % localNetCount` 的 modulo 仍可能落在該 NIC 的 index，導致 `ncclIbConnect` 對死亡 NIC 建立 QP，`ibv_modify_qp` 失敗（errno=61 或 22） | `ncclTopoGetLocalNetType()` 在 `ncclTopoGetLocal()` 之後、modulo 之前，過濾掉所有 `nccl_ft_is_nic_banned(net_dev)==true` 的 NET 節點；保護條件 `filteredCount > 0` 避免清空候選列表 |
 
 ### ❓ 待確認 / 待修復
 
 | 項目 | 嚴重性 | 說明 |
 |------|--------|------|
 | `sscanf` 格式字串可移植性 | **低危** | 行 4752：`%lu`/`%lx` 在 Windows 上對應 32-bit `unsigned long` 而非 64-bit `uint64_t`。應改用 `SCNu64`/`SCNx64`（`<cinttypes>`）。 |
-| `ncclCommBanNic` 作用域 | **待確認** | Process-level global 還是 per-comm？影響是否需要在 reinit 前重複呼叫。 |
-| `NCCLFTComm::create` topo discovery | **待確認** | 呼叫後是否確實跳過被 ban 的 NIC？需要實驗確認。 |
-| 側車在 recovery_mutex_ 上潛在死結 | **待確認** | 側車呼叫 recover_and_replay → 鎖 recovery_mutex_；主執行緒的 wait() 若也觸發 recover_and_replay，兩者會序列化（不死結，因為使用 lock_guard）。但若側車持鎖期間主執行緒卡在 recover 上等鎖，會多等一輪。目前可接受。 |
+| 側車在 recovery_mutex_ 上潛在死結 | **低危** | 側車呼叫 recover_and_replay → 鎖 recovery_mutex_；主執行緒 wait() 不觸發 recover，無死結風險。但側車持鎖期間若觸發新 exception，後者需等待當前鎖釋放，多等一輪，可接受。 |
 
 ### 遺留效能注意事項
 

@@ -1,6 +1,6 @@
 # ProcessGroupNCCLFT — Shadow Ping-Pong Failover: Implementation Plan
 
-> 以 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實作狀態為準（2026-08，第三次修訂）
+> 以 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實作狀態為準（2026-08，第四次修訂）
 
 ---
 
@@ -87,19 +87,23 @@
 | **GC 執行緒加入 abort()** — 確保舊 comm 實際清理（`~NCCLFTComm` 不自動 abort） | rebuild ~4219-4240 | ✅ |
 | **`pending_shadow_seq_` 在 recover_and_replay 末尾重置為 UINT64_MAX** — 消除逐步故障的 stale checkpoint | recover_and_replay ~5565 | ✅ |
 | **移除所有 DEBUG-HANG / DEBUG-RUNAWAY log** — 清除暫時性調試輸出 | execute_shadow_allreduce, shadow_pre | ✅ |
+| **[P0 fix] HEALTHY rank 在 execute_shadow_allreduce 加入 stream sync + ncclCommGetAsyncError**，確保所有 rank 都能感知失敗並觸發 rebuild | execute_shadow_allreduce ~4771 | ✅ |
+| **[P1 方案二] ncclTopoGetLocalNetType 在 modulo 前過濾 banned NIC**，防止 channel 分配落在死亡 NIC | nccl/src/graph/topo.cc ~1809 | ✅ |
+| **[Revert 方案三] 移除 ncclConfig_t::bannedNicsMask**，採用純方案二（無 ABI 變更） | nccl.h.in, topo.h, topo.cc, init.cc, ProcessGroupNCCLFT.cpp | ✅ |
 
 ---
 
 ## 三、待確認與待修復項目
 
-### P0：確認 NCCL Fork 行為
+### P0：端對端測試（進行中）
 
-**問題 1：** `ncclCommBanNic(dev_idx)` 是 process-level global 還是 per-comm？
-- 如果是 process-level：rebuild 前呼叫一次即可，後續 `NCCLFTComm::create` 建立的新 comm 自動跳過被 ban 的 NIC。
-- 如果是 per-comm：ban 在 abort 後失效，需要在 reinit 前再次呼叫（目前 `rebuild_shadow_ping_pong_topology` 已在所有 rank 呼叫 ban，應可覆蓋此情況）。
+**問題 1：** `ncclCommBanNic(dev_idx)` 是 process-level global。
+- 已確認：`g_nccl_ft_banned_nics_mask` 是 process-level global，`ncclTopoPopulateNics` 讀取它在每次 `ncclCommInitRankConfig` 的 topo XML 建構時生效。
+- `rebuild_shadow_ping_pong_topology` 在所有 rank 呼叫 `ncclCommBanNic(d)` 後再建 comm，確保新 comm 的 topo discovery 跳過 banned NIC。
 
-**問題 2：** `NCCLFTComm::create`（即 `ncclCommInitRank`）是否每次都重新執行 topo discovery？
-- 需要實驗確認：呼叫 `ncclCommBanNic(0)` 後再建立新 comm，確認新 comm 不使用 mlx5_0。
+**問題 2：** `NCCLFTComm::create` 每次 reinit 都重新執行 topo discovery？
+- 已確認：每次 `ncclCommInitRankConfig` 都呼叫 `ncclTopoGetSystem`，重新從 XML 建構 topo graph。Global ban mask 在此時生效（`ncclTopoPopulateNics` 設 speed=0）。
+- 方案二額外保護：`ncclTopoGetLocalNetType` 的 modulo 選取也過濾 banned NIC，雙重防護。
 
 **問題 3：** 側車在 recovery_mutex_ 上的執行緒競爭
 - 現行設計：只有側車呼叫 `recover_and_replay_inflight_ops()`，主執行緒的 `wait()` 只呼叫 `future_->wait()`，不再觸發 recover
@@ -198,12 +202,14 @@
 |------|------|
 | `ncclIbResiliencyHandleDeviceFailure`: `ncclSystemError → ncclRemoteError` | ✅ 已完成 |
 | `ncclIbResiliencyProbeHandleCompletionEvent`: `ncclSuccess → ncclRemoteError` | ✅ 已完成 |
-| `topo.cc ncclTopoPopulateNics`: 移除 ban check（讓 `ncclCommBanNic` 在 reinit 時生效） | ✅ 已完成 |
+| `ncclTopoPopulateNics`：global ban mask 軟性遮蔽（speed=0, latency=999999） | ✅ 已完成 |
+| `ncclTopoGetLocalNetType`：modulo 前過濾 banned NIC（方案二） | ✅ 已完成 |
 | `init.cc`: 新增 `ncclCommBanNicReset()` | ✅ 已完成 |
 | `init.cc nccl_ft_trigger_fault`: 呼叫已註冊的 callback | ✅ 已完成 |
 | `ncclCommRegisterFaultCallback` API 可用 | ✅ 已確認（在 first collective 成功呼叫） |
-| **`ncclCommBanNic` 作用域（process-level vs. per-comm）** | ❓ 待確認 |
-| **`NCCLFTComm::create` 在 reinit 時是否每次重新做 topo discovery** | ❓ 待確認 |
+| `ncclCommBanNic` 作用域：**process-level global** | ✅ 已確認 |
+| `NCCLFTComm::create` 每次 reinit 重新 topo discovery | ✅ 已確認 |
+| **方案三 `ncclConfig_t::bannedNicsMask` ABI 變更** | ✅ 已 revert（採用方案二，無 ABI 影響） |
 
 ---
 

@@ -346,11 +346,20 @@ extern "C" void nccl_ft_global_fault_callback(int dev_idx) {
 /* --- [NCCL-FT: C API 到 C++ 實體的全域橋樑] --- */
 extern "C" {
     ncclResult_t ncclCommBanNic(int dev_idx);
+    // Non-blocking: moves old ibv_context/pciPath/mrCache into a stale list.
+    // Must be followed by nccl_ft_cleanup_stale_ib_contexts() once the new comm
+    // is established.
     void nccl_ft_reset_ib_cache();
+    // Blocking deferred cleanup for IB contexts evicted by nccl_ft_reset_ib_cache().
+    // Safe to call from a background thread 1-5s after re-init completes.
+    void nccl_ft_cleanup_stale_ib_contexts();
     // Reset bootstrapNetInitDone so that the next ncclGetUniqueId() re-reads
     // NCCL_SOCKET_IFNAME.  Must be called after setenv(NCCL_SOCKET_IFNAME)
     // and before the recovery-round ncclGetUniqueId().
     void nccl_ft_reset_bootstrap_net();
+    // Reset the socket-transport singleton (ncclNetIfs / ncclNetSocketDevs[]).
+    // Frees pciPath strings.  Must be called after setenv(NCCL_SOCKET_IFNAME).
+    void nccl_ft_reset_net_socket();
 }
 /* ========================================================================= */
 
@@ -5763,6 +5772,17 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     this->pending_shadow_seq_.store(UINT64_MAX, std::memory_order_release);
 
     this->final_commit_op_.store(0, std::memory_order_release);
+
+    // Deferred IB context cleanup: ibv_close_device() blocks if the kernel's
+    // async-events-completed counter is non-zero.  By this point the PORT_ERR
+    // event has already been get()-ed and ack()-ed by the NCCL async thread
+    // (counter = 0), so the call will not block.  We still run it on a
+    // background thread to keep the recovery path latency tight.
+    std::thread([]() {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        nccl_ft_cleanup_stale_ib_contexts();
+    }).detach();
+
     LOG(INFO) << logPrefix() << "[NCCL-FT] 全域重播完成！系統準備進入下一回合: " << this->ft_round_;
 }
 
