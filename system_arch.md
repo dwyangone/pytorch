@@ -1,6 +1,6 @@
 # ProcessGroupNCCLFT — System Architecture
 
-> 依據 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實際程式碼撰寫，2026-08（第四次修訂）。
+> 依據 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實際程式碼撰寫，2026-08（第六次修訂）。
 
 ---
 
@@ -166,8 +166,7 @@ Python DDP
 
 | API | 用途 | 呼叫時機 |
 |-----|------|---------|
-| `ncclCommRegisterFaultCallback(comm, cb)` | 每 rank 各自在自己的 comm 上註冊 fault callback | 第一個 collective 的 lazy-init（行 5039-5076） |
-| `ncclCommBanNic(dev_idx)` | 將指定 NIC 加入黑名單，下次 ncclCommInitRank 跳過 | `rebuild_shadow_ping_pong_topology()` 中，所有 rank 都呼叫 |
+| `ncclCommRegisterFaultCallback(comm, cb)` | 每 rank 各自在自己的 comm 上註冊 fault callback | 第一個 collective 的 lazy-init |
 | `ncclGetUniqueId(&id)` | 生成新 rendezvous ID | rebuild 時 proxy_comm_rank_==0 的 rank 呼叫；initLocalNvlinkComm 時 local_rank==0 呼叫 |
 | `NCCLFTComm::create(size, rank, id, device, config)` | 從頭建立全新 communicator（完整 topo discovery） | local_nvlink_comm_ 初始化 + proxy_global_comm_ rebuild |
 | `ncclAllReduce(...)` | 跨節點 AllReduce | 正常路徑 + 降級路徑（proxy/healthy 角色） |
@@ -220,13 +219,17 @@ if (opts.reduceOp == ReduceOp::SUM && !is_degraded_) {
   3. **All-ready barrier**（Phase 2）：每個 local rank 讀取 ID 後先寫 ready key（`NCCL_FT_LOCAL_READY_..._LR_<lr>`），再 wait 所有 ready key，確保全部 local rank 同時進入 `NCCLFTComm::create`（60 秒超時）
 - all-ready barrier 通過後，local_rank=0 立即 `deleteKey(local_id_key)` 清除 Store 殘留
 
-**proxy_global_comm_（行 4261-4293）：**
+**proxy_global_comm_（行 4346-4543）：**
 - 在 `rebuild_shadow_ping_pong_topology()` 中建立
 - 只有健康 rank 才建立（faulty rank 設 `proxy_global_comm_ = nullptr`）
-- 流程：
-  1. 所有 rank 呼叫 `ncclCommBanNic(d)` 排除所有 faulty NIC（一個 for 迴圈，不重複）
-  2. proxy_comm_rank_ == 0 生成新 `ncclUniqueId`，寫入 TCPStore（key: `NCCL_FT_PROXY_ID_<ft_round_>`）
-  3. `NCCLFTComm::create(proxy_comm_size_, proxy_comm_rank_, proxyId, device.index(), config)`
+- 流程（**環境變數重置方案**）：
+  1. **Data channel**：從 `faulty_devs` 計算健康 HCA 列表（`mlx5_1,mlx5_2,...`），`setenv("NCCL_IB_HCA", healthy_hcas, 1)` + `nccl_ft_reset_ib_cache()`，讓下次 `ncclIbInitDevices()` 重新掃描並只使用健康 NIC。vNic 索引從 0 重新編號（0-6 對應 mlx5_1-mlx5_7），NCCL 用 modulo 分配 GPU→NIC，資料仍能正確到達目標 rank
+  2. **Control channel**：掃描 `getifaddrs()` 找第一個 UP/非 loopback/非 IB 的 Ethernet 介面（fallback 到 `lo`），`setenv("NCCL_SOCKET_IFNAME", chosen_if, 1)` + `nccl_ft_reset_bootstrap_net()` + `nccl_ft_reset_net_socket()`，確保 bootstrap TCP socket 和 Socket transport singleton 都不再走死亡 IB NIC
+  3. Pre-rebuild global barrier（key: `NCCL_FT_REBUILD_SYNC_ATT_<attempt>_R<rank>`），確保所有 16 個 rank 同步到達
+  4. proxy_comm_rank_ == 0 生成新 `ncclUniqueId`，寫入 TCPStore（key: `NCCL_FT_PROXY_ID_ATT_<rebuild_attempt_>`）
+  5. All-ready barrier（key: `NCCL_FT_PROXY_READY_ATT_<attempt>_<rank>`），健康 rank 間同步
+  6. `NCCLFTComm::create(proxy_comm_size_, proxy_comm_rank_, proxyId, device.index(), config)`
+  7. **零元素 AllReduce 驗證**：建立後立即在 ncclStream 上執行 `ncclAllReduce(nullptr, nullptr, 0, ...)` + `cudaStreamSynchronize`，確認 IB transport 穩定後才標記 `proxy_comm_ready_=true`
 
 ### 4.3 proxy_comm 大小與排名計算（行 4194-4209）
 
@@ -241,9 +244,9 @@ proxy_comm_rank_：重新對健康 rank 編號（跳過 faulty_devs）
 
 | 情況 | abort 呼叫者 | 原因 |
 |------|-------------|------|
-| 2PC committed | side-car thread（行 4981） | 強制喚醒卡在 ncclAllReduce 的主執行緒 |
-| recover_and_replay_inflight_ops() 開始 | 側車（recover 在側車內執行）（行 5432-5435） | 確保舊 global comm 徹底死亡再 rebuild |
-| rebuild 完成後（舊 local/proxy comm） | GC 執行緒（行 4228-4232） | `~NCCLFTComm()` 不自動 abort/destroy；GC 執行緒在 5 秒 sleep 後明確呼叫 abort() 再 reset()，避免 NCCL 資源洩漏 |
+| 2PC committed | side-car thread | 強制喚醒卡在 ncclAllReduce 的主執行緒 |
+| recover_and_replay_inflight_ops() 開始 | 側車（recover 在側車內執行） | 確保舊 global comm 徹底死亡再 rebuild |
+| rebuild 開始前（舊 local/proxy comm） | `rebuild_shadow_ping_pong_topology()` 同步 GC | 用 `std::move` 取走舊 comm shared_ptr，立即呼叫 `abort()` 再讓 destructor 執行（**不再使用背景 GC 執行緒**）；原因：背景 GC 執行緒與 `ncclCommInitRankConfig` 之間的 race 會造成 `ncclInvalidUsage` |
 
 ---
 
@@ -391,8 +394,16 @@ Step 1: globalComm->abort("FT Recovery")   [確保舊 comm 死亡]
 
 Step 2: rebuild_shadow_ping_pong_topology()
           └─ 使用最新的 faulty_local_devs_（2PC 已聚合所有節點的故障資訊）
-             ├─ 所有 rank：ncclCommBanNic(d) for d in faulty_devs
-             └─ 健康 rank：NCCLFTComm::create(proxy_comm_size_, proxy_comm_rank_, ...)
+             ├─ 同步 GC：std::move 舊 local/proxy comm → abort() → destructor
+             ├─ [Data] setenv("NCCL_IB_HCA", "mlx5_1,...") + nccl_ft_reset_ib_cache()
+             ├─ [Ctrl] setenv("NCCL_SOCKET_IFNAME", <enp*|lo>) + nccl_ft_reset_bootstrap_net()
+             │          + nccl_ft_reset_net_socket()
+             ├─ Pre-rebuild global barrier (NCCL_FT_REBUILD_SYNC_ATT_<att>_R<r>)
+             ├─ initLocalNvlinkComm(attempt=rebuild_attempt_)
+             ├─ 健康 rank：
+             │    NCCLFTComm::create(proxy_comm_size_, proxy_comm_rank_, ...)
+             │    零元素 AllReduce 驗證 (cudaStreamSynchronize 後檢查 async error)
+             └─ proxy_comm_ready_ = true
         is_degraded_ = true
 
 Step 3: 收集 seqs_to_replay
@@ -415,12 +426,20 @@ Step 4: 依序 H2D restore + replay（迴圈外宣告一個 restore_done CUDAEve
 
 Step 5: ft_round_++         [Bug A fix：讓 side-car 知道可以進入下一輪]
         TCPStore cleanup:
-          deleteKey("NCCL_FT_PROPOSE_<rank>_<round>")            [每個 rank 清自己的]
-          if !is_faulty: deleteKey("NCCL_FT_PROXY_READY_<round>_<rank>")
-          if cur_round==0: deleteKey("NCCL_FT_LOCAL_READY_NODE_<node>_PG_<uid>_ROUND_0_LR_<lr>")
-          if rank==0: deleteKey("NCCL_FT_COMMIT_<round>")
-                      deleteKey("NCCL_FT_SS_AGREED_<round>")
-                      deleteKey("NCCL_FT_PROXY_ID_<round>")
+          每個 rank（每個 attempt att=1..cur_attempt）:
+            deleteKey("NCCL_FT_PROPOSE_<rank>_<round>")
+            deleteKey("NCCL_FT_REBUILD_SYNC_ATT_<att>_R<rank>")
+            deleteKey("NCCL_FT_LOCAL_ARRIVE_NODE_<node>_PG_<uid>_ATT_<att>_LR_<local_rank>")
+            deleteKey("NCCL_FT_LOCAL_READY_NODE_<node>_PG_<uid>_ATT_<att>_LR_<local_rank>")
+            deleteKey("NCCL_FT_LOCAL_COMM_ERR_NODE_<node>_PG_<uid>_ATT_<att>")   [非必寫，但 delete 無害]
+            if !is_faulty_rank: deleteKey("NCCL_FT_PROXY_READY_ATT_<att>_<rank>")
+          if cur_round==0（lazy-init attempt=0 的殘留）:
+            deleteKey("NCCL_FT_LOCAL_ARRIVE_NODE_<node>_PG_<uid>_ATT_0_LR_<local_rank>")
+            deleteKey("NCCL_FT_LOCAL_READY_NODE_<node>_PG_<uid>_ATT_0_LR_<local_rank>")
+          if rank==0（每個 attempt att=1..cur_attempt）:
+            deleteKey("NCCL_FT_COMMIT_<round>")
+            deleteKey("NCCL_FT_SS_AGREED_<round>")
+            deleteKey("NCCL_FT_PROXY_ID_ATT_<att>")
 
 Step 6: final_commit_op_.store(0, release)
           [解除 wait() 的自旋，允許下一輪 2PC 開始]
@@ -607,11 +626,16 @@ T3: Side-car thread（pt_nccl_ft_side）
        
        recover_and_replay_inflight_ops() [在 recovery_mutex_ 保護下]
           ├─ globalComm->abort()（若還未 abort）
+          ├─ rebuild_attempt_++（確保 TCPStore key namespace 唯一）
           ├─ rebuild_shadow_ping_pong_topology()
-          │    ├─ ncclCommBanNic(0)（所有 rank 都呼叫）
-          │    ├─ [方案二] ncclTopoPopulateNics: NIC 0 speed=0（第一層防護）
-          │    ├─ [方案二] ncclTopoGetLocalNetType: modulo filter 跳過 NIC 0（第二層防護）
-          │    └─ proxy_global_comm_ = NCCLFTComm::create(14, new_rank, ...)
+          │    ├─ 同步 GC：std::move 舊 local/proxy comm → abort() → destructor
+          │    ├─ [Data] setenv("NCCL_IB_HCA","mlx5_1,...") + nccl_ft_reset_ib_cache()
+          │    ├─ [Ctrl] setenv("NCCL_SOCKET_IFNAME","enp*") + nccl_ft_reset_bootstrap_net()
+          │    │         + nccl_ft_reset_net_socket()
+          │    ├─ Pre-rebuild global barrier (NCCL_FT_REBUILD_SYNC_ATT_1_R<r>)
+          │    ├─ initLocalNvlinkComm(attempt=1)
+          │    ├─ proxy_global_comm_ = NCCLFTComm::create(14, new_rank, ...)
+          │    └─ 零元素 AllReduce 驗證（若失敗 → 側車 catch → rebuild attempt=2）
           ├─ is_degraded_ = true
           ├─ seqs_to_replay = { seq | seq >= agreed_ss }
           ├─ for seq:
@@ -626,8 +650,11 @@ T3: Side-car thread（pt_nccl_ft_side）
           │    work_ptr->setException(nullptr)
           │    work_ptr->future_->markCompleted(...)
           ├─ ft_round_++
-          ├─ TCPStore cleanup
-          └─ final_commit_op_ = 0
+          ├─ TCPStore cleanup (per-rank keys + per-attempt keys)
+          ├─ pending_shadow_seq_.store(UINT64_MAX)  [為下一輪故障重置 checkpoint]
+          ├─ final_commit_op_ = 0
+          └─ 背景執行緒 sleep(3s) → nccl_ft_cleanup_stale_ib_contexts()
+             [延遲清理 ibv_close_device，不阻塞恢復路徑]
 
 T4: 主執行緒（wait()）
     └─ FT 安全等待區判斷（行 915-973）：
@@ -656,81 +683,27 @@ T5: 後續所有 AllReduce 走降級路徑
 | `transport/net_ib/p2p_resiliency.cc` | `ncclIbResiliencyHandleDeviceFailure()` | 將原本的 `ncclSystemError` 改回傳 `ncclRemoteError`，讓 ProcessGroupNCCLFT 的 Watchdog 能辨識為可容錯的 NIC 硬體故障，而非致命系統錯誤 |
 | `transport/net_ib/p2p_resiliency.cc` | `ncclIbResiliencyProbeHandleCompletionEvent()` | 探針 QP 偵測到完成錯誤時從 `ncclSuccess` 改為 `ncclRemoteError`，確保 fault callback 被觸發 |
 
-### 12.2 Fault Callback 與 Ban 機制（`init.cc`）
+### 12.3 Fault Callback 與動態環境變數重置（`init.cc` / `bootstrap.cc` / `net_socket.cc`）
 
-| 函式 / 變數 | 說明 |
-|-------------|------|
-| `g_nccl_ft_banned_nics_mask` | Process-level global `uint64_t`，bit k=1 代表 NIC index k 被 ban。由 `ncclCommBanNic(k)` 設定，`ncclCommBanNicReset()` 清除 |
-| `nccl_ft_is_nic_banned(dev_idx)` | 查詢 global ban mask，在 `ncclTopoPopulateNics` 與 `ncclTopoGetLocalNetType` 中呼叫 |
-| `nccl_ft_is_disabled()` | 檢查 `NCCL_FT_DISABLE` 環境變數，若為 1 則所有 FT 邏輯（包含 ban 和 filter）均跳過 |
-| `ncclCommBanNic(dev_idx)` | 設定 global ban mask bit，process-level 生效（不綁定特定 comm） |
-| `ncclCommBanNicReset()` | 清除整個 global ban mask（預留 API，目前未使用） |
-| `ncclCommRegisterFaultCallback(comm, cb)` | 每個 comm 可獨立註冊 fault callback；故障時 NCCL progress thread 呼叫 callback |
-| `nccl_ft_trigger_fault(dev_idx)` | 在 IB 傳輸層確認故障後呼叫，遍歷所有已註冊的 comm callback |
+| 函式 / 變數 | 檔案 | 說明 |
+|-------------|------|------|
+| `nccl_ft_is_disabled()` | `init.cc` | 檢查 `NCCL_FT_DISABLE` 環境變數，若為 1 則所有 FT 邏輯均跳過 |
+| `ncclCommRegisterFaultCallback(comm, cb)` | `init.cc` | 每個 comm 可獨立註冊 fault callback；故障時 NCCL progress thread 呼叫 callback |
+| `nccl_ft_trigger_fault(dev_idx)` | `init.cc` | 在 IB 傳輸層確認故障後呼叫，遍歷所有已註冊的 comm callback |
+| `nccl_ft_reset_bootstrap_net()` | `bootstrap.cc` | 重置 `bootstrapNetInitDone=0`；在 `setenv("NCCL_SOCKET_IFNAME",...)` 後呼叫，讓下次 `ncclGetUniqueId()` 的 bootstrap socket 重讀介面名稱 |
+| `nccl_ft_reset_net_socket()` | `net_socket.cc` | 重置 Socket transport singleton（`ncclNetIfs=-1`, `netRefCount=0`），釋放 pciPath 字串；與 `nccl_ft_reset_bootstrap_net()` 配對呼叫 |
+| `nccl_ft_reset_ib_cache()` | `net_ib/init.cc` | 非阻塞式重置 IB 全域設備快取（`ncclNIbDevs=-1`），將舊 context 移入 stale 列表；在 `setenv("NCCL_IB_HCA",...)` 後呼叫，讓下次 `ncclIbInitDevices()` 重新掃描並只使用健康 NIC |
+| `nccl_ft_cleanup_stale_ib_contexts()` | `net_ib/init.cc` | 阻塞式延遲清理：呼叫 `ibv_close_device()` 關閉被 `nccl_ft_reset_ib_cache()` 移入 stale 列表的 context。在 recover 完成後 3 秒背景執行 |
 
-### 12.3 拓撲路由遮蔽（`graph/topo.cc`）— 方案二（雙重防護）
+### 12.4 舊 NIC 排除方案歷史
 
-NCCL 的拓撲路由使用兩個關鍵步驟：（1）建構 topo XML graph，（2）每個 GPU 的每個 channel 從可達 NET 節點中選一個 NIC。兩個步驟都需要排除 banned NIC，方案二同時處理兩者：
+**方案三（ABI 變更）：** 嘗試在 `ncclConfig_t` 新增 `bannedNicsMask` 欄位。已 revert 因破壞公開 ABI。
 
-**第一層：`ncclTopoPopulateNics()`（`graph/topo.cc` ~行 1435）**
+**方案二（Ban Mask + Topo Filter）：** 採用 global ban mask (`g_nccl_ft_banned_nics_mask`) 配合兩層 topo graph 過濾（`ncclTopoPopulateNics` 軟 ban + `ncclTopoGetLocalNetType` modulo filter）。已完全移除，原因：NCCL 的 topo graph 在 comm 建立時已確定，動態更新 ban mask 不能改變既存 QP 的路由，只能影響下一次 comm init。
 
-```c
-// 在把每張 NIC 的屬性寫入 XML 之前，若該 NIC 被 ban：
-if (nccl_ft_is_disabled() == 0 && nccl_ft_is_nic_banned(n)) {
-    WARN("NCCL-FT: 軟性物理遮蔽故障網卡 %d (將頻寬設為 0，阻斷路由)", n);
-    props.speed = 0;
-    props.maxComms = 0;
-    props.latency = 999999;
-}
-```
-
-作用：在 topo graph 建構階段將 banned NIC 的頻寬清零，使 NCCL 的 path-finder（BFS/最短路徑）不選擇通過它的路由。每次 `ncclCommInitRankConfig` 都會重新執行此步驟。
-
-**第二層：`ncclTopoGetLocalNetType()`（`graph/topo.cc` ~行 1809）— 方案二新增**
-
-```c
-// ncclTopoGetLocal() 取得 GPU 可達的所有 NET 節點後，
-// 在 modulo 選取之前過濾掉 banned NIC：
-if (nccl_ft_is_disabled() == 0) {
-    int filtered[NCCL_TOPO_MAX_NODES];
-    int filteredCount = 0;
-    for (int i = 0; i < localNetCount; i++) {
-        int net_dev = system->nodes[type].nodes[localNets[i]].net.dev;
-        if (!nccl_ft_is_nic_banned(net_dev)) {
-            filtered[filteredCount++] = localNets[i];
-        }
-    }
-    if (filteredCount > 0) {  // 保護：至少留一張 NIC
-        for (int i = 0; i < filteredCount; i++) localNets[i] = filtered[i];
-        localNetCount = filteredCount;
-    }
-}
-```
-
-作用：`ncclTopoGetLocal()` 回傳的是從 GPU 可達的 NET 節點列表，即使速度已清零，節點仍存在於 graph 中。若不過濾，`net % localNetCount` 的 modulo 仍可能落在 banned NIC 的 index，導致後續 `ncclIbConnect` 建立 QP 時使用死亡設備。此層確保每個 channel 的最終 NIC 分配結果永遠排除 banned NIC。
-
-**為什麼需要雙重防護：**
-
-| 問題 | 第一層解決 | 第二層解決 |
-|------|-----------|-----------|
-| path-finder 選路繞過 banned NIC | ✅ speed=0 讓 BFS 不選此路徑 | — |
-| channel 分配 modulo 落在 banned NIC index | ✗ 節點仍在 graph，modulo 仍可能選到 | ✅ 過濾後 modulo 只在非 banned 節點中選 |
-| 全局 IB device cache（`ncclNIbDevs`）已建立 | ✗ 第一次 init 後 cache 不重建 | ✅ 過濾使用 net.dev index 對比 global ban mask |
-
-### 12.4 方案三（ABI 變更）已 Revert
-
-原本的「方案三」嘗試在 `ncclConfig_t` 新增 `uint64_t bannedNicsMask` 欄位，讓每個 communicator 可以攜帶自己的 NIC ban mask。此方案已被 revert，原因：
-
-1. **ABI 破壞**：`ncclConfig_t` 是公開 ABI struct，新增欄位改變 size，導致用舊 header 編譯的呼叫端存取新欄位時行為未定義。
-2. **冗餘**：global ban mask（`g_nccl_ft_banned_nics_mask`）已是 process-level，所有新 comm 自動繼承；per-comm 版本帶來複雜度卻無額外收益。
-3. **方案二已充分**：第一層（speed=0）+ 第二層（modulo filter）已足以防止 banned NIC 被選中。
-
-已 revert 的檔案：
-- `nccl/src/nccl.h.in`：移除 `bannedNicsMask` 欄位與 initializer
-- `nccl/src/graph/topo.h`：移除 `ncclTopoNetInfo::bannedNicsMask`
-- `nccl/src/graph/topo.cc`：移除 `netInfo.bannedNicsMask` 傳播與 per-comm check
-- `nccl/src/init.cc`：移除 `comm->config.bannedNicsMask` 賦值
-- `torch/csrc/distributed/c10d/ProcessGroupNCCLFT.cpp`：移除 `config.bannedNicsMask |= ...` 迴圈
+**目前方案（環境變數重置，方案四）：** 完全移除 ban mask 機制。改用 `setenv` + 重置三個 singleton 強迫 NCCL 重新掃描：
+- 所有涉及 ban mask 的程式碼均已移除，包含 `g_nccl_ft_banned_nics_mask`、`ncclCommBanNic()`、`ncclCommBanNicReset()`、`nccl_ft_is_nic_banned()`（`init.cc`），以及 topo graph 中的兩層過濾 hook（`topo.cc`）
+- `nccl.h.in` 中對應的公開 API 宣告亦已移除
 
 ---
 
@@ -797,7 +770,7 @@ if (nccl_ft_is_disabled() == 0) {
 | **`pending_shadow_seq_` 在 recovery 後未重置** | 第二次故障的 PROPOSE 帶著第一輪的 checkpoint seq，agreed_ss 錯誤，可能重播已完成的 op | `recover_and_replay_inflight_ops()` 末尾在 `final_commit_op_.store(0)` 前重置 `pending_shadow_seq_` 為 `UINT64_MAX` |
 | **DEBUG-HANG / DEBUG-RUNAWAY log 殘留** | 暫時性調試輸出混入生產 log，干擾問題分析 | 移除所有 `[DEBUG-HANG]` 和 `[DEBUG-RUNAWAY]` log |
 | **P0：HEALTHY rank rebuild deadlock（Pre-rebuild global barrier 死鎖）** | attempt=N 失敗後只有 PROXY rank 和直接收到 socket error 的 HEALTHY rank 觸發 rebuild attempt=N+1；其餘 HEALTHY rank 的 ncclAllReduce 非同步完成，side-car 不感知錯誤，不重入 rebuild，導致 Pre-rebuild global barrier 等不到所有 16 rank，永遠死鎖 | `execute_shadow_allreduce` HEALTHY 路徑在 ncclAllReduce enqueue 後加 `cudaStreamSynchronize` + `ncclCommGetAsyncError`；任一失敗即 throw，讓側車 catch 到並重入 rebuild |
-| **P1（方案二）：proxy_global_comm_ 仍使用 banned NIC 建立 QP** | `ncclTopoGetLocal()` 回傳的 NET 節點列表包含速度已清零的 banned NIC；`net % localNetCount` 的 modulo 仍可能落在該 NIC 的 index，導致 `ncclIbConnect` 對死亡 NIC 建立 QP，`ibv_modify_qp` 失敗（errno=61 或 22） | `ncclTopoGetLocalNetType()` 在 `ncclTopoGetLocal()` 之後、modulo 之前，過濾掉所有 `nccl_ft_is_nic_banned(net_dev)==true` 的 NET 節點；保護條件 `filteredCount > 0` 避免清空候選列表 |
+| **P1：proxy_global_comm_ 仍使用 dead NIC 建立 QP** | 方案二的 topo filter 無法完全防止 dead NIC 被選中（topo graph 在 comm init 時已固定） | **已改以方案四（環境變數重置）取代**：`setenv("NCCL_IB_HCA", healthy_hcas)` + `nccl_ft_reset_ib_cache()` 讓下一次 `ncclIbInitDevices()` 重新掃描時根本不看到 dead NIC，從根本排除問題。`ncclTopoGetLocalNetType()` 目前不含任何 ban filter（已清除）。 |
 
 ### ❓ 待確認 / 待修復
 

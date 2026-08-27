@@ -345,13 +345,12 @@ extern "C" void nccl_ft_global_fault_callback(int dev_idx) {
 
 /* --- [NCCL-FT: C API 到 C++ 實體的全域橋樑] --- */
 extern "C" {
-    ncclResult_t ncclCommBanNic(int dev_idx);
     // Non-blocking: moves old ibv_context/pciPath/mrCache into a stale list.
     // Must be followed by nccl_ft_cleanup_stale_ib_contexts() once the new comm
     // is established.
     void nccl_ft_reset_ib_cache();
     // Blocking deferred cleanup for IB contexts evicted by nccl_ft_reset_ib_cache().
-    // Safe to call from a background thread 1-5s after re-init completes.
+    // Safe to call from a background thread a few seconds after re-init completes.
     void nccl_ft_cleanup_stale_ib_contexts();
     // Reset bootstrapNetInitDone so that the next ncclGetUniqueId() re-reads
     // NCCL_SOCKET_IFNAME.  Must be called after setenv(NCCL_SOCKET_IFNAME)
@@ -4095,9 +4094,10 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
 
     // ── Phase 1: generate or retrieve the per-node ncclUniqueId ──────────────
     // The ID generator must be a healthy rank.  If local_rank==0 is faulty (its
-    // NIC is dead), ncclGetUniqueId() fails because NCCL's bootstrap socket
-    // initialisation picks the banned IB interface.  Use the first local rank
-    // that is NOT in faulty_local_devs_ as the generator instead.
+    // NIC is dead), ncclGetUniqueId() could fail because NCCL's bootstrap socket
+    // may still pick up the dead IB interface despite NCCL_SOCKET_IFNAME being
+    // redirected (timing window).  Use the first local rank that is NOT in
+    // faulty_local_devs_ as the generator to be safe.
     int id_generator = 0; // default: local_rank 0
     {
         std::lock_guard<std::mutex> lk(faulty_devs_mutex_);
@@ -4260,11 +4260,10 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     // ncclCommInitRankConfig for the new ones.  A detached GC thread with a
     // sleep heuristic races with the new ncclCommInitRankConfig calls: NCCL
     // rejects initialising a communicator on a GPU that still has another live
-    // communicator mid-abort, returning ncclInvalidUsage.  The original reason
-    // for async GC (avoiding IB driver lock contention) no longer applies here
-    // because we call ncclBanNic first and the new comms do not use the dead
-    // NIC.  Blocking here is safe: the global comm was already aborted by the
-    // 2PC side-car thread before this function is called.
+    // communicator mid-abort, returning ncclInvalidUsage.  Blocking here is
+    // safe: the global comm was already aborted by the 2PC side-car thread
+    // before this function is called, and NCCL_IB_HCA excludes the dead NIC
+    // from the new scan so there is no IB driver lock contention to avoid.
     //
     // Why abort() before reset():
     //   ~NCCLFTComm() intentionally does NOT call ncclCommAbort/Destroy — it
@@ -4348,35 +4347,54 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
               << " proxy_comm_size=" << proxy_comm_size_
               << " proxy_comm_rank=" << proxy_comm_rank_;
 
-    /* ===================================================================== */
-    /* --- [NCCL-FT: Phase 1 - Ban faulty NIC (affects IB transport only)] --- */
-    for (int d : faulty_devs) {
-        LOG(INFO) << logPrefix() << "[NCCL-FT] 呼叫底層 API ncclCommBanNic，將 NIC " << d << " 徹底遮蔽";
-        ncclCommBanNic(d);
-    }
-    /* ===================================================================== */
-
-    // Brief pause so the IB driver lock is released before ncclCommAbort
-    // competes for it in the GC thread.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-
-    // Phase 2: Rebuild local NVLink comm (intra-node, no IB needed).
+    // Phase 1: Update NCCL environment variables to exclude faulty NICs,
+    // then reset all IB/socket singletons so the next ncclCommInitRankConfig
+    // re-reads them from scratch.
     //
-    // local_nvlink_comm_ uses only NVLink — it never touches IB transport.
-    // We must NOT reset the IB cache here, because that would trigger IB
-    // re-discovery with the reduced NIC set, causing NCCL to renumber vNic
-    // indices.  Any GPU whose NCCL-assigned vNic index is >= (total_nics - 1)
-    // would then get "Requested properties for vNic N, only N vNics created".
+    // Thread safety of setenv():
+    //   setenv() is not thread-safe in the general case, but it is safe here
+    //   because the global comm was already aborted before this function is
+    //   called (see recover_and_replay_inflight_ops).  NCCL's progress thread —
+    //   the only other thread that could concurrently call getenv("NCCL_IB_HCA")
+    //   or getenv("NCCL_SOCKET_IFNAME") — exits its loop upon comm abort, so
+    //   no concurrent getenv() race exists by the time we reach this point.
     //
-    // For the bootstrap socket (ncclGetUniqueId) we need an AF_INET interface
-    // that is UP, not a loopback, not an IB/RoCE port (mlx5_*), and reachable
-    // by all other ranks on the same host.  We scan getifaddrs() at runtime so
-    // the choice adapts if one Ethernet port goes down.
-    // We deliberately do NOT call nccl_ft_reset_ib_cache() here.
+    // Data channel (IB):
+    //   setenv("NCCL_IB_HCA", <healthy HCAs>) tells NCCL which physical NICs
+    //   to use during the next IB device scan.  nccl_ft_reset_ib_cache() clears
+    //   the old scan result (ncclNIbDevs=-1) so ncclIbInitDevices() re-enters
+    //   its scan block and reads the new NCCL_IB_HCA value.  After the reset,
+    //   vNic indices are renumbered starting from 0 over the surviving NICs,
+    //   which is fine: NCCL maps GPU rank to the available vNics via modulo, so
+    //   every GPU still reaches a healthy NIC and data reaches the correct rank.
+    //
+    // Control channel (bootstrap socket):
+    //   setenv("NCCL_SOCKET_IFNAME", <Ethernet_if>) redirects ncclGetUniqueId()'s
+    //   bootstrap TCP socket away from the dead IB port.  Both the bootstrap
+    //   singleton (nccl_ft_reset_bootstrap_net) and the socket-transport singleton
+    //   (nccl_ft_reset_net_socket) must be reset so their respective netRefCount
+    //   guards do not skip the re-read on the next init call.
     {
+        // --- Data channel: build NCCL_IB_HCA from surviving NICs ---
+        // NIC device index equals local GPU rank index in our topology
+        // (mlx5_0 serves GPU 0, mlx5_1 serves GPU 1, etc.).
+        std::string healthy_hcas;
+        for (int i = 0; i < localDeviceCount_; i++) {
+            if (faulty_devs.count(i) == 0) {
+                if (!healthy_hcas.empty()) healthy_hcas += ",";
+                healthy_hcas += "mlx5_" + std::to_string(i);
+            }
+        }
+        setenv("NCCL_IB_HCA", healthy_hcas.c_str(), 1);
+        nccl_ft_reset_ib_cache();
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT] Set NCCL_IB_HCA=" << healthy_hcas
+                  << " and reset IB cache (vNic indices will be renumbered 0.."
+                  << (localDeviceCount_ - static_cast<int>(faulty_devs.size()) - 1) << ").";
+
+        // --- Control channel: redirect bootstrap socket to Ethernet ---
         // Scan for the first UP, non-loopback, non-IB AF_INET interface.
         // Exclusion prefixes: lo, virbr, docker, br_, mlx, ib.
-        // Any surviving enp*/eth*/bond* interface is suitable.
         auto is_excluded = [](const char* name) {
             static const char* const skip[] = {
                 "lo", "virbr", "docker", "br_", "mlx", "ib"
@@ -4403,18 +4421,19 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         }
 
         if (chosen_if.empty()) {
-            // Fallback: let NCCL pick (original IB address may still be used,
-            // but this is better than hard-failing).
+            // No Ethernet found; fall back to loopback so bootstrap can at
+            // least complete within the node.
+            chosen_if = "lo";
             LOG(WARNING) << logPrefix()
-                         << "[NCCL-FT] No suitable Ethernet interface found for "
-                         << "bootstrap; leaving NCCL_SOCKET_IFNAME unchanged.";
-        } else {
-            setenv("NCCL_SOCKET_IFNAME", chosen_if.c_str(), 1);
-            nccl_ft_reset_bootstrap_net();
-            LOG(INFO) << logPrefix()
-                      << "[NCCL-FT] Set NCCL_SOCKET_IFNAME=" << chosen_if
-                      << " and reset bootstrap net (IB cache NOT reset).";
+                         << "[NCCL-FT] No suitable Ethernet interface found; "
+                         << "falling back to loopback for bootstrap.";
         }
+        setenv("NCCL_SOCKET_IFNAME", chosen_if.c_str(), 1);
+        nccl_ft_reset_bootstrap_net();
+        nccl_ft_reset_net_socket();
+        LOG(INFO) << logPrefix()
+                  << "[NCCL-FT] Set NCCL_SOCKET_IFNAME=" << chosen_if
+                  << " and reset bootstrap + socket-transport singletons.";
     }
 
     // Global cross-node barrier: ensure ALL ranks (on both nodes) reach this
@@ -4453,14 +4472,12 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     initLocalNvlinkComm(/*attempt=*/rebuild_attempt_.load(std::memory_order_relaxed));
 
     // Phase 3: Rebuild proxy_global_comm_ (healthy ranks only).
-    // ncclCommBanNic() called above already marks the faulty NIC in the
-    // global banned-mask; topo.cc reads that mask during ncclCommInitRankConfig
-    // topology discovery and zeroes bandwidth on the banned NIC, so NCCL's
-    // path-finder naturally excludes it.  We must NOT call
-    // nccl_ft_reset_ib_cache() here: doing so renumbers the vNic indices
-    // (removing mlx5_0 shifts indices 1-7 down to 0-6), but the comm-init
-    // path still maps GPU N to vNic N, causing "Requested properties for
-    // vNic 7, only 7 vNics have been created" for the highest-indexed GPU.
+    // NCCL_IB_HCA was set to the surviving HCAs and nccl_ft_reset_ib_cache()
+    // was called in Phase 1, so the next ncclCommInitRankConfig re-scans the
+    // IB devices and only discovers the healthy NICs.  vNic indices are
+    // renumbered from 0 over the surviving set; NCCL maps GPU rank to vNics
+    // via modulo so every GPU reaches a healthy NIC regardless of the new
+    // index assignment.
 
     // 5. 重建 Proxy Global Comm (只有健康節點參與)
     if (!is_faulty) {
@@ -4514,13 +4531,13 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         // 從頭建立全新的降級群組 (Re-Init)
         proxy_global_comm_ = NCCLFTComm::create(proxy_comm_size_, proxy_comm_rank_, proxyId, device.index(), config);
 
-        // Verify the new comm is healthy with a zero-element allreduce across
+        // Verify the new comm is healthy with a zero-element AllReduce across
         // all proxy ranks before marking it ready.  If the IB transport is still
-        // unstable after ncclCommBanNic (root cause of "unhandled system error"
-        // crash at execute_shadow_allreduce:4642), this throws here inside
-        // rebuild_shadow_ping_pong_topology.  The caller
-        // (recover_and_replay_inflight_ops) increments rebuild_attempt_ and
-        // retries, preventing a broken comm from being handed to the replay path.
+        // unstable (e.g. the NIC excluded via NCCL_IB_HCA has not fully quiesced
+        // yet), the error surfaces here inside rebuild_shadow_ping_pong_topology.
+        // The caller (recover_and_replay_inflight_ops) increments rebuild_attempt_
+        // and retries after 500 ms, preventing a broken comm from reaching the
+        // replay path.
         {
             auto ncclStream = ncclStreams_.at(key);
             ncclComm_t raw = proxy_global_comm_->getNcclComm();
