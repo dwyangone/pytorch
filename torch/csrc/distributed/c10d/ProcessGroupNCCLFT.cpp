@@ -4629,11 +4629,22 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
     auto ncclDataType = getNcclDataType(input.scalar_type());
     size_t numel = static_cast<size_t>(input.numel());
 
+    // Snapshot shared ownership of both communicators before doing any work.
+    // The side-car thread may concurrently run rebuild_shadow_ping_pong_topology(),
+    // which calls std::move(local_nvlink_comm_) and std::move(proxy_global_comm_)
+    // to null out the shared_ptrs before rebuilding them.  Without a snapshot here,
+    // the raw ncclComm_t handles extracted below would become dangling pointers for
+    // the lifetime of this function, causing a SIGSEGV inside ncclAllReduce.
+    // Holding a local shared_ptr keeps the NCCLFTComm object (and its ncclComm handle)
+    // alive until this function returns, even if the rebuild nulls the member ptr.
+    auto local_comm_ref = local_nvlink_comm_;
+    auto proxy_comm_ref = proxy_global_comm_;
+
     TORCH_CHECK(
-        local_nvlink_comm_ != nullptr,
+        local_comm_ref != nullptr,
         logPrefix(),
         "[NCCL-FT] execute_shadow_allreduce called but local_nvlink_comm_ is null.");
-    ncclComm_t nvlink_comm = local_nvlink_comm_->getNcclComm();
+    ncclComm_t nvlink_comm = local_comm_ref->getNcclComm();
 
     // Build log string for wards.
     std::string wards_str;
@@ -4654,8 +4665,8 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
 #else
     bool use_avg_workaround = false;
 #endif
-    ncclComm_t proxy_comm = (proxy_global_comm_ != nullptr)
-        ? proxy_global_comm_->getNcclComm()
+    ncclComm_t proxy_comm = (proxy_comm_ref != nullptr)
+        ? proxy_comm_ref->getNcclComm()
         : nullptr;
     ncclRedOpRAII nccl_proxy_op_raii = use_avg_workaround
         ? ncclRedOpRAII(ncclSum)
