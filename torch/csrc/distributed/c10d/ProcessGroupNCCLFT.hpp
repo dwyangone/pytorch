@@ -1104,6 +1104,13 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // the necessary cross-rank visibility.
   std::atomic<uint64_t> rebuild_attempt_{0};
 
+  // Number of consecutive rebuild failures within the current fault round.
+  // Reset to 0 on each successful recovery.  When it exceeds
+  // kMaxConsecutiveRebuildFailures the side-car stops retrying and marks the
+  // PG as permanently failed to prevent an unbounded FD-leaking retry loop.
+  int consecutive_rebuild_failures_{0};
+  static constexpr int kMaxConsecutiveRebuildFailures = 5;
+
   // Pending fault signal from NCCL callback / Watchdog.
   // Bitmask: bit i is set when local device i has a pending NIC fault.
   // 0 means no pending fault.

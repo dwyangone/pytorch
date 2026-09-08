@@ -5173,6 +5173,24 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                 LOG(WARNING) << logPrefix()
                              << "[NCCL-FT] Side-car thread exception: "
                              << e.what();
+                int failures = ++this->consecutive_rebuild_failures_;
+                if (failures > kMaxConsecutiveRebuildFailures) {
+                    // Permanent failure: the environment is broken (e.g. FD
+                    // exhaustion, misconfigured NICs).  Stop retrying to
+                    // prevent an unbounded FD-leaking loop and propagate a
+                    // fatal signal to the main thread.
+                    LOG(ERROR) << logPrefix()
+                               << "[NCCL-FT] Rebuild failed " << failures
+                               << " consecutive times; giving up. Last error: "
+                               << e.what();
+                    // Clear the commit signal so subsequent loop iterations
+                    // do not re-enter the recovery path.
+                    this->final_commit_op_.store(0, std::memory_order_release);
+                    // Re-throw so the side-car thread terminates, which will
+                    // be observed by any join() or via std::terminate if
+                    // detached -- the training job will surface the error.
+                    throw;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             } catch (...) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -5799,6 +5817,10 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         std::this_thread::sleep_for(std::chrono::seconds(3));
         nccl_ft_cleanup_stale_ib_contexts();
     }).detach();
+
+    // Reset the consecutive-failure counter now that this recovery round
+    // completed successfully.
+    this->consecutive_rebuild_failures_ = 0;
 
     LOG(INFO) << logPrefix() << "[NCCL-FT] 全域重播完成！系統準備進入下一回合: " << this->ft_round_;
 }
