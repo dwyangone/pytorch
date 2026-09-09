@@ -1,5 +1,5 @@
 #include <torch/csrc/distributed/c10d/NCCLFTUtils.hpp>
-// 引入原始的 NCCLUtils 以重複使用輔助函式 (如 getNcclVersion, getNcclErrorDetailStr 等)
+// Include the original NCCLUtils to reuse helper functions (e.g. getNcclVersion, getNcclErrorDetailStr).
 #include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
 
 #ifdef USE_C10D_NCCL

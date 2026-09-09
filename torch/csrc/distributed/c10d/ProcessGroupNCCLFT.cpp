@@ -26,7 +26,7 @@
 #include <c10/util/irange.h>
 #include <c10/util/thread_name.h>
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
-/* --- [NCCL-FT: 1. 顯式引入我們客製化的底層 NCCL 標頭檔] --- */
+/* --- [NCCL-FT: 1. Explicitly include our customized low-level NCCL header] --- */
 #include <nccl.h>
 #include <torch/csrc/cuda/nccl.h>
 #include <torch/csrc/distributed/c10d/FlightRecorder.hpp>
@@ -47,7 +47,7 @@ constexpr const char* const kNCCLAbortedCommStoreKey_FT = "NCCLFTABORTEDCOMM";
 using FlightRecorderCUDA = FlightRecorder<at::cuda::CUDAEvent>;
 
 /* ========================================================================= */
-/* --- [NCCL-FT: 強制宣告底層 C API (繞過 Header 路徑衝突)] --- */
+/* --- [NCCL-FT: Force-declare low-level C API (bypass header path conflicts)] --- */
 //extern "C" {
 //    typedef void (*ncclFaultCallback_t)(int dev_idx);
 //    ncclResult_t ncclCommRegisterFaultCallback(ncclComm_t comm, ncclFaultCallback_t cb);
@@ -329,13 +329,13 @@ bool shouldAllCommunicatorsRegisterAllTensors() {
 }
 
 /* ========================================================================= */
-/* --- [NCCL-FT: C API 到 C++ 實體的全域橋樑] --- */
+/* --- [NCCL-FT: Global bridge from C API to C++ instances] --- */
 std::mutex g_ft_pg_mutex;
 std::unordered_set<ProcessGroupNCCLFT*> g_ft_pg_instances;
 
 extern "C" void nccl_ft_global_fault_callback(int dev_idx) {
-    // 【追蹤點 1】：如果沒看到這行，代表你改的 NCCL 根本沒送出信號！
-    LOG(ERROR) << "[NCCL-FT-TRACE] !!! NCCL 底層成功觸發 Callback !!! 故障網卡: " << dev_idx;
+    // [Trace point 1]: If this line never appears, NCCL did not emit the signal.
+    LOG(ERROR) << "[NCCL-FT-TRACE] !!! NCCL fault callback fired !!! faulty dev_idx: " << dev_idx;
 
     std::lock_guard<std::mutex> lock(g_ft_pg_mutex);
     for (auto* pg : g_ft_pg_instances) {
@@ -343,7 +343,7 @@ extern "C" void nccl_ft_global_fault_callback(int dev_idx) {
     }
 }
 
-/* --- [NCCL-FT: C API 到 C++ 實體的全域橋樑] --- */
+/* --- [NCCL-FT: Global bridge from C API to C++ instances] --- */
 extern "C" {
     // Non-blocking: moves old ibv_context/pciPath/mrCache into a stale list.
     // Must be followed by nccl_ft_cleanup_stale_ib_contexts() once the new comm
@@ -918,8 +918,9 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
       static_cast<int>(1)); // number of device?
 
   // =========================================================================
-  // 🔥 [NCCL-FT] 終極防線：必須放在 synchronize() 之前！
-  // 依賴 Future 機制來進行絕對安全的非同步等待，徹底消滅 while(true) 死結
+  // [NCCL-FT] Last line of defense: must run before synchronize().
+  // Uses the Future mechanism for a fully safe async wait, eliminating
+  // the while(true) deadlock risk.
   // =========================================================================
   if (!pg_->ft_disabled_) {
       bool is_ft_managed = false;
@@ -937,16 +938,17 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
           catch (...) {}
       }
 
-      // 如果這筆任務被 FT 攔截 (有例外)，或是處於降級狀態且它還在備份池裡
+      // If this work was intercepted by FT (has exception), or is in degraded
+      // mode and still in the shadow buffer pool.
       if (is_ft_exception || (is_ft_managed && pg_->is_degraded_.load(std::memory_order_acquire))) {
-          LOG(WARNING) << logPrefix() << "[NCCL-FT] wait() 進入容錯安全等待區 (seq=" << this->seq_ << ")";
-          
-          // 1. 乖乖等待 Side-car 重播完畢並標記 Future 完成！(不耗 CPU 的完美等待)
+          LOG(WARNING) << logPrefix() << "[NCCL-FT] wait() entering FT safe-wait zone (seq=" << this->seq_ << ")";
+
+          // 1. Wait for the side-car to finish replay and mark the Future complete (CPU-free wait).
           if (future_) {
               future_->wait(); 
           }
           
-          // 2. Future 已經完成，代表重播中心處理完了！對 Python 裝作一切正常。
+          // 2. Future completed: replay center finished. Return normally to Python.
           this->setException(nullptr); 
 
           ShadowContext ctx;
@@ -965,7 +967,7 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
               ctx.replayed_end_event->block(currentStream);
               this->stashed_for_allocator_safety_->unstash();
               
-              // 3. Inline GC：回收 VRAM
+              // 3. Inline GC: reclaim VRAM references.
               std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
               auto it = pg_->in_flight_shadow_bufs_.find(this->seq_);
               if (it != pg_->in_flight_shadow_bufs_.end()) {
@@ -975,15 +977,15 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
                   recycle_ctx.work_ptr.reset(); 
                   pg_->free_shadow_bufs_.push_back(recycle_ctx); 
                   pg_->in_flight_shadow_bufs_.erase(it); 
-                  LOG(INFO) << logPrefix() << "[NCCL-FT] GC: 異常恢復成功，已回收 Bucket (seq=" << this->seq_ << ") 的 VRAM 參照。";
+                  LOG(WARNING) << logPrefix() << "[NCCL-FT] GC: recovery succeeded, reclaimed VRAM ref for Bucket (seq=" << this->seq_ << ").";
               }
           }
-          return true; // 🌟 成功返回，徹底避開底下的原生 synchronize() 與死掉的 ncclStream！
+          return true; // Successfully returned; bypasses native synchronize() and the dead ncclStream.
       }
   }
 
   // =========================================================================
-  // --- [原生 NCCL 執行路徑] (若未發生容錯重播，則維持原本行為) ---
+  // --- [Native NCCL execution path] (normal behavior when no FT replay) ---
   // =========================================================================
   synchronize();
 
@@ -1017,7 +1019,7 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
   }
 #endif // PGNCCL_ENABLE_HASH
 
-  LOG(INFO) << "[DEBUG] wait() 已經放行 seq=" << this->seq_;
+  LOG(INFO) << "[DEBUG] wait() released seq=" << this->seq_;
   return true;
 }
 
@@ -1138,8 +1140,8 @@ ProcessGroupNCCLFT::ProcessGroupNCCLFT(
   heartbeatMonitor_ = std::make_unique<HeartbeatMonitor>(this);
   watchdog_ = std::make_unique<Watchdog>(this);
 
-  /* --- [NCCL-FT: 註冊並啟動協商側車] --- */
-  /* --- [NCCL-FT: 檢查環境變數決定是否啟動容錯控制面] --- */
+  /* --- [NCCL-FT: Register and start negotiation side-car] --- */
+  /* --- [NCCL-FT: Check env var to decide whether to start FT control plane] --- */
   const char* disable_env = getenv("NCCL_FT_DISABLE");
   this->ft_disabled_ = (disable_env && strcmp(disable_env, "1") == 0);
 
@@ -1149,17 +1151,17 @@ ProcessGroupNCCLFT::ProcessGroupNCCLFT(
           g_ft_pg_instances.insert(this);
       }
 
-      // 只有在沒被停用時，才啟動側車進行 TCPStore 協商與預約
+      // Start side-car for TCPStore negotiation only when FT is not disabled.
       start_ft_negotiator_thread();
       // local_nvlink_comm_ is initialised lazily on the first collective()
       // call via initLocalNvlinkComm(), because ncclCommSplit requires the
       // global comm (devNCCLCommMap_) to already exist — it is not available
       // here in the constructor.
-      LOG(INFO) << logPrefix() << "[NCCL-FT] 容錯優化控制面已成功啟動。"
+      LOG(WARNING) << logPrefix() << "[NCCL-FT] Fault-tolerance control plane started successfully."
                 << " local_nvlink_comm_ will be built on first collective.";
   } else {
-      this->is_degraded_ = false; // 強制不進入降級代傳模式
-      LOG(WARNING) << logPrefix() << "[NCCL-FT] 偵測到 NCCL_FT_DISABLE=1，完全恢復原生 NCCL 運作模式。";
+      this->is_degraded_ = false; // Force-disable degraded relay mode.
+      LOG(WARNING) << logPrefix() << "[NCCL-FT] NCCL_FT_DISABLE=1 detected; reverting to native NCCL mode.";
   }
   /* ----------------------------------------------------- */
 
@@ -1759,7 +1761,7 @@ void ProcessGroupNCCLFT::shutdown() {
 ProcessGroupNCCLFT::~ProcessGroupNCCLFT() {
   LOG(INFO) << logPrefix() << "ProcessGroupNCCLFT destructor entered.";
 
-  /* --- [NCCL-FT: 退出協商側車與 FT 通訊子] --- */
+  /* --- [NCCL-FT: Shut down negotiation side-car and FT communicators] --- */
   {
       std::lock_guard<std::mutex> lock(g_ft_pg_mutex);
       g_ft_pg_instances.erase(this);
@@ -2507,10 +2509,11 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
 
       // Then check if work has timed out.
       // Skip if work has encountered an error.
-      // [Fix 3 改良版] FT early-abort: 
-      // 只要 2PC 達成共識 (commit_signal > 0)，代表底層的 globalComm 已經宣告死亡。
-      // 我們必須將所有還在 workMetaList_ 裡面的飛行中任務全部標記為異常並清除。
-      // 這樣才不會讓它們卡在 Watchdog 裡導致 Timeout。後續拯救工作交給 wait() 的重播中心。
+      // [Fix 3 improved] FT early-abort:
+      // Once 2PC commits (commit_signal > 0) the global comm is dead.
+      // Mark and clear all in-flight works in workMetaList_ so they do not
+      // stall the Watchdog with a Timeout. Recovery is handled by wait()'s
+      // replay center.
       if (!pg_->ft_disabled_ && !work.exception()) {
         uint64_t commit_signal = pg_->final_commit_op_.load(std::memory_order_acquire);
         if (C10_UNLIKELY(commit_signal > 0)) {
@@ -2518,16 +2521,16 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
             LOG(WARNING) << pg_->logPrefix()
                          << "[NCCL-FT] Watchdog early-abort: 2PC committed "
                          << "(commit_signal=" << commit_signal
-                         << "), 無差別清除受死掉的 Comm 影響的 work seq=" << work.seq_
+                         << "), unconditionally clearing work seq=" << work.seq_
                          << " device=" << device_idx;
             
-            // 標記異常，讓 wait() 知道它必須被重播
+            // Mark as exception so wait() knows it must be replayed.
             std::string exceptionMsg = c10::str(work.logPrefix(), "FT early-abort: Comm dead.");
             work.setException(std::make_exception_ptr(
                 C10_BUILD_ERROR(NCCLFaultToleranceError, exceptionMsg)));
             
-            // 設定完例外後，程式會順順地往下走，
-            // 進入下方的 if (work.exception()) 區塊統一執行 record 與 erase！
+            // After setting the exception, execution falls through to the
+            // if (work.exception()) block below for unified record and erase.
         }
       }
 
@@ -2637,8 +2640,8 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
                 getKeyFromDevice(work.device_));
             work.ncclEndEvent_->record(ncclStream);
           }
-          // 確保早期被清除的 Work 也能正確釋放 Caching Allocator 的扣留！
-          // 就算後續 wait() 有呼叫 unstash，重複呼叫 clear() 也是安全且冪等的 (Idempotent)
+          // Ensure early-cleared Work correctly releases the CachingAllocator hold.
+          // Duplicate clear() calls from a later wait() unstash are safe and idempotent.
           if (!work.stashed_for_allocator_safety_->empty()) {
               std::lock_guard<std::mutex> lock(pg_->shelvesMutex_);
               pg_->shelvesToUnstash_.push_back(work.stashed_for_allocator_safety_);
@@ -2799,14 +2802,14 @@ void ProcessGroupNCCLFT::Watchdog::runLoop() {
               std::chrono::steady_clock::now());
         }
 
-        // [NCCL-FT] 垃圾回收：清除 Tensor 參照，放回 Free Pool
+        // [NCCL-FT] GC: clear tensor references and return to the free pool.
         if (work.opType_ == OpType::ALLREDUCE && !pg_->ft_disabled_) {
             std::lock_guard<std::mutex> lk(pg_->shadow_buf_mutex_);
             auto it = pg_->in_flight_shadow_bufs_.find(work.seq_);
             if (it != pg_->in_flight_shadow_bufs_.end()) {
                 ShadowContext ctx = it->second;
-                ctx.original_input = at::Tensor();  // 釋放 GPU VRAM 參照
-                ctx.original_output = at::Tensor(); // 釋放 GPU VRAM 參照
+                ctx.original_input = at::Tensor();  // release GPU VRAM reference
+                ctx.original_output = at::Tensor(); // release GPU VRAM reference
                 pg_->free_shadow_bufs_.push_back(ctx);
                 pg_->in_flight_shadow_bufs_.erase(it);
             }
@@ -3122,37 +3125,37 @@ std::exception_ptr ProcessGroupNCCLFT::checkForNCCLErrors(
 std::exception_ptr ProcessGroupNCCLFT::checkForNCCLErrorsInternal(
     std::shared_ptr<NCCLFTComm>& ncclComm) {
   
-  // 1. 檢查是否有自定義的 Abort 原因
+  // 1. Check for a custom abort reason.
   auto commFailureReason = ncclComm->getNcclCommFailureReason();
   if (commFailureReason != std::nullopt) {
-    // [分流] 如果是我們側車強制切斷的訊號，拋出容錯專用例外！
+    // [Branch] If aborted by our side-car, throw a fault-tolerance-specific exception.
     if (commFailureReason->find("FT 2PC Committed") != std::string::npos ||
         commFailureReason->find("FT early-abort") != std::string::npos) {
         
         std::string err_msg = c10::str("NCCL FT communicator was safely aborted: ", *commFailureReason);
         return std::make_exception_ptr(C10_BUILD_ERROR(NCCLFaultToleranceError, err_msg));
     }
-    // 其他原生的 Abort 維持拋出 DistBackendError
+    // Other native abort reasons: throw DistBackendError.
     return std::make_exception_ptr(C10_BUILD_ERROR(
         DistBackendError,
         c10::str("NCCL communicator encountered error set by ProcessGroupNCCLFT: ", *commFailureReason)));
   }
 
-  // 2. 檢查 NCCL 底層硬體錯誤
+  // 2. Check for low-level NCCL hardware errors.
   ncclResult_t ncclAsyncErr = ncclComm->checkForNcclError();
 #ifdef NCCL_HAS_COMM_NONBLOCKING
   if (ncclAsyncErr != ncclSuccess && ncclAsyncErr != ncclInProgress) {
 #else
   if (ncclAsyncErr != ncclSuccess) {
 #endif
-    // [分流] 如果是單純的網路連線問題 (SystemError / RemoteError)，拋出容錯專用例外！
+    // [Branch] Pure network error (SystemError / RemoteError): throw FT exception.
     if (ncclAsyncErr == ncclSystemError || ncclAsyncErr == ncclRemoteError) {
         std::string err_msg = c10::str(ncclGetErrorWithVersion(ncclAsyncErr), "\n", getNcclErrorDetailStr(ncclAsyncErr));
         return std::make_exception_ptr(C10_BUILD_ERROR(NCCLFaultToleranceError, err_msg));
     }
     
-    // [不攔截] 若是 CUDA OOM, Illegal Access (ncclUnhandledCudaError) 或參數錯誤，
-    // 維持拋出 DistBackendError，讓 PyTorch 原生機制將其擊殺！
+    // [No intercept] CUDA OOM, Illegal Access (ncclUnhandledCudaError), or
+    // parameter errors: throw DistBackendError and let PyTorch handle it.
     return std::make_exception_ptr(C10_BUILD_ERROR(
         DistBackendError,
         "NCCL error: " + ncclGetErrorWithVersion(ncclAsyncErr) + "\n" +
@@ -4197,17 +4200,17 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
     }
 
     // 2. Initialize the local communicator
-    // 使用 blocking 模式，確保建立失敗時能立刻捕捉到錯誤
+    // Use blocking mode so creation failures are caught immediately.
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
     config.blocking = 1;
 
-    // 取得當前綁定的 CUDA Device
+    // Get the currently bound CUDA device.
     auto device = at::Device(at::DeviceType::CUDA, guessDeviceId());
 
-    LOG(INFO) << logPrefix() << "[NCCL-FT] Calling NCCLFTComm::create for local_nvlink_comm_...";
+    LOG(WARNING) << logPrefix() << "[NCCL-FT] Calling NCCLFTComm::create for local_nvlink_comm_...";
 
-    // 從頭建立全新的 Communicator
-    // 參數: (總數=localDeviceCount_, 內部排行=local_rank, ID, GPU index, config)
+    // Create a brand-new communicator from scratch.
+    // Args: (total=localDeviceCount_, local_rank, ID, GPU index, config)
     local_nvlink_comm_ = NCCLFTComm::create(
         localDeviceCount_, local_rank, localId, device.index(), config);
 
@@ -4275,7 +4278,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         // shared_ptr slots are now null; no other thread can observe the old
         // objects through them.
         if (dead_proxy != nullptr || dead_local != nullptr) {
-            LOG(INFO) << logPrefix() << "[NCCL-FT] GC: aborting old communicators (synchronous)...";
+            LOG(WARNING) << logPrefix() << "[NCCL-FT] GC: aborting old communicators (synchronous)...";
             if (dead_proxy && !dead_proxy->isAborted()) {
                 dead_proxy->abort("FT GC - retiring old proxy comm");
             }
@@ -4283,7 +4286,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
                 dead_local->abort("FT GC - retiring old local NVLink comm");
             }
             // Destructors run here; aborted_=true suppresses WARN_ONCE.
-            LOG(INFO) << logPrefix() << "[NCCL-FT] GC: old communicators retired.";
+            LOG(WARNING) << logPrefix() << "[NCCL-FT] GC: old communicators retired.";
         }
     }
 
@@ -4334,8 +4337,8 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
     config.blocking = 1;
 
-    // 在 rebuild_shadow_ping_pong_topology() 中加診斷 log
-    LOG(INFO) << "[NCCL-FT] globalComm isAborted=" 
+    // Diagnostic log inside rebuild_shadow_ping_pong_topology().
+    LOG(WARNING) << "[NCCL-FT] globalComm isAborted="
               << globalComm->isAborted()
               << " before NCCLFTComm::create";
 
@@ -4479,7 +4482,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     // via modulo so every GPU reaches a healthy NIC regardless of the new
     // index assignment.
 
-    // 5. 重建 Proxy Global Comm (只有健康節點參與)
+    // 5. Rebuild proxy_global_comm_ (healthy ranks only).
     if (!is_faulty) {
         // Use rebuild_attempt_ (not ft_round_) so that each retry attempt
         // writes to a fresh key and does not collide with a stale value from
@@ -4495,7 +4498,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
                 reinterpret_cast<uint8_t*>(&proxyId) + NCCL_UNIQUE_ID_BYTES);
             this->globalStore_->set(proxy_id_key, vec);
         } else {
-            // 其他健康節點等待 proxy_comm_rank_==0 廣播的 ID。
+            // Other healthy ranks wait for the ID broadcast by proxy_comm_rank_==0.
             // Use 120s to match the pre-rebuild global barrier timeout; the
             // broadcaster may be slow to reach this point if it had to recover
             // from the previous rebuild attempt's exception handler sleep.
@@ -4504,7 +4507,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
             std::memcpy(&proxyId, vec.data(), vec.size());
         }
 
-        // N-to-N all-ready barrier：確保所有健康 rank 都已到達此處再進入
+        // N-to-N all-ready barrier: ensure all healthy ranks have arrived here.
         // Use cur_attempt in the key so retries don't collide with prior rounds.
         {
             std::string my_ready_key = "NCCL_FT_PROXY_READY_ATT_" +
@@ -4525,10 +4528,10 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
                       << "[NCCL-FT] All-ready barrier passed for proxy_global_comm_.";
         }
 
-        LOG(INFO) << logPrefix() << "[NCCL-FT] 建立全新的 proxy_global_comm_ (Size="
+        LOG(WARNING) << logPrefix() << "[NCCL-FT] Building new proxy_global_comm_ (Size="
                   << proxy_comm_size_ << " Rank=" << proxy_comm_rank_ << ")";
 
-        // 從頭建立全新的降級群組 (Re-Init)
+        // Create a brand-new degraded group from scratch (Re-Init).
         proxy_global_comm_ = NCCLFTComm::create(proxy_comm_size_, proxy_comm_rank_, proxyId, device.index(), config);
 
         // Verify the new comm is healthy with a zero-element AllReduce across
@@ -4549,7 +4552,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
             C10_CUDA_CHECK(cudaStreamSynchronize(ncclStream.stream()));
         }
 
-        LOG(INFO) << logPrefix() << "[NCCL-FT] proxy_global_comm_ ready!";
+        LOG(WARNING) << logPrefix() << "[NCCL-FT] proxy_global_comm_ ready!";
     } else {
         proxy_global_comm_.reset();
         LOG(INFO) << logPrefix()
@@ -4730,7 +4733,7 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         ward_bufs.reserve(my_wards.size());
         for (size_t i = 0; i < my_wards.size(); ++i) {
             ward_bufs.push_back(at::empty_like(input));
-            // 在 stream 執行完畢前，絕對不准回收或複用這塊 VRAM！
+            // Must not reclaim or reuse this VRAM until the stream finishes.
             c10::cuda::CUDACachingAllocator::recordStream(
                 ward_bufs[i].storage().data_ptr(), stream);
         }
@@ -4857,7 +4860,7 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
     // still UINT64_MAX — if two NICs fault back-to-back, the first snapshot
     // is the correct one (oldest checkpoint is safest for replay).
     //
-    // [修正]: 安全地使用 Acquire 語意讀取 atomic shadow_seq_
+    // [Fix]: safely read atomic shadow_seq_ with acquire semantics.
     uint64_t current_shadow_seq = this->shadow_seq_.load(std::memory_order_acquire);
     
     uint64_t sentinel = UINT64_MAX;
@@ -4865,11 +4868,11 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
         sentinel, current_shadow_seq, std::memory_order_release);
 
     LOG(INFO) << logPrefix()
-              << "[NCCL-FT] 瞬間攔截本地網卡故障，標記 dev_idx: " << dev_idx
+              << "[NCCL-FT] Instantly intercepted local NIC fault, marking dev_idx: " << dev_idx
               << " mask=0x" << std::hex
               << this->local_hardware_fault_mask_.load(std::memory_order_relaxed)
               << std::dec
-              << " pending_shadow_seq=" << current_shadow_seq; // 使用同一個區域變數印出
+              << " pending_shadow_seq=" << current_shadow_seq;
 }
 
 void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
@@ -5175,28 +5178,29 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                 }
 
               /* ========================================================= */
-                /* 暴力砍斷全域通訊，解救卡死的主執行緒！               */
+                /* Forcibly abort global comm to unblock the stalled main thread. */
                 {
                     auto device = at::Device(at::DeviceType::CUDA, this->guessDeviceId());
                     auto globalComm = this->getNCCLComm(getKeyFromDevice(device));
                     if (globalComm && !globalComm->isAborted()) {
-                        LOG(WARNING) << logPrefix() << "[NCCL-FT] 2PC 達成共識，側車強制 Abort 全域 Communicator！";
+                        LOG(WARNING) << logPrefix() << "[NCCL-FT] 2PC consensus reached; side-car force-aborting global communicator.";
                         globalComm->abort("FT 2PC Committed - Wake up main thread");
                     }
                 }
                 /* ========================================================= */                
 
-                // 設定訊號，讓其他模組知道正在重播
+                // Set signal so other modules know a replay is in progress.
                 this->final_commit_op_.store(cur_round + 1, std::memory_order_release);
-                LOG(INFO) << logPrefix() << "[NCCL-FT] 2PC 共識達成，側車親自啟動全域重播中心...";
+                LOG(WARNING) << logPrefix() << "[NCCL-FT] 2PC consensus reached; side-car launching global replay center...";
 
-                // 側車自己啟動重播中心！不依賴主執行緒！
-                // 這樣一來，不管主執行緒卡在哪裡等 Future，側車都會在背景幫它算完並喚醒它！
+                // Side-car launches the replay center directly; no reliance on main thread.
+                // This ensures the side-car completes the replay and wakes the main thread
+                // regardless of where the main thread is blocked waiting on a Future.
                 this->recover_and_replay_inflight_ops();
 
-                // 刪除原本等待主執行緒將 final_commit_op_ 設回 0 的 while 迴圈！
-                // 因為 recover_and_replay_inflight_ops 執行完畢後，它自己就會把 final_commit_op_ 設回 0，
-                // 所以側車可以直接進入下一輪監控，不需要再等了！
+                // Removed the original while-loop that waited for the main thread to reset
+                // final_commit_op_ to 0. recover_and_replay_inflight_ops resets it itself
+                // upon completion, so the side-car can proceed directly to the next round.
  
 
             } catch (const std::exception& e) {
@@ -5228,30 +5232,30 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
         }
     });
 }
-//New add functions
-// 尋找或配置 ShadowContext
+// New helper functions
+// Find or allocate a ShadowContext.
 ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_context(const at::Tensor& t) {
     // ---------------------------------------------------------
-    // 1. 臨界區：使用 Best-Fit (最佳適配) 尋找最適合的 Buffer
-    //    若CPU 太快了，睡 2 毫秒等 GPU 和網路傳輸追上來
+    // 1. Critical section: use Best-Fit to find the closest buffer.
+    //    If the CPU is too fast, sleep 2 ms to let GPU and network catch up.
     // ---------------------------------------------------------
     while (true) {
         {
             std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
             
-            // 1. 🔥 Inline GC: CPU 主動收割已經「成功」完成的 Bucket 🔥
+            // 1. Inline GC: proactively harvest successfully completed Buckets.
             size_t current_in_flight_bytes = 0;
             for (auto it = in_flight_shadow_bufs_.begin(); it != in_flight_shadow_bufs_.end(); ) {
-                // 如果 Work 存在，且 GPU 已經確認跑完這個任務，且「沒有」發生硬體例外
+                // If Work exists, GPU has confirmed completion, and no hardware exception.
                 if (it->second.work_ptr && 
                     it->second.work_ptr->finishedGPUExecutionInternal() && 
                     !it->second.work_ptr->exception()) {
                     
                     ShadowContext recycle_ctx = it->second;
-                    recycle_ctx.original_input = at::Tensor(); // 斷開 VRAM 參照
+                    recycle_ctx.original_input = at::Tensor(); // drop VRAM reference
                     recycle_ctx.original_output = at::Tensor();
-                    recycle_ctx.work_ptr.reset(); // 清除 Work 參照
-                    free_shadow_bufs_.push_back(recycle_ctx); // 歸還給 Free Pool
+                    recycle_ctx.work_ptr.reset(); // drop Work reference
+                    free_shadow_bufs_.push_back(recycle_ctx); // return to free pool
                     it = in_flight_shadow_bufs_.erase(it);
                 } else {
                     current_in_flight_bytes += it->second.buffer.nbytes();
@@ -5259,7 +5263,7 @@ ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_con
                 }
             }
 
-            // 2. Best-Fit (最佳適配)：從 Free Pool 找出大小最接近的 Buffer 複用
+            // 2. Best-Fit: find the closest-sized buffer in the free pool for reuse.
             auto best_it = free_shadow_bufs_.end();
             size_t min_diff = std::numeric_limits<size_t>::max();
             for (auto it = free_shadow_bufs_.begin(); it != free_shadow_bufs_.end(); ++it) {
@@ -5269,7 +5273,7 @@ ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_con
                         min_diff = diff;
                         best_it = it;
                     }
-                    if (diff == 0) break; // 大小完全吻合，直接命中！
+                    if (diff == 0) break; // Exact size match, direct hit.
                 }
             }
 
@@ -5279,22 +5283,22 @@ ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_con
                 return ctx; 
             }
 
-            // 3. 🛡️ Memory Backpressure (背壓防禦)：防止 CPU 暴走導致 OOM 🛡️
-            // 如果目前飛行中的 Buffer 總量超過 2GB (安全值)，強迫 CPU 讓出資源等待 GPU 消化！
-            if (current_in_flight_bytes > 2ULL * 1024 * 1024 * 1024) { 
-                // 解鎖，往下走去 Sleep，然後重試
+            // 3. Memory backpressure: if in-flight buffer total exceeds 2 GB,
+            // yield the CPU and wait for the GPU to catch up.
+            if (current_in_flight_bytes > 2ULL * 1024 * 1024 * 1024) {
+                // unlock and fall through to sleep and retry
             } else {
-                // 安全範圍內，允許向 OS 申請新的 Memory
-                break; 
+                // Within safe range; allow OS allocation.
+                break;
             }
         } // mutex unlock
 
-        // CPU 太快了，睡 2 毫秒等 GPU 和網路傳輸追上來
+        // CPU is ahead; sleep 2 ms for GPU and network to catch up.
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
     // ---------------------------------------------------------
-    // 2. 非鎖區：執行昂貴的 OS 呼叫並印出統計 Log
+    // 2. Outside lock: perform the expensive OS allocation and log stats.
     // ---------------------------------------------------------
     auto cpu_opts = t.options().device(at::kCPU).memory_format(at::MemoryFormat::Contiguous);
     
@@ -5304,14 +5308,14 @@ ProcessGroupNCCLFT::ShadowContext ProcessGroupNCCLFT::get_or_allocate_shadow_con
     new_ctx.replayed_end_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
     new_ctx.compute_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
     
-    // 更新統計數據
+    // Update stats.
     total_pinned_bytes_ += new_ctx.buffer.nbytes();
     total_pinned_buffers_++;
-    
-    LOG(WARNING) << logPrefix() << "[NCCL-FT] Cache Miss: 配置新的 Pinned Shadow Context. "
-              << "本次大小: " << (new_ctx.buffer.nbytes() / 1024.0 / 1024.0) << " MB. "
-              << "目前總共分配區塊數: " << total_pinned_buffers_.load() 
-              << ", 總 Pinned Memory: " << (total_pinned_bytes_.load() / 1024.0 / 1024.0) << " MB";
+
+    LOG(WARNING) << logPrefix() << "[NCCL-FT] Cache miss: allocated new Pinned Shadow Context. "
+              << "Size: " << (new_ctx.buffer.nbytes() / 1024.0 / 1024.0) << " MB. "
+              << "Total buffers allocated: " << total_pinned_buffers_.load()
+              << ", Total pinned memory: " << (total_pinned_bytes_.load() / 1024.0 / 1024.0) << " MB";
     
     return new_ctx;
 }
@@ -5501,8 +5505,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
     work->ncclStartEvent_->record(ncclStream);
   }
 
-  // 將 Future 的初始化移到最前面！
-  // 確保在 pre() 將任務暴露給重播中心之前，Future 已經存在，徹底消滅 Race Condition！
+  // Initialize Future before pre() exposes the work to the replay center,
+  // eliminating a race condition.
   {
     c10::cuda::CUDAMultiStreamGuard sg(ncclStream);
     std::vector<at::Device> devs{device};
@@ -5514,17 +5518,17 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   pre(ncclStream, work);
 
   try {
-      // 先判斷是否處於降級模式！
-      // 絕對不要在降級模式下呼叫 ncclComm->getNcclComm()，因為它已經被 abort，會拋出例外！
+      // Check degraded mode first; never call ncclComm->getNcclComm() in
+      // degraded mode since the comm has been aborted and will throw.
       if (C10_UNLIKELY(this->is_degraded_.load(std::memory_order_acquire))) {
-          LOG(INFO) << logPrefix() << "[NCCL-FT] 降級模式，執行 Shadow Ping-Pong (seq=" << seqCollective_ << ")";
-          
+          LOG(WARNING) << logPrefix() << "[NCCL-FT] Degraded mode; executing Shadow Ping-Pong (seq=" << seqCollective_ << ")";
+
           if (opType == OpType::ALLREDUCE && proxy_comm_ready_.load(std::memory_order_acquire)) {
-              // 執行降級重播，內部會使用 proxy_global_comm_ 和 local_nvlink_comm_
+              // Execute degraded replay using proxy_global_comm_ and local_nvlink_comm_.
               execute_shadow_allreduce(inputs[0], outputs[0], ncclStream, current_shadow_reduce_op_);
           } else {
               LOG(WARNING) << logPrefix() << "[NCCL-FT] Non-AllReduce op in degraded mode — falling back...";
-              // 只有不支援的 Op 才會去撞舊的 Comm 觸發例外
+              // Only unsupported ops fall through to the old comm to trigger an exception.
               ncclComm_t comm = ncclComm->getNcclComm(); 
 #ifndef NCCL_HAS_COMM_NONBLOCKING
               C10D_NCCL_FT_CHECK(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm->getNcclCommFailureReason());
@@ -5550,20 +5554,20 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
           }
 
       } else {
-          /* --- [原生 NCCL 執行路徑] (正常訓練時，100% 只會走這裡) --- */
-          ncclComm_t comm = ncclComm->getNcclComm(); // 正常情況下才去拿 Comm
+          /* --- [Native NCCL execution path] (always taken during normal training) --- */
+          ncclComm_t comm = ncclComm->getNcclComm(); // Only fetch comm on the normal path.
 #ifndef NCCL_HAS_COMM_NONBLOCKING
           C10D_NCCL_FT_CHECK(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm->getNcclCommFailureReason());
 #else
           C10D_NCCL_FT_CHECK_TIMEOUT(fn(inputs[0], outputs[0], comm, ncclStream), ncclComm, ncclComm->getNcclCommFailureReason());
 #endif 
-          // 正常成功執行，指派原生 Comm
+          // Normal successful execution; assign the native comm.
           work->ncclComm_ = ncclComm;
       }
 
   } catch (const ::c10::NCCLFaultToleranceError& e) {
       if (!ft_disabled_) {
-          LOG(WARNING) << logPrefix() << "[NCCL-FT] 攔截到同步派發錯誤 (seq=" << seqCollective_ << ")，建立 Pending Work 轉交背景重播。";
+          LOG(WARNING) << logPrefix() << "[NCCL-FT] Intercepted sync dispatch error (seq=" << seqCollective_ << "); creating Pending Work for background replay.";
           
           work->ncclEndEvent_->record(ncclStream);
           
@@ -5609,7 +5613,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
           },
           /*uses_future=*/false);
     }
-    // 正常執行完畢，標記完成
+    // Normal completion; mark future as done.
     work->future_->markCompleted(at::IValue(*work->outputs_));
   }
 
@@ -5643,7 +5647,7 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         return;
     }
 
-    LOG(INFO) << logPrefix() << "[NCCL-FT] 啟動全域重播中心！ (容錯回合 Round=" << this->ft_round_ << ")";
+    LOG(WARNING) << logPrefix() << "[NCCL-FT] Starting global replay center! (FT round=" << this->ft_round_ << ")";
 
     auto device = at::Device(at::DeviceType::CUDA, this->guessDeviceId());
     at::cuda::CUDAGuard device_guard(device);
@@ -5681,7 +5685,7 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
 
     uint64_t agreed_ss = this->committed_shadow_seq_.load(std::memory_order_acquire);
 
-    // 3. 收集所有飛行中的 Buckets，分為「需要重播」與「只需補齊 Future」兩批
+    // 3. Collect all in-flight Buckets, split into "needs replay" and "only complete Future".
     std::vector<uint64_t> seqs_to_replay;
     std::vector<uint64_t> seqs_to_skip;
     {
@@ -5698,7 +5702,8 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
 
     auto ncclStream = ncclStreams_.at(getKeyFromDevice(device));
 
-    // 處理小於 agreed_ss 的無辜任務：把它們當作正常完成並補齊 Future，解鎖 DDP！
+    // Handle works with seq < agreed_ss: treat them as normally completed and
+    // mark their Futures, unblocking DDP.
     for (uint64_t seq : seqs_to_skip) {
         ShadowContext ctx;
         {
@@ -5709,7 +5714,7 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
             ctx.work_ptr->setException(nullptr);
             if (ctx.work_ptr->future_ && !ctx.work_ptr->future_->completed()) {
                 c10::cuda::CUDAMultiStreamGuard streamGuard(ncclStream);
-                ctx.replayed_end_event->record(ncclStream); // 確保 wait() 呼叫 block() 時不會空等
+                ctx.replayed_end_event->record(ncclStream); // Ensure wait()'s block() call does not spin on empty.
                 ctx.work_ptr->future_->markCompleted(at::IValue(*ctx.work_ptr->outputs_));
             }
         }
@@ -5717,9 +5722,9 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
 
     at::cuda::CUDAEvent restore_done(cudaEventDisableTiming);
 
-    // 4. 依序還原並重播
+    // 4. Restore and replay in order.
     for (uint64_t seq : seqs_to_replay) {
-        LOG(INFO) << logPrefix() << "[NCCL-FT] 正在重播 Bucket (seq=" << seq << ")";
+        LOG(WARNING) << logPrefix() << "[NCCL-FT] Replaying Bucket (seq=" << seq << ")";
         ShadowContext ctx;
         {
             std::lock_guard<std::mutex> lk(shadow_buf_mutex_);
@@ -5748,14 +5753,14 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         }
     }
 
-    // 5. 推進容錯回合，並清理 TCPStore
+    // 5. Advance the FT round and clean up TCPStore.
     uint64_t cur_round = commit_signal - 1;
     this->ft_round_++;
 
     try {
         std::string round_str = std::to_string(cur_round);
 
-        // 每個 rank 清除自己的 per-rank keys
+        // Each rank cleans its own per-rank keys.
         this->globalStore_->deleteKey("NCCL_FT_PROPOSE_" + std::to_string(this->rank_) + "_" + round_str);
 
         // Clean up all rebuild-attempt-keyed keys written by this rank for
@@ -5824,7 +5829,7 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
                     "NCCL_FT_PROXY_ID_ATT_" + std::to_string(att));
             }
         }
-        LOG(INFO) << logPrefix() << "[NCCL-FT] TCPStore keys cleaned for round=" << cur_round;
+        LOG(WARNING) << logPrefix() << "[NCCL-FT] TCPStore keys cleaned for round=" << cur_round;
     } catch (const std::exception& e) {
         LOG(WARNING) << logPrefix() << "[NCCL-FT] TCPStore cleanup failed (non-fatal): " << e.what();
     }
@@ -5852,7 +5857,7 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     // completed successfully.
     this->consecutive_rebuild_failures_ = 0;
 
-    LOG(INFO) << logPrefix() << "[NCCL-FT] 全域重播完成！系統準備進入下一回合: " << this->ft_round_;
+    LOG(WARNING) << logPrefix() << "[NCCL-FT] Global replay complete! System ready for next round: " << this->ft_round_;
 }
 
 template <typename Fn>

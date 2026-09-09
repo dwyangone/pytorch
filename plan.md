@@ -1,6 +1,6 @@
 # ProcessGroupNCCLFT — Shadow Ping-Pong Failover: Implementation Plan
 
-> 以 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實作狀態為準（2026-08，第四次修訂）
+> 以 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實作狀態為準（2026-09，第五次修訂）
 
 ---
 
@@ -73,7 +73,7 @@
 | Best-Fit buffer 搜尋：取代舊版第一個 numel >= 的策略 | ~5043 | ✅ |
 | wait() FT 後處理 GC：replay 完成後由 wait() 回收 shadow buffer | wait() | ✅ |
 | `ShadowContext` struct（含 per-seq copy_event / replayed_end_event / compute_event / work_ptr / reduce_op） | hpp ~1178 | ✅ |
-| findProxy()：round-robin 尋找下一個健康 proxy（支援多 faulty） | ~4414 | ✅ |
+| `findProxy()`：**round-robin 均攤**（sorted faulty 列表的第 i 項 → healthy 列表的第 `i % healthy.size()` 項）；faulty ≤ healthy 時每個 proxy 恰好 1 個 ward，徹底消除多 NIC 故障時的 proxy OOM 問題 | ~4575 | ✅ |
 | my_wards vector：proxy 可代理多個 faulty rank | execute_shadow_allreduce ~4452 | ✅ |
 | **多維 Tensor Shape Mismatch fix**：shadow_pre D2H copy + H2D restore 均加 `.flatten()` | shadow_pre, recover_and_replay ~5490 | ✅ |
 | **迴圈內 CUDAEvent 效能 fix**：recover_and_replay 迴圈外宣告 `restore_done`，迴圈內重複 record | recover_and_replay ~5476 | ✅ |
@@ -142,11 +142,11 @@
 |------|------|
 | AllGather / ReduceScatter 降級路徑 | FSDP / ZeRO2/3 場景；目前降級時非 AllReduce op 走 fallback fn()，可能崩潰 |
 | Per-Server NIC Pool 非對稱降級 | 不同節點不同 NIC 索引時（對稱降級假設目前固定） |
-| Proxy 負載均衡 | 目前固定 `(faulty+1) % N`，多 faulty 時 findProxy 可能將多個 ward 集中在同一 proxy |
+| Proxy 負載均衡 | ✅ 已由 round-robin `findProxy` 解決（faulty ≤ healthy 時每個 proxy 恰好 1 個 ward） |
 | Error type 精細分類 | 目前所有 ncclRemoteError 視為 NIC 硬體故障，應區分網路抖動 vs. 實際 NIC failure |
 | AllReduce AVG 正確性驗證 | proxy 用 ncclSum 再除以原始 size_，需驗證浮點精度是否與 ncclAvg 一致 |
 | 降級後 `is_degraded_` 不恢復 | 目前一旦降級不回到正常模式；若 NIC 可熱插拔可考慮恢復路徑 |
-| ward_bufs 預配置 | 目前每次 execute_shadow_allreduce 都 at::empty_like；可加入 ShadowContext pool |
+| ward_bufs 預配置 | 目前每次 `execute_shadow_allreduce` 都臨時 `at::empty_like`（函式 local vector，返回後回 allocator cache）；第一次若 cache 無可用 block 觸發 GC（`release_cached_blocks`），耗時約 2 秒；第二次起 cache 命中不重新 `cudaMalloc`；可考慮 rebuild 後預配置 |
 
 ---
 

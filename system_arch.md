@@ -1,6 +1,6 @@
 # ProcessGroupNCCLFT — System Architecture
 
-> 依據 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實際程式碼撰寫，2026-08（第六次修訂）。
+> 依據 `ProcessGroupNCCLFT.cpp` / `.hpp` 目前實際程式碼撰寫，2026-09（第七次修訂）。
 
 ---
 
@@ -306,9 +306,32 @@ wait() FT 後處理 GC（is_degraded_ && seq <= committed_ss）：
 
 根據 `local_rank = rank_ % localDeviceCount_` 與 `faulty_local_devs_` 決定角色。
 
-**角色分配函式 `findProxy(faulty_dev, localDeviceCount, faulty_devs)`（行 4315-4324）：**
-- 從 `(faulty_dev+1) % N` 開始走，找第一個不在 faulty set 中的 local rank
-- 保證多 NIC 故障時仍能找到 proxy（要求 faulty_devs.size() < localDeviceCount_）
+**角色分配函式 `findProxy(faulty_dev, localDeviceCount, faulty_devs)`（行 4575-4609）：**
+
+Round-robin 均攤：將 faulty_devs 排序後，第 `i` 個 faulty rank 對應到 healthy 列表中第 `i % healthy.size()` 個 rank。
+
+```cpp
+// faulty_sorted = sorted(faulty_devs)
+// healthy       = [i for i in 0..N-1 if i not in faulty_devs]  (天然有序)
+// idx = faulty_sorted.index(faulty_dev)
+// return healthy[idx % healthy.size()]
+```
+
+**設計要點：**
+- `faulty_devs`（`unordered_set`，無序）先 sort 為 `faulty_sorted`，確保 deterministic
+- 兩個呼叫點（faulty rank 找自己的 proxy、healthy rank 算自己的 wards）傳入相同參數，結果完全一致，雙邊對稱不會 deadlock
+- faulty ≤ healthy 時每個 proxy 最多 1 個 ward（各自 16 GB ward_buf）
+- faulty > healthy 時均攤分配，最大 ward 數 = ⌈faulty / healthy⌉
+
+**各場景 ward 分配範例（localDeviceCount=8）：**
+
+| faulty_devs | proxy 分配 | 每 proxy 最多幾個 ward |
+|-------------|-----------|----------------------|
+| `{0}` | rank0→1 | 1 |
+| `{0,1}` | rank0→2, rank1→3 | 1 |
+| `{0,1,2}` | rank0→3, rank1→4, rank2→5 | 1 |
+| `{0,1,2,3}` | rank0→4, rank1→5, rank2→6, rank3→7 | 1 |
+| `{0,1,2,3,4}` | rank0→5, rank1→6, rank2→7, rank3→5, rank4→6 | 2 |
 
 **FAULTY 角色（本地 NIC 故障）：**
 ```
@@ -715,8 +738,8 @@ T5: 後續所有 AllReduce 走降級路徑
 - `trigger_fault_proposal`：`fetch_or`（不是 CAS，所有 bit 都記錄）
 - side-car：`exchange(0)` 一次取走整個 bitmask，PROPOSE message 帶完整 fault_mask
 - 協調：`agg_fault_mask |= p_fmask`（OR 聚合所有 rank 的 mask）
-- `findProxy`：走 round-robin，一定能找到非故障 proxy
-- `my_wards`：proxy 可代理多個 faulty rank
+- `findProxy`：**round-robin 均攤**（sorted faulty 列表的第 i 項 → healthy 列表的第 i % len(healthy) 項），faulty ≤ healthy 時每個 proxy 恰好 1 個 ward
+- `my_wards`：proxy 可代理多個 faulty rank（faulty > healthy 時發生）
 
 ### 逐步故障（Sequential Faults）
 
@@ -786,4 +809,4 @@ T5: 後續所有 AllReduce 走降級路徑
 | shadow_pre `setCurrentCUDAStream` / `getCurrentCUDAStream` 每次呼叫 | 極低 | 兩次 thread-local 讀寫，無 CUDA API 呼叫 |
 | Inline GC 在 get_or_allocate 鎖內掃描 in_flight_shadow_bufs_ | O(n) 掃描 | n = 飛行中 bucket 數，通常 < 100，可接受 |
 | Memory Backpressure sleep 2ms | 輕微 latency | 只在 in-flight > 2GB 時觸發，視為異常保護 |
-| proxy step 2 每次 at::empty_like | 輕微 GPU allocator 呼叫 | 降級後每次 AllReduce 都配置 ward_bufs；可考慮預配置加入 ShadowContext pool |
+| proxy step 2 每次 `at::empty_like` | 輕微 GPU allocator 呼叫 | 降級後每次 AllReduce 都臨時配置 ward_bufs（函式 local vector，返回後回 allocator cache）；第一次若 cache 無可用 block 會觸發 `release_cached_blocks` GC；第二次起 cache 命中不重新 `cudaMalloc`；可考慮 rebuild 後預配置 |
