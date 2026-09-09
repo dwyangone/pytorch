@@ -4572,21 +4572,40 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 //   the original size_. To get the correct average, the proxy uses ncclSum on
 //   proxy_global_comm_ and then divides the result by size_ (original world size)
 //   on the CUDA stream before scatter-back.
-// Helper: given a faulty local rank and the full faulty set, find the next
-// healthy local rank that will serve as proxy.
-// Walks (faulty_dev+1) % N, (faulty_dev+2) % N, ... until it finds a rank
-// that is NOT in the faulty set.  Guaranteed to find one because
-// faulty_devs.size() < localDeviceCount_ (we would have no healthy ranks
-// otherwise).
+// Helper: given a faulty local rank and the full faulty set, find the healthy
+// local rank that will serve as proxy using round-robin assignment.
+//
+// Round-robin spreads ward load evenly across healthy ranks:
+//   faulty_sorted[i] -> healthy[i % healthy.size()]
+//
+// Both call sites (faulty rank finding its own proxy, healthy rank checking
+// which faulty ranks it covers) pass the same arguments and get the same
+// deterministic answer because faulty_sorted and healthy are derived purely
+// from the sorted faulty set and the fixed localDeviceCount.
+//
+// Example: faulty={0,1}, localDeviceCount=8
+//   findProxy(0,...) -> healthy[0%6] = 2
+//   findProxy(1,...) -> healthy[1%6] = 3
+//   rank2 has my_wards={0}, rank3 has my_wards={1}: each holds 1 ward_buf.
 static int findProxy(int faulty_dev, int localDeviceCount,
                      const std::unordered_set<int>& faulty_devs) {
-    for (int offset = 1; offset < localDeviceCount; ++offset) {
-        int candidate = (faulty_dev + offset) % localDeviceCount;
-        if (faulty_devs.count(candidate) == 0) {
-            return candidate;
-        }
+    // Sorted faulty list gives a deterministic rank index for faulty_dev.
+    std::vector<int> faulty_sorted(faulty_devs.begin(), faulty_devs.end());
+    std::sort(faulty_sorted.begin(), faulty_sorted.end());
+
+    // Healthy list is naturally sorted (ascending for loop).
+    std::vector<int> healthy;
+    for (int i = 0; i < localDeviceCount; ++i) {
+        if (!faulty_devs.count(i)) healthy.push_back(i);
     }
-    return -1; // should never happen
+
+    if (healthy.empty()) return -1; // should never happen
+
+    auto it = std::find(faulty_sorted.begin(), faulty_sorted.end(), faulty_dev);
+    if (it == faulty_sorted.end()) return -1; // faulty_dev not in faulty set
+    int idx = static_cast<int>(std::distance(faulty_sorted.begin(), it));
+
+    return healthy[idx % static_cast<int>(healthy.size())];
 }
 
 void ProcessGroupNCCLFT::execute_shadow_allreduce(
