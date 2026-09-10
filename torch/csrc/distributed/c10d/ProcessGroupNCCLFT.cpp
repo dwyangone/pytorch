@@ -4060,7 +4060,7 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
     int node_id    = rank_ / localDeviceCount_;
     int local_rank = rank_ % localDeviceCount_;
 
-    LOG(INFO) << logPrefix()
+    LOG(WARNING) << logPrefix()
               << "[NCCL-FT] initLocalNvlinkComm: Building independent NVLink communicator "
               << "from scratch (node_id=" << node_id
               << ", local_rank=" << local_rank
@@ -4090,7 +4090,7 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
                                       + "_LR_" + std::to_string(lr));
         }
         this->globalStore_->wait(all_arrive_keys, std::chrono::seconds(120));
-        LOG(INFO) << logPrefix()
+        LOG(WARNING) << logPrefix()
                   << "[NCCL-FT] Entry-arrival barrier passed (node=" << node_id
                   << ", attempt=" << attempt << ").";
     }
@@ -4133,7 +4133,7 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
             reinterpret_cast<uint8_t*>(&localId),
             reinterpret_cast<uint8_t*>(&localId) + NCCL_UNIQUE_ID_BYTES);
         this->globalStore_->set(local_id_key, vec);
-        LOG(INFO) << logPrefix()
+        LOG(WARNING) << logPrefix()
                   << "[NCCL-FT] Local rank " << id_generator
                   << " (first healthy) generated and stored NVLink Comm ID for Node "
                   << node_id << " (attempt=" << attempt << ")";
@@ -4183,7 +4183,7 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
                                      + "_LR_" + std::to_string(lr));
         }
         this->globalStore_->wait(all_ready_keys, std::chrono::seconds(60));
-        LOG(INFO) << logPrefix()
+        LOG(WARNING) << logPrefix()
                   << "[NCCL-FT] All-ready barrier passed for local_nvlink_comm_ (node="
                   << node_id << ").";
 
@@ -4219,7 +4219,7 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
             c10::str(logPrefix(), "[NCCL-FT] Failed to create local_nvlink_comm_ via NCCLFTComm::create!"));
     }
 
-    LOG(INFO) << logPrefix()
+    LOG(WARNING) << logPrefix()
               << "[NCCL-FT] local_nvlink_comm_ ready: "
               << local_nvlink_comm_->repr()
               << " (node=" << node_id
@@ -4342,7 +4342,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
               << globalComm->isAborted()
               << " before NCCLFTComm::create";
 
-    LOG(INFO) << logPrefix()
+    LOG(WARNING) << logPrefix()
               << "[NCCL-FT] rebuild_shadow_ping_pong_topology: "
               << "faulty_devs=[" << faulty_str << "]"
               << " color=" << color
@@ -4390,7 +4390,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         }
         setenv("NCCL_IB_HCA", healthy_hcas.c_str(), 1);
         nccl_ft_reset_ib_cache();
-        LOG(INFO) << logPrefix()
+        LOG(WARNING) << logPrefix()
                   << "[NCCL-FT] Set NCCL_IB_HCA=" << healthy_hcas
                   << " and reset IB cache (vNic indices will be renumbered 0.."
                   << (localDeviceCount_ - static_cast<int>(faulty_devs.size()) - 1) << ").";
@@ -4434,7 +4434,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         setenv("NCCL_SOCKET_IFNAME", chosen_if.c_str(), 1);
         nccl_ft_reset_bootstrap_net();
         nccl_ft_reset_net_socket();
-        LOG(INFO) << logPrefix()
+        LOG(WARNING) << logPrefix()
                   << "[NCCL-FT] Set NCCL_SOCKET_IFNAME=" << chosen_if
                   << " and reset bootstrap + socket-transport singletons.";
     }
@@ -4462,7 +4462,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
                 std::to_string(cur_attempt) + "_R" + std::to_string(r));
         }
         this->globalStore_->wait(all_sync_keys, std::chrono::seconds(120));
-        LOG(INFO) << logPrefix()
+        LOG(WARNING) << logPrefix()
                   << "[NCCL-FT] Pre-rebuild global barrier passed (attempt=" << cur_attempt << ").";
     }
 
@@ -4524,7 +4524,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
                 }
             }
             this->globalStore_->wait(all_ready_keys, std::chrono::seconds(60));
-            LOG(INFO) << logPrefix()
+            LOG(WARNING) << logPrefix()
                       << "[NCCL-FT] All-ready barrier passed for proxy_global_comm_.";
         }
 
@@ -4555,7 +4555,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         LOG(WARNING) << logPrefix() << "[NCCL-FT] proxy_global_comm_ ready!";
     } else {
         proxy_global_comm_.reset();
-        LOG(INFO) << logPrefix()
+        LOG(WARNING) << logPrefix()
                   << "[NCCL-FT] This rank is faulty (local_rank=" << local_rank
                   << "); proxy_global_comm_ is null.";
     }
@@ -4672,7 +4672,12 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
     std::string wards_str;
     for (int w : my_wards) wards_str += std::to_string(w) + " ";
 
-    LOG(INFO) << logPrefix()
+    constexpr uint64_t log_cycle = 20;
+    // Log on the first call and every log_cycle calls thereafter so that
+    // steady-state degraded mode does not flood the log with per-op lines.
+    bool do_shadow_log = ((shadow_allreduce_log_count_++ % log_cycle) == 0);
+    if (do_shadow_log) {
+        LOG(WARNING) << logPrefix()
               << "[NCCL-FT] execute_shadow_allreduce: role="
               << (is_faulty ? "FAULTY" : (is_proxy ? "PROXY" : "HEALTHY"))
               << " local_rank=" << local_rank
@@ -4680,7 +4685,9 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
               << (is_proxy  ? " my_wards=[" + wards_str + "]" : "")
               << " op=" << static_cast<int>(reduceOp.op_)
               << " numel=" << numel
-              << " seq=" << seqCollective_;
+              << " seq=" << seqCollective_
+              << " (log #" << shadow_allreduce_log_count_ << ")";
+    }
 
 #ifdef NCCL_HAS_AVG
     bool use_avg_workaround = (reduceOp == ReduceOp::AVG);
@@ -4715,8 +4722,10 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
                      my_proxy, nvlink_comm, stream.stream()),
             std::nullopt);
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
-        LOG(INFO) << logPrefix()
+        if (do_shadow_log) {
+            LOG(WARNING) << logPrefix()
                   << "[NCCL-FT][FAULTY] Steps 1+4 enqueued via proxy=" << my_proxy;
+        }
 
     } else if (is_proxy) {
         // ----------------------------------------------------------------
@@ -4792,8 +4801,10 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
                 std::nullopt);
         }
         C10D_NCCL_FT_CHECK(ncclGroupEnd(), std::nullopt);
-        LOG(INFO) << logPrefix()
+        if (do_shadow_log) {
+            LOG(WARNING) << logPrefix()
                   << "[NCCL-FT][PROXY] All steps enqueued for wards=[" << wards_str << "]";
+        }
 
     } else {
         // ----------------------------------------------------------------
@@ -4834,8 +4845,10 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
             throw ::c10::NCCLFaultToleranceError(
                 {__func__, __FILE__, static_cast<uint32_t>(__LINE__)}, err);
         }
-        LOG(INFO) << logPrefix()
+        if (do_shadow_log) {
+            LOG(WARNING) << logPrefix()
                   << "[NCCL-FT][HEALTHY] ncclAllReduce completed on proxy_global_comm_.";
+        }
     }
 }
 
@@ -4867,7 +4880,7 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
     this->pending_shadow_seq_.compare_exchange_strong(
         sentinel, current_shadow_seq, std::memory_order_release);
 
-    LOG(INFO) << logPrefix()
+    LOG(WARNING) << logPrefix()
               << "[NCCL-FT] Instantly intercepted local NIC fault, marking dev_idx: " << dev_idx
               << " mask=0x" << std::hex
               << this->local_hardware_fault_mask_.load(std::memory_order_relaxed)
@@ -4895,7 +4908,7 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                 // ── Heartbeat ────────────────────────────────────────────
                 auto now = std::chrono::steady_clock::now();
                 if (now - last_heartbeat >= std::chrono::seconds(5)) {
-                    LOG(INFO) << logPrefix()
+                    LOG(WARNING) << logPrefix()
                               << "[NCCL-FT] Side-car alive: fault_mask=0x"
                               << std::hex
                               << local_hardware_fault_mask_.load(
@@ -4971,7 +4984,7 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                                                  proposal.end());
                         this->globalStore_->set(propose_key, vec);
                         last_proposed_round = cur_round;
-                        LOG(INFO) << logPrefix()
+                        LOG(WARNING) << logPrefix()
                                   << "[NCCL-FT] Side-car wrote per-rank "
                                   << "propose key: " << propose_key
                                   << " val=" << proposal;
@@ -5040,7 +5053,7 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                                                  proposal.end());
                         this->globalStore_->set(my_propose_key, vec);
                         last_proposed_round = cur_round;
-                        LOG(INFO) << logPrefix()
+                        LOG(WARNING) << logPrefix()
                                   << "[NCCL-FT] Side-car wrote no-fault propose "
                                   << "key: " << my_propose_key;
                     }
@@ -5107,7 +5120,7 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                     continue;
                 }
 
-                LOG(INFO) << logPrefix()
+                LOG(WARNING) << logPrefix()
                           << "[NCCL-FT] All " << this->size_
                           << " per-rank proposals received for round="
                           << cur_round
@@ -5143,7 +5156,7 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                     this->globalStore_->set(
                         commit_key,
                         std::vector<uint8_t>(cv.begin(), cv.end()));
-                    LOG(INFO) << logPrefix()
+                    LOG(WARNING) << logPrefix()
                               << "[NCCL-FT] (rank 0) COMMIT written for "
                               << "round=" << cur_round
                               << " agreed_shadow_seq=" << agreed_ss;
@@ -5171,7 +5184,7 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                         // is already visible (release/acquire ordering).
                         this->committed_shadow_seq_.store(
                             final_ss, std::memory_order_release);
-                        LOG(INFO) << logPrefix()
+                        LOG(WARNING) << logPrefix()
                                   << "[NCCL-FT] committed_shadow_seq_=" << final_ss
                                   << " for round=" << cur_round;
                     }
@@ -5381,13 +5394,13 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
   // (the `local_nvlink_comm_ == nullptr` guard still ensures it runs once).
   if (!ft_disabled_ && local_nvlink_comm_ == nullptr && !nvlink_init_attempted_) {
     nvlink_init_attempted_ = true;
-    LOG(INFO) << logPrefix()
+    LOG(WARNING) << logPrefix()
               << "[NCCL-FT] First collective detected; registering fault "
               << "callback and initialising local_nvlink_comm_.";
     // Register the fault callback on THIS rank's own comm.  Every rank must
     // call this independently — there is no inter-rank broadcast.
     ft_root_comm_ = ncclComm;
-    LOG(INFO) << logPrefix()
+    LOG(WARNING) << logPrefix()
               << "[NCCL-FT] Registering fault callback on comm "
               << ncclComm->repr()
               << " (ncclComm_t=" << (void*)ncclComm->getNcclComm() << ")";
@@ -5399,7 +5412,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
                  << "ret=" << reg_ret
                  << " — fault callback NOT active for this rank!";
     } else {
-      LOG(INFO) << logPrefix()
+      LOG(WARNING) << logPrefix()
                 << "[NCCL-FT] Fault callback registered successfully on comm "
                 << ncclComm->repr();
     }
@@ -5662,7 +5675,7 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     // TCPStore keys. rebuild_shadow_ping_pong_topology reads this counter via
     // rebuild_attempt_.load() to name the barrier and comm-id keys.
     uint64_t cur_attempt = rebuild_attempt_.fetch_add(1, std::memory_order_relaxed) + 1;
-    LOG(INFO) << logPrefix()
+    LOG(WARNING) << logPrefix()
               << "[NCCL-FT] Starting rebuild attempt=" << cur_attempt
               << " (ft_round=" << ft_round_ << ")";
 

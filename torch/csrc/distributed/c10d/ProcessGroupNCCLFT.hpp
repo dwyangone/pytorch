@@ -1144,6 +1144,12 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // first collective completed).
   bool nvlink_init_attempted_{false};
 
+  // Throttle counter for per-op shadow AllReduce log lines.
+  // Logs are emitted on the first call and then every 100 calls thereafter
+  // so that degraded-mode steady-state does not flood the log with identical
+  // lines differing only in seq number.
+  uint64_t shadow_allreduce_log_count_{0};
+
   // Reduced cross-node communicator built after each fault round is confirmed.
   // Only ranks whose local_rank is NOT in faulty_local_devs_ participate.
   // Rebuilt via ncclCommSplit on every new fault (color=1 for healthy,
