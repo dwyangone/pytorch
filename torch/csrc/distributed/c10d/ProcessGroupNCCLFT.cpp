@@ -1145,6 +1145,12 @@ ProcessGroupNCCLFT::ProcessGroupNCCLFT(
   const char* disable_env = getenv("NCCL_FT_DISABLE");
   this->ft_disabled_ = (disable_env && strcmp(disable_env, "1") == 0);
 
+  const char* no_timing_env = getenv("NCCL_FT_NO_TIMING");
+  this->ft_timing_enabled_ = !(no_timing_env && strcmp(no_timing_env, "1") == 0);
+  if (!this->ft_timing_enabled_) {
+      LOG(WARNING) << logPrefix() << "[NCCL-FT] NCCL_FT_NO_TIMING=1: failover benchmarking disabled.";
+  }
+
   if (!this->ft_disabled_) {
       {
           std::lock_guard<std::mutex> lock(g_ft_pg_mutex);
@@ -4855,6 +4861,12 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
 // Called ONLY from the NCCL fault callback (NCCL progress thread).
 // Must return in microseconds — no TCPStore, no locks, only atomic writes.
 void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
+    // T0: fault first detected — record before anything else so the timestamp
+    // reflects the true moment the hardware event reached the software layer.
+    if (ft_timing_enabled_) {
+        ft_timings_.t0_fault_detected = std::chrono::steady_clock::now();
+    }
+
     // This log confirms the NCCL callback path is active.  If a fault occurs
     // and this line never appears, the callback was not registered correctly.
     LOG(WARNING) << logPrefix()
@@ -4984,6 +4996,10 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                                                  proposal.end());
                         this->globalStore_->set(propose_key, vec);
                         last_proposed_round = cur_round;
+                        // T1: PROPOSE written — 2PC phase 1 started from this rank.
+                        if (ft_timing_enabled_) {
+                            ft_timings_.t1_propose_written = std::chrono::steady_clock::now();
+                        }
                         LOG(WARNING) << logPrefix()
                                   << "[NCCL-FT] Side-car wrote per-rank "
                                   << "propose key: " << propose_key
@@ -5184,6 +5200,10 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                         // is already visible (release/acquire ordering).
                         this->committed_shadow_seq_.store(
                             final_ss, std::memory_order_release);
+                        // T2: consensus reached, committed_shadow_seq_ is now visible.
+                        if (ft_timing_enabled_) {
+                            ft_timings_.t2_commit_received = std::chrono::steady_clock::now();
+                        }
                         LOG(WARNING) << logPrefix()
                                   << "[NCCL-FT] committed_shadow_seq_=" << final_ss
                                   << " for round=" << cur_round;
@@ -5660,6 +5680,10 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         return;
     }
 
+    // T3: recovery function entered (after 2PC commit, under recovery_mutex_).
+    if (ft_timing_enabled_) {
+        ft_timings_.t3_recovery_enter = std::chrono::steady_clock::now();
+    }
     LOG(WARNING) << logPrefix() << "[NCCL-FT] Starting global replay center! (FT round=" << this->ft_round_ << ")";
 
     auto device = at::Device(at::DeviceType::CUDA, this->guessDeviceId());
@@ -5694,6 +5718,10 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     // 500 ms sleep — which is the intended retry mechanism.  The COMMIT key
     // already exists in TCPStore so the 2PC step completes immediately.
     rebuild_shadow_ping_pong_topology();
+    // T4: new topology is live (NVLink + proxy_global_comm_ ready).
+    if (ft_timing_enabled_) {
+        ft_timings_.t4_topology_rebuilt = std::chrono::steady_clock::now();
+    }
     this->is_degraded_ = true;
 
     uint64_t agreed_ss = this->committed_shadow_seq_.load(std::memory_order_acquire);
@@ -5854,7 +5882,16 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     // ops or missing in-flight ones.
     this->pending_shadow_seq_.store(UINT64_MAX, std::memory_order_release);
 
+    // T5: all in-flight buckets have been replayed and their Futures resolved.
+    if (ft_timing_enabled_) {
+        ft_timings_.t5_replay_done = std::chrono::steady_clock::now();
+    }
+
     this->final_commit_op_.store(0, std::memory_order_release);
+    // T6: system fully restored; training can resume.
+    if (ft_timing_enabled_) {
+        ft_timings_.t6_complete = std::chrono::steady_clock::now();
+    }
 
     // Deferred IB context cleanup: ibv_close_device() blocks if the kernel's
     // async-events-completed counter is non-zero.  By this point the PORT_ERR
@@ -5869,6 +5906,28 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
     // Reset the consecutive-failure counter now that this recovery round
     // completed successfully.
     this->consecutive_rebuild_failures_ = 0;
+
+    // ── FT Benchmarking summary ──────────────────────────────────────────
+    if (ft_timing_enabled_) {
+        auto ms = [](std::chrono::steady_clock::duration d) {
+            return std::chrono::duration<double, std::milli>(d).count();
+        };
+        LOG(WARNING) << logPrefix()
+            << "[NCCL-FT][BENCH] Failover timing summary (ft_round=" << this->ft_round_ << "):\n"
+            << "  T0 fault detected\n"
+            << "  T1 propose written  : +" << ms(ft_timings_.t1_propose_written  - ft_timings_.t0_fault_detected) << " ms\n"
+            << "  T2 commit received  : +" << ms(ft_timings_.t2_commit_received  - ft_timings_.t0_fault_detected) << " ms\n"
+            << "  T3 recovery entered : +" << ms(ft_timings_.t3_recovery_enter   - ft_timings_.t0_fault_detected) << " ms\n"
+            << "  T4 topology rebuilt : +" << ms(ft_timings_.t4_topology_rebuilt - ft_timings_.t0_fault_detected) << " ms\n"
+            << "  T5 replay done      : +" << ms(ft_timings_.t5_replay_done      - ft_timings_.t0_fault_detected) << " ms\n"
+            << "  T6 system ready     : +" << ms(ft_timings_.t6_complete         - ft_timings_.t0_fault_detected) << " ms  [TOTAL]\n"
+            << "  -- Phase breakdown --\n"
+            << "  2PC negotiation     : "  << ms(ft_timings_.t2_commit_received  - ft_timings_.t1_propose_written) << " ms\n"
+            << "  Commit -> recovery  : "  << ms(ft_timings_.t3_recovery_enter   - ft_timings_.t2_commit_received) << " ms\n"
+            << "  Topology rebuild    : "  << ms(ft_timings_.t4_topology_rebuilt - ft_timings_.t3_recovery_enter)  << " ms\n"
+            << "  Bucket replay       : "  << ms(ft_timings_.t5_replay_done      - ft_timings_.t4_topology_rebuilt) << " ms\n"
+            << "  Cleanup + finalize  : "  << ms(ft_timings_.t6_complete         - ft_timings_.t5_replay_done)     << " ms";
+    }
 
     LOG(WARNING) << logPrefix() << "[NCCL-FT] Global replay complete! System ready for next round: " << this->ft_round_;
 }

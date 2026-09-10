@@ -1111,6 +1111,23 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   int consecutive_rebuild_failures_{0};
   static constexpr int kMaxConsecutiveRebuildFailures = 5;
 
+  // ── FT Benchmarking timestamps ─────────────────────────────────────────
+  // Disabled when NCCL_FT_NO_TIMING=1 is set in the environment.
+  // All use steady_clock; t0 is set on the NCCL callback thread, the rest
+  // on the side-car thread.  Values are only meaningful after a completed
+  // recovery round — read them from the WARNING summary log.
+  bool ft_timing_enabled_ = true;
+  struct FTTimings {
+    std::chrono::steady_clock::time_point t0_fault_detected;   // NCCL callback fired
+    std::chrono::steady_clock::time_point t1_propose_written;  // 2PC PROPOSE sent to TCPStore
+    std::chrono::steady_clock::time_point t2_commit_received;  // all ranks committed (consensus)
+    std::chrono::steady_clock::time_point t3_recovery_enter;   // recover_and_replay_inflight_ops entered
+    std::chrono::steady_clock::time_point t4_topology_rebuilt; // rebuild_shadow_ping_pong_topology done
+    std::chrono::steady_clock::time_point t5_replay_done;      // all in-flight buckets replayed
+    std::chrono::steady_clock::time_point t6_complete;         // final_commit_op_ cleared, system ready
+  };
+  FTTimings ft_timings_;
+
   // Pending fault signal from NCCL callback / Watchdog.
   // Bitmask: bit i is set when local device i has a pending NIC fault.
   // 0 means no pending fault.
