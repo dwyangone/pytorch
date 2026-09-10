@@ -4911,25 +4911,38 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
         // target_op, and prevents the same fault from being relayed twice.
         uint64_t last_proposed_round = UINT64_MAX; // UINT64_MAX = "never"
 
-        // Heartbeat timer: emit a LOG every 5 s so we can confirm the
-        // side-car thread is alive even when no fault has occurred.
-        auto last_heartbeat = std::chrono::steady_clock::now();
+        // Track last-logged values so we only log on state changes.
+        uint64_t last_logged_fault_mask = UINT64_MAX;
+        bool     last_logged_ft_disabled = !ft_disabled_; // force first log
+        bool     last_logged_is_degraded = !is_degraded_.load(std::memory_order_relaxed);
+        uint64_t last_logged_ft_round    = UINT64_MAX;
 
         while (ft_negotiator_running_.load()) {
             try {
-                // ── Heartbeat ────────────────────────────────────────────
-                auto now = std::chrono::steady_clock::now();
-                if (now - last_heartbeat >= std::chrono::seconds(5)) {
-                    LOG(WARNING) << logPrefix()
-                              << "[NCCL-FT] Side-car alive: fault_mask=0x"
-                              << std::hex
-                              << local_hardware_fault_mask_.load(
-                                     std::memory_order_relaxed)
-                              << std::dec
-                              << " ft_disabled=" << ft_disabled_
-                              << " is_degraded=" << is_degraded_
-                              << " ft_round=" << ft_round_;
-                    last_heartbeat = now;
+                // ── State-change heartbeat ────────────────────────────────
+                {
+                    uint64_t cur_fault_mask = local_hardware_fault_mask_.load(std::memory_order_relaxed);
+                    bool     cur_ft_disabled = ft_disabled_;
+                    bool     cur_is_degraded = is_degraded_.load(std::memory_order_relaxed);
+                    uint64_t cur_ft_round    = ft_round_;
+
+                    if (cur_fault_mask  != last_logged_fault_mask  ||
+                        cur_ft_disabled != last_logged_ft_disabled ||
+                        cur_is_degraded != last_logged_is_degraded ||
+                        cur_ft_round    != last_logged_ft_round) {
+
+                        LOG(WARNING) << logPrefix()
+                                  << "[NCCL-FT] Side-car alive: fault_mask=0x"
+                                  << std::hex << cur_fault_mask << std::dec
+                                  << " ft_disabled=" << cur_ft_disabled
+                                  << " is_degraded=" << cur_is_degraded
+                                  << " ft_round=" << cur_ft_round;
+
+                        last_logged_fault_mask  = cur_fault_mask;
+                        last_logged_ft_disabled = cur_ft_disabled;
+                        last_logged_is_degraded = cur_is_degraded;
+                        last_logged_ft_round    = cur_ft_round;
+                    }
                 }
 
                 // =========================================================
