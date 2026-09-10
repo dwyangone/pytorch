@@ -1141,6 +1141,21 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // simultaneously without any write silently losing to a failed CAS.
   std::atomic<uint64_t> local_hardware_fault_mask_{0};
 
+  // Set by execute_shadow_allreduce (HEALTHY role) when proxy_global_comm_
+  // reports an async error — i.e., the remote-side NIC has died while the
+  // system is already in degraded mode.  The side-car drains this flag in
+  // Task 1 and writes a no-fault PROPOSE so a new 2PC round starts.
+  // Written by the main thread, drained by the side-car via exchange(false).
+  std::atomic<bool> proxy_comm_fault_pending_{false};
+
+  // Per-node fault bitmask populated by 2PC aggregation.
+  // Key: node_id (= rank / localDeviceCount_).  Value: OR of all p_fmask
+  // values contributed by ranks on that node across all rounds so far.
+  // Protected by faulty_devs_mutex_.  Used by rebuild to compute the
+  // global-union NCCL_IB_HCA exclusion list so that a NIC whose remote
+  // counterpart on any node is dead is also excluded locally.
+  std::unordered_map<int, uint64_t> per_node_fault_map_;
+
   // Persistent set of all local device indices confirmed as faulty by 2PC.
   // Grows monotonically; never shrinks. Protected by faulty_devs_mutex_.
   // The main thread reads it (under lock) only at rebuild time.

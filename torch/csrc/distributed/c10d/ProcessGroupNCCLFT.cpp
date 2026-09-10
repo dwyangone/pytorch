@@ -4399,11 +4399,38 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         // --- Data channel: build NCCL_IB_HCA from surviving NICs ---
         // NIC device index equals local GPU rank index in our topology
         // (mlx5_0 serves GPU 0, mlx5_1 serves GPU 1, etc.).
+        //
+        // [Fix 2-A] Use the global-union exclusion mask: any NIC index that
+        // is faulty on ANY node must be excluded on ALL nodes.  This handles
+        // asymmetric failures where, e.g., Server A loses mlx5_0 and Server B
+        // loses mlx5_2.  Without the union mask, Server A would keep mlx5_2 in
+        // its HCA list and attempt QP handshake with Server B's dead mlx5_2,
+        // causing ibv_modify_qp INIT->RTR to time out for all 35 retries.
+        //
+        // The symmetric faulty_devs set (used for proxy_comm_size/rank
+        // computation) is left unchanged — the comm slot allocation must be
+        // identical on both nodes to avoid rank mismatch.
+        uint64_t union_exclude_mask = 0;
+        {
+            std::lock_guard<std::mutex> lk(faulty_devs_mutex_);
+            for (auto& [node_id, mask] : per_node_fault_map_) {
+                union_exclude_mask |= mask;
+            }
+        }
+        // Also include the symmetric faulty_devs bits in case a fault round
+        // ran before per_node_fault_map_ was populated (e.g., first round).
+        for (int d : faulty_devs) {
+            union_exclude_mask |= (1ULL << d);
+        }
+
         std::string healthy_hcas;
+        int excluded_count = 0;
         for (int i = 0; i < localDeviceCount_; i++) {
-            if (faulty_devs.count(i) == 0) {
+            if (!(union_exclude_mask & (1ULL << i))) {
                 if (!healthy_hcas.empty()) healthy_hcas += ",";
                 healthy_hcas += "mlx5_" + std::to_string(i);
+            } else {
+                ++excluded_count;
             }
         }
         setenv("NCCL_IB_HCA", healthy_hcas.c_str(), 1);
@@ -4411,7 +4438,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         LOG(WARNING) << logPrefix()
                   << "[NCCL-FT] Set NCCL_IB_HCA=" << healthy_hcas
                   << " and reset IB cache (vNic indices will be renumbered 0.."
-                  << (localDeviceCount_ - static_cast<int>(faulty_devs.size()) - 1) << ").";
+                  << (localDeviceCount_ - excluded_count - 1) << ").";
 
         // --- Control channel: redirect bootstrap socket to Ethernet ---
         // Scan for the first UP, non-loopback, non-IB AF_INET interface.
@@ -4904,6 +4931,30 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         ncclResult_t async_err = ncclSuccess;
         ncclCommGetAsyncError(proxy_comm, &async_err);
         if (async_err != ncclSuccess) {
+            // [Fix 1-A] The proxy_global_comm_ has a transport error — the
+            // remote-side NIC died while we are already in degraded mode.
+            // Signal the side-car to start a new 2PC round rather than
+            // propagating an exception that would bypass FT and crash the
+            // training job.  The side-car will write a no-fault PROPOSE for
+            // this rank; other ranks will observe the proxy comm failure the
+            // same way and also set their flag, completing the new 2PC round.
+            LOG(WARNING) << logPrefix()
+                         << "[NCCL-FT][HEALTHY] proxy_global_comm_ async error: "
+                         << ncclGetErrorWithVersion(async_err)
+                         << " — signalling side-car for new FT round.";
+            this->proxy_comm_fault_pending_.store(true, std::memory_order_release);
+            // Mark proxy comm not-ready so subsequent collectives do not re-enter
+            // execute_shadow_allreduce with an already-aborted comm while the
+            // side-car is driving the new 2PC round.  rebuild_ will set it true.
+            this->proxy_comm_ready_.store(false, std::memory_order_release);
+            // Abort the comm so NCCL cleans up its internal state; the next
+            // rebuild will create a fresh proxy_global_comm_.
+            if (proxy_comm_ref && !proxy_comm_ref->isAborted()) {
+                proxy_comm_ref->abort("FT proxy comm async error - triggering new FT round");
+            }
+            // Re-throw as NCCLFaultToleranceError so the caller's
+            // C10D_NCCL_FT_CHECK macro catches it and queues a PendingWork
+            // for replay.  The side-car handles the new 2PC from here.
             std::string err = "NCCL error in: " + std::string(__FILE__) + ":" +
                 std::to_string(__LINE__) + ", " + ncclGetErrorWithVersion(async_err) +
                 "\n" + getNcclErrorDetailStr(async_err, std::nullopt);
@@ -5022,6 +5073,54 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                 // =========================================================
                 uint64_t fault_mask = this->local_hardware_fault_mask_.exchange(
                     0, std::memory_order_acquire);
+
+                // [Fix 1-A] Also treat a proxy comm failure as a fault trigger.
+                // When execute_shadow_allreduce detects a dead proxy_global_comm_
+                // it sets proxy_comm_fault_pending_ instead of carrying a local
+                // dev_idx (which would corrupt faulty_local_devs_).  Drain the
+                // flag here and treat it as an additional trigger alongside any
+                // concurrent local NIC fault_mask.  Writing a combined PROPOSE
+                // (local mask OR 0x0) avoids the dedup problem where proxy_fault
+                // sets last_proposed_round=N first and then the fault_mask path
+                // sees cur_round==last_proposed_round and puts bits back forever.
+                bool proxy_fault = this->proxy_comm_fault_pending_.exchange(
+                    false, std::memory_order_acquire);
+
+                // If proxy_fault is set but there is no local NIC fault on this
+                // rank, synthesise a PROPOSE now so the 2PC round starts without
+                // waiting for a local callback that will never come.
+                // If fault_mask is also non-zero, fall through to the existing
+                // fault_mask path below which will write the combined PROPOSE.
+                if (proxy_fault && fault_mask == 0) {
+                    uint64_t cur_round = ft_round_;
+                    if (cur_round != last_proposed_round) {
+                        LOG(WARNING) << logPrefix()
+                                     << "[NCCL-FT] Side-car: proxy_comm_fault detected"
+                                     << " for round=" << cur_round
+                                     << " — writing no-local-fault PROPOSE to trigger new 2PC.";
+                        int my_node_id = this->rank_ / this->localDeviceCount_;
+                        uint64_t my_shadow_seq =
+                            this->pending_shadow_seq_.load(std::memory_order_acquire);
+                        std::ostringstream oss;
+                        oss << "PROPOSE:" << cur_round
+                            << ":" << my_node_id
+                            << ":0x0"  // no local NIC fault on this rank
+                            << ":" << my_shadow_seq;
+                        std::string proposal = oss.str();
+                        std::string propose_key =
+                            "NCCL_FT_PROPOSE_" +
+                            std::to_string(this->rank_) + "_" +
+                            std::to_string(cur_round);
+                        std::vector<uint8_t> vec(proposal.begin(), proposal.end());
+                        this->globalStore_->set(propose_key, vec);
+                        last_proposed_round = cur_round;
+                        if (ft_timing_enabled_) {
+                            ft_timings_.t1_propose_written = std::chrono::steady_clock::now();
+                        }
+                    }
+                    // fault_mask == 0 so the block below is a no-op; continue.
+                }
+
                 if (fault_mask != 0) {
                     // ft_round_ is written by the main thread after each
                     // committed rollback; read here on the side-car.  A
@@ -5156,10 +5255,15 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                 uint64_t agg_fault_mask  = 0;
                 int      agg_failed_node = -1; // first faulty node seen
                 uint64_t agreed_ss       = UINT64_MAX;
+                // [Fix 2-A] Per-node fault map for this round: accumulates
+                // p_fmask per p_node so rebuild can exclude NICs whose remote
+                // endpoint on any node is known dead (asymmetric failure).
+                std::unordered_map<int, uint64_t> round_node_fault_map;
 
                 while (!all_proposed && this->ft_negotiator_running_.load()) {
                     all_proposed = true;
                     agg_fault_mask = 0;
+                    round_node_fault_map.clear();
                     agreed_ss      = UINT64_MAX;
                     for (int r = 0; r < this->size_; ++r) {
                         std::string pk = "NCCL_FT_PROPOSE_" +
@@ -5178,6 +5282,7 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                                    &p_round, &p_node,
                                    &p_fmask, &p_ss) == 4) {
                             agg_fault_mask |= p_fmask;
+                            round_node_fault_map[p_node] |= p_fmask;
                             if (agg_failed_node < 0) agg_failed_node = p_node;
                             // Only fold ranks that have a real checkpoint
                             // (p_ss != UINT64_MAX means pending_shadow_seq_
@@ -5217,12 +5322,18 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                           << " agreed_ss=" << agreed_ss;
 
                 // ── Phase 1b: expand aggregated fault mask into local set ─
+                // Also merge round_node_fault_map into the persistent
+                // per_node_fault_map_ so rebuild can compute the global-union
+                // HCA exclusion list across all rounds.
                 {
                     std::lock_guard<std::mutex> lk(this->faulty_devs_mutex_);
                     for (int b = 0; b < 64; ++b) {
                         if (agg_fault_mask & (1ULL << b)) {
                             this->faulty_local_devs_.insert(b);
                         }
+                    }
+                    for (auto& [node_id, mask] : round_node_fault_map) {
+                        this->per_node_fault_map_[node_id] |= mask;
                     }
                 }
 
