@@ -5567,7 +5567,10 @@ c10::intrusive_ptr<Work> ProcessGroupNCCLFT::collective(
       // Check degraded mode first; never call ncclComm->getNcclComm() in
       // degraded mode since the comm has been aborted and will throw.
       if (C10_UNLIKELY(this->is_degraded_.load(std::memory_order_acquire))) {
-          LOG(WARNING) << logPrefix() << "[NCCL-FT] Degraded mode; executing Shadow Ping-Pong (seq=" << seqCollective_ << ")";
+          if (!shadow_ping_pong_logged_) {
+              LOG(WARNING) << logPrefix() << "[NCCL-FT] Degraded mode; executing Shadow Ping-Pong (first collective in this degraded epoch)";
+              shadow_ping_pong_logged_ = true;
+          }
 
           if (opType == OpType::ALLREDUCE && proxy_comm_ready_.load(std::memory_order_acquire)) {
               // Execute degraded replay using proxy_global_comm_ and local_nvlink_comm_.
@@ -5736,6 +5739,7 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         ft_timings_.t4_topology_rebuilt = std::chrono::steady_clock::now();
     }
     this->is_degraded_ = true;
+    this->shadow_ping_pong_logged_ = false; // reset so next epoch logs once
 
     uint64_t agreed_ss = this->committed_shadow_seq_.load(std::memory_order_acquire);
 

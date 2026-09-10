@@ -1090,6 +1090,10 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   // thread writes before unlocking the barrier, side-car reads after COMMIT
   // (there is a TCPStore-mediated happens-before relationship).
   std::atomic<bool> is_degraded_{false};
+  // Set to true after the first "Shadow Ping-Pong" log in the current degraded
+  // episode; reset to false each time is_degraded_ transitions to true so that
+  // the first collective of every new degraded epoch always logs once.
+  bool shadow_ping_pong_logged_{false};
   std::atomic<uint64_t> ft_round_{0};
 
   // Per-rebuild-attempt counter.  Unlike ft_round_, this increments on every
