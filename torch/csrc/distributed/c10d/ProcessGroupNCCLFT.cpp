@@ -44,6 +44,18 @@
 namespace c10d {
 
 constexpr const char* const kNCCLAbortedCommStoreKey_FT = "NCCLFTABORTEDCOMM";
+
+// Barrier retry parameters for rebuild_shadow_ping_pong_topology.
+// Each barrier is attempted up to kBarrierMaxRetries times with a
+// kBarrierSliceSeconds timeout per slice, giving a total wait of
+// kBarrierMaxRetries * kBarrierSliceSeconds before the barrier throws
+// and the side-car retries the whole rebuild attempt after 500 ms.
+// This prevents a second-node NIC fault (which briefly prevents some
+// ranks from reaching the barrier) from causing an irreversible 120 s
+// hang followed by a hard rebuild failure.
+static constexpr int kBarrierMaxRetries = 4;       // 4 * 30 s = 120 s total
+static constexpr int kBarrierSliceSeconds = 30;    // per-slice timeout
+static constexpr int kProxyBarrierMaxRetries = 2;  // 2 * 30 s = 60 s total
 using FlightRecorderCUDA = FlightRecorder<at::cuda::CUDAEvent>;
 
 /* ========================================================================= */
@@ -4453,6 +4465,14 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     //
     // We use a fresh TCPStore key per rebuild_attempt_ so that retries are
     // fully isolated from previous attempts.
+    //
+    // The wait is split into kBarrierMaxRetries slices of kBarrierSliceSeconds
+    // each (total = kBarrierMaxRetries * kBarrierSliceSeconds = 120 s) so that
+    // a concurrent NIC fault on the remote node -- which briefly stalls those
+    // ranks inside their own fault handler -- does not result in an immediate
+    // hard failure.  If a slice times out we log and retry; once all retries
+    // are exhausted we re-throw so the side-car's catch block increments
+    // rebuild_attempt_ and retries the whole rebuild after 500 ms.
     {
         uint64_t cur_attempt = rebuild_attempt_.load(std::memory_order_relaxed);
         std::string my_sync_key = "NCCL_FT_REBUILD_SYNC_ATT_" +
@@ -4467,7 +4487,26 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
             all_sync_keys.push_back("NCCL_FT_REBUILD_SYNC_ATT_" +
                 std::to_string(cur_attempt) + "_R" + std::to_string(r));
         }
-        this->globalStore_->wait(all_sync_keys, std::chrono::seconds(120));
+        bool barrier_ok = false;
+        for (int slice = 0; slice < kBarrierMaxRetries; ++slice) {
+            try {
+                this->globalStore_->wait(all_sync_keys,
+                    std::chrono::seconds(kBarrierSliceSeconds));
+                barrier_ok = true;
+                break;
+            } catch (const c10::Error& e) {
+                if (slice == kBarrierMaxRetries - 1) {
+                    throw; // exhausted: propagate to side-car retry loop
+                }
+                LOG(WARNING) << logPrefix()
+                             << "[NCCL-FT] Pre-rebuild global barrier slice "
+                             << (slice + 1) << "/" << kBarrierMaxRetries
+                             << " timed out (attempt=" << cur_attempt
+                             << "); retrying slice. Error: " << e.what();
+            }
+        }
+        TORCH_CHECK(barrier_ok, logPrefix(),
+            "[NCCL-FT] Pre-rebuild global barrier unreachable after retries.");
         LOG(WARNING) << logPrefix()
                   << "[NCCL-FT] Pre-rebuild global barrier passed (attempt=" << cur_attempt << ").";
     }
@@ -4515,6 +4554,7 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 
         // N-to-N all-ready barrier: ensure all healthy ranks have arrived here.
         // Use cur_attempt in the key so retries don't collide with prior rounds.
+        // Same slice-retry strategy as the pre-rebuild global barrier above.
         {
             std::string my_ready_key = "NCCL_FT_PROXY_READY_ATT_" +
                 std::to_string(cur_attempt) + "_" + std::to_string(rank_);
@@ -4529,7 +4569,26 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
                         std::to_string(cur_attempt) + "_" + std::to_string(r));
                 }
             }
-            this->globalStore_->wait(all_ready_keys, std::chrono::seconds(60));
+            bool ready_ok = false;
+            for (int slice = 0; slice < kProxyBarrierMaxRetries; ++slice) {
+                try {
+                    this->globalStore_->wait(all_ready_keys,
+                        std::chrono::seconds(kBarrierSliceSeconds));
+                    ready_ok = true;
+                    break;
+                } catch (const c10::Error& e) {
+                    if (slice == kProxyBarrierMaxRetries - 1) {
+                        throw;
+                    }
+                    LOG(WARNING) << logPrefix()
+                                 << "[NCCL-FT] Proxy-ready barrier slice "
+                                 << (slice + 1) << "/" << kProxyBarrierMaxRetries
+                                 << " timed out (attempt=" << cur_attempt
+                                 << "); retrying slice. Error: " << e.what();
+                }
+            }
+            TORCH_CHECK(ready_ok, logPrefix(),
+                "[NCCL-FT] Proxy-ready barrier unreachable after retries.");
             LOG(WARNING) << logPrefix()
                       << "[NCCL-FT] All-ready barrier passed for proxy_global_comm_.";
         }
