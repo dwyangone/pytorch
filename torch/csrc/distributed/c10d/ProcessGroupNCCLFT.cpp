@@ -5456,7 +5456,42 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                     }
                 }
 
-              /* ========================================================= */
+                // ── Spurious-round guard ──────────────────────────────────
+                // agg_fault_mask == 0 && agreed_ss == UINT64_MAX means every
+                // rank wrote a no-fault PROPOSE carrying the UINT64_MAX reset
+                // sentinel that recover_and_replay_inflight_ops() stores at the
+                // end of each round.  This combination cannot arise from a real
+                // NIC fault (which always sets at least one bit in agg_fault_mask
+                // on the faulty node), so the round is spurious.  Skip the
+                // rebuild, clean up TCPStore keys for this round, and advance
+                // ft_round_ so the next genuine fault uses a fresh key namespace.
+                if (agg_fault_mask == 0 && agreed_ss == UINT64_MAX) {
+                    LOG(WARNING) << logPrefix()
+                        << "[NCCL-FT] Spurious 2PC round detected "
+                        << "(agg_fault_mask=0x0, agreed_ss=UINT64_MAX) for round="
+                        << cur_round << "; skipping rebuild.";
+                    try {
+                        std::string round_str = std::to_string(cur_round);
+                        this->globalStore_->deleteKey(
+                            "NCCL_FT_PROPOSE_" + std::to_string(this->rank_)
+                            + "_" + round_str);
+                        if (this->rank_ == 0) {
+                            this->globalStore_->deleteKey(
+                                "NCCL_FT_COMMIT_" + round_str);
+                            this->globalStore_->deleteKey(
+                                "NCCL_FT_SS_AGREED_" + round_str);
+                        }
+                    } catch (const std::exception& e) {
+                        LOG(WARNING) << logPrefix()
+                            << "[NCCL-FT] Spurious-round TCPStore cleanup failed "
+                            << "(non-fatal): " << e.what();
+                    }
+                    this->ft_round_++;
+                    this->final_commit_op_.store(0, std::memory_order_release);
+                    continue;
+                }
+
+                /* ========================================================= */
                 /* Forcibly abort global comm to unblock the stalled main thread. */
                 {
                     auto device = at::Device(at::DeviceType::CUDA, this->guessDeviceId());
@@ -5466,7 +5501,7 @@ void ProcessGroupNCCLFT::start_ft_negotiator_thread() {
                         globalComm->abort("FT 2PC Committed - Wake up main thread");
                     }
                 }
-                /* ========================================================= */                
+                /* ========================================================= */
 
                 // Set signal so other modules know a replay is in progress.
                 this->final_commit_op_.store(cur_round + 1, std::memory_order_release);
