@@ -1195,6 +1195,13 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   int proxy_comm_size_{0};
   std::atomic<bool> proxy_comm_ready_{false};
 
+  // Cached GPU receive buffers for the PROXY role, keyed by faulty local rank.
+  // Allocated lazily on first use and reused across iterations to avoid
+  // repeated ~16 GB at::empty_like() calls that exhaust VRAM.
+  // Cleared at every rebuild_shadow_ping_pong_topology() call so they are
+  // re-sized if the next FT round uses a different tensor numel.
+  std::unordered_map<int, at::Tensor> ward_recv_bufs_;
+
   // The ReduceOp requested by the current allreduce call. Set by allreduce_impl
   // before collective() is called so the degraded path can honour the real op
   // instead of defaulting to SUM.

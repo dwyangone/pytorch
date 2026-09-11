@@ -4277,6 +4277,11 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     // Mark proxy comm not-ready before rebuilding.
     proxy_comm_ready_.store(false, std::memory_order_release);
 
+    // Discard any cached PROXY ward recv buffers from the previous topology.
+    // They will be lazily re-allocated in execute_shadow_allreduce() with the
+    // correct tensor numel for the new degraded configuration.
+    ward_recv_bufs_.clear();
+
     // Synchronously abort and release old communicators before calling
     // ncclCommInitRankConfig for the new ones.  A detached GC thread with a
     // sleep heuristic races with the new ncclCommInitRankConfig calls: NCCL
@@ -4830,13 +4835,24 @@ void ProcessGroupNCCLFT::execute_shadow_allreduce(
         // ----------------------------------------------------------------
 
         // Step 1: receive all wards' tensors in a single ncclGroup.
+        // Use cached GPU buffers (ward_recv_bufs_) to avoid allocating a new
+        // ~16 GB tensor on every iteration, which would exhaust VRAM when the
+        // PROXY rank has limited free memory (OOM fix).
+        // ward_recv_bufs_ is keyed by faulty local rank, allocated once on
+        // first use, and cleared in rebuild_shadow_ping_pong_topology() so a
+        // new round can re-allocate at the correct numel.
         std::vector<at::Tensor> ward_bufs;
         ward_bufs.reserve(my_wards.size());
-        for (size_t i = 0; i < my_wards.size(); ++i) {
-            ward_bufs.push_back(at::empty_like(input));
-            // Must not reclaim or reuse this VRAM until the stream finishes.
+        for (int ward : my_wards) {
+            auto it = ward_recv_bufs_.find(ward);
+            if (it == ward_recv_bufs_.end() || it->second.numel() != static_cast<int64_t>(numel)) {
+                ward_recv_bufs_[ward] = at::empty_like(input);
+            }
+            ward_bufs.push_back(ward_recv_bufs_[ward]);
+            // Record stream so CUDA does not reclaim this buffer while the
+            // ncclRecv enqueued on `stream` is still in flight.
             c10::cuda::CUDACachingAllocator::recordStream(
-                ward_bufs[i].storage().data_ptr(), stream);
+                ward_bufs.back().storage().data_ptr(), stream);
         }
         C10D_NCCL_FT_CHECK(ncclGroupStart(), std::nullopt);
         for (int i = 0; i < static_cast<int>(my_wards.size()); ++i) {
