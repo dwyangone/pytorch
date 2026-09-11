@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <net/if.h>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
@@ -1084,6 +1085,10 @@ ProcessGroupNCCLFT::ProcessGroupNCCLFT(
   this->setGroupUid(options_->group_name);
   this->setUsePgForSymmMemRendezvous(options_->use_pg_for_symm_mem_rendezvous);
   this->localDeviceCount_ = static_cast<int>(at::cuda::getNumGPUs());
+  // Identity mapping: before any rebuild, vNic index == physical HCA index.
+  this->current_hca_phys_indices_.resize(this->localDeviceCount_);
+  std::iota(this->current_hca_phys_indices_.begin(),
+            this->current_hca_phys_indices_.end(), 0);
   logPrefix_ = createLogPrefix();
   blockingWait_ = getCvarBool(TORCH_NCCLFT_BLOCKING_WAIT, false);
   asyncErrorHandling_ = static_cast<ErrorHandlingModeFT>(
@@ -4430,13 +4435,21 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
 
         std::string healthy_hcas;
         int excluded_count = 0;
+        std::vector<int> new_hca_phys;
         for (int i = 0; i < localDeviceCount_; i++) {
             if (!(union_exclude_mask & (1ULL << i))) {
                 if (!healthy_hcas.empty()) healthy_hcas += ",";
                 healthy_hcas += "mlx5_" + std::to_string(i);
+                new_hca_phys.push_back(i);
             } else {
                 ++excluded_count;
             }
+        }
+        // Update vNic-to-physical mapping so trigger_fault_proposal() can
+        // translate the NCCL-renumbered dev_idx back to a physical HCA index.
+        {
+            std::lock_guard<std::mutex> lk(faulty_devs_mutex_);
+            current_hca_phys_indices_ = std::move(new_hca_phys);
         }
         setenv("NCCL_IB_HCA", healthy_hcas.c_str(), 1);
         nccl_ft_reset_ib_cache();
@@ -4999,12 +5012,40 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
                  << "[NCCL-FT-CALLBACK] !!! NCCL fault callback fired !!! "
                  << "dev_idx=" << dev_idx;
 
+    // Translate NCCL's vNic index (renumbered 0..k-1 after each rebuild) back
+    // to the physical HCA index (N in mlx5_N) so the fault bitmask always
+    // refers to stable physical device numbers, not rebuild-dependent vNics.
+    //
+    // Example: after round-0 rebuild with NCCL_IB_HCA=mlx5_0,mlx5_2,...,
+    //   vNic 0 -> physical 0, vNic 1 -> physical 2, etc.
+    //   A callback with dev_idx=1 means mlx5_2, not mlx5_1.
+    int phys_idx;
+    {
+        std::lock_guard<std::mutex> lk(faulty_devs_mutex_);
+        if (dev_idx >= 0 &&
+            dev_idx < static_cast<int>(current_hca_phys_indices_.size())) {
+            phys_idx = current_hca_phys_indices_[dev_idx];
+        } else {
+            // dev_idx out of range — fall back to raw value and log a warning.
+            LOG(WARNING) << logPrefix()
+                         << "[NCCL-FT] trigger_fault_proposal: dev_idx=" << dev_idx
+                         << " out of range (hca_map size="
+                         << current_hca_phys_indices_.size()
+                         << "); using raw dev_idx as physical index.";
+            phys_idx = dev_idx;
+        }
+    }
+    LOG(WARNING) << logPrefix()
+                 << "[NCCL-FT] Mapped vNic dev_idx=" << dev_idx
+                 << " -> physical HCA index=" << phys_idx
+                 << " (mlx5_" << phys_idx << ")";
+
     // [NCCL-FT Bug 12 fix] Use fetch_or on a bitmask instead of CAS on a
     // single int.  When multiple NICs fault simultaneously (or the callback
     // fires twice for the same device on send+recv comms), every bit is
     // recorded atomically and nothing is silently dropped.
     this->local_hardware_fault_mask_.fetch_or(
-        1ULL << dev_idx, std::memory_order_release);
+        1ULL << phys_idx, std::memory_order_release);
 
     // [NCCL-FT] Sub-Task 4: snapshot the current shadow_seq so the negotiator
     // can include it in the PROPOSE message. Only write when the sentinel is
@@ -5019,7 +5060,8 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
         sentinel, current_shadow_seq, std::memory_order_release);
 
     LOG(WARNING) << logPrefix()
-              << "[NCCL-FT] Instantly intercepted local NIC fault, marking dev_idx: " << dev_idx
+              << "[NCCL-FT] Instantly intercepted local NIC fault, vNic dev_idx=" << dev_idx
+              << " -> phys mlx5_" << phys_idx
               << " mask=0x" << std::hex
               << this->local_hardware_fault_mask_.load(std::memory_order_relaxed)
               << std::dec

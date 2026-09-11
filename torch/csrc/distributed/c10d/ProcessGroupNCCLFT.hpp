@@ -1162,6 +1162,14 @@ class TORCH_API ProcessGroupNCCLFT : public Backend {
   std::unordered_set<int> faulty_local_devs_;
   std::mutex faulty_devs_mutex_;
 
+  // Maps vNic index (as reported by the NCCL fault callback dev_idx) to the
+  // physical HCA index (N in mlx5_N).  After rebuild, NCCL renumbers the
+  // surviving NICs 0..k-1 in the order they appear in NCCL_IB_HCA; the
+  // callback reports this renumbered index, NOT the original physical index.
+  // Initialised to the identity mapping in the constructor and updated by
+  // rebuild_shadow_ping_pong_topology() under faulty_devs_mutex_.
+  std::vector<int> current_hca_phys_indices_;
+
   // The very first NCCL communicator created for this PG, built via the full
   // ncclCommInitRankConfig path. All subsequent non-P2P comms are derived from
   // this one via ncclCommSplit so that ncclCommInitRankConfig (and its NIC
