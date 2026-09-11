@@ -5012,13 +5012,18 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
                  << "[NCCL-FT-CALLBACK] !!! NCCL fault callback fired !!! "
                  << "dev_idx=" << dev_idx;
 
-    // Translate NCCL's vNic index (renumbered 0..k-1 after each rebuild) back
-    // to the physical HCA index (N in mlx5_N) so the fault bitmask always
-    // refers to stable physical device numbers, not rebuild-dependent vNics.
+    // Translate NCCL's global IB device index (ibDevN — the index into the
+    // ncclIbDevs[] array, rebuilt from NCCL_IB_HCA in order after each reset)
+    // to the physical HCA index (N in mlx5_N) using current_hca_phys_indices_.
     //
-    // Example: after round-0 rebuild with NCCL_IB_HCA=mlx5_0,mlx5_2,...,
-    //   vNic 0 -> physical 0, vNic 1 -> physical 2, etc.
-    //   A callback with dev_idx=1 means mlx5_2, not mlx5_1.
+    // After nccl_ft_reset_ib_cache() + rebuild, ncclIbDevs[] is repopulated
+    // in the same order as the NCCL_IB_HCA env var, so:
+    //   ibDevN=0 -> first HCA in NCCL_IB_HCA -> current_hca_phys_indices_[0]
+    //   ibDevN=1 -> second HCA               -> current_hca_phys_indices_[1]
+    //   ...
+    // This is set by NCCL p2p_resiliency.cc which now passes
+    //   resCtx->baseComm->vProps.devs[devIndex]  (= ibDevN)
+    // instead of the old per-communicator devIndex.
     int phys_idx;
     {
         std::lock_guard<std::mutex> lk(faulty_devs_mutex_);
@@ -5036,7 +5041,7 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
         }
     }
     LOG(WARNING) << logPrefix()
-                 << "[NCCL-FT] Mapped vNic dev_idx=" << dev_idx
+                 << "[NCCL-FT] Mapped ibDevN=" << dev_idx
                  << " -> physical HCA index=" << phys_idx
                  << " (mlx5_" << phys_idx << ")";
 
@@ -5060,7 +5065,7 @@ void ProcessGroupNCCLFT::trigger_fault_proposal(int dev_idx) {
         sentinel, current_shadow_seq, std::memory_order_release);
 
     LOG(WARNING) << logPrefix()
-              << "[NCCL-FT] Instantly intercepted local NIC fault, vNic dev_idx=" << dev_idx
+              << "[NCCL-FT] Instantly intercepted local NIC fault, ibDevN=" << dev_idx
               << " -> phys mlx5_" << phys_idx
               << " mask=0x" << std::hex
               << this->local_hardware_fault_mask_.load(std::memory_order_relaxed)
