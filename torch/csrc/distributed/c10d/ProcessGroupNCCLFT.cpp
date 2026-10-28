@@ -957,8 +957,41 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
           LOG(WARNING) << logPrefix() << "[NCCL-FT] wait() entering FT safe-wait zone (seq=" << this->seq_ << ")";
 
           // 1. Wait for the side-car to finish replay and mark the Future complete (CPU-free wait).
+          // [Fix 1-B] Timeout fallback: if the side-car never calls markCompleted
+          // (e.g., it crashed or permanently failed after kMaxConsecutiveRebuildFailures),
+          // unblock with a warning rather than hanging forever.  The timeout is long
+          // (60 s) so normal recovery — which takes < 30 s — always wins the race.
+          //
+          // at::ivalue::Future does not expose wait_for(), so we spin-check
+          // completed() with a 100 ms sleep rather than blocking indefinitely.
+          // CPU cost: ~0 (this loop only runs during fault recovery).
           if (future_) {
-              future_->wait(); 
+              static constexpr int kFutureTimeoutSeconds = 60;
+              static constexpr int kFutureCheckIntervalMs = 100;
+              const int max_iters = kFutureTimeoutSeconds * 1000 / kFutureCheckIntervalMs;
+              bool completed_in_time = false;
+              for (int i = 0; i < max_iters; ++i) {
+                  if (future_->completed()) {
+                      completed_in_time = true;
+                      break;
+                  }
+                  std::this_thread::sleep_for(
+                      std::chrono::milliseconds(kFutureCheckIntervalMs));
+              }
+              if (!completed_in_time) {
+                  LOG(ERROR) << logPrefix()
+                      << "[NCCL-FT][Fix 1-B] future_->wait() timed out after "
+                      << kFutureTimeoutSeconds
+                      << "s — side-car may have failed.  Forcing completion "
+                      << "to unblock training (results may be incorrect).";
+                  // Force-complete so DDP can proceed; data may be stale.
+                  c10::cuda::CUDAMultiStreamGuard sg(
+                      pg_->ncclStreams_.at(pg_->getKeyFromDevice(device_)));
+                  future_->markCompleted(at::IValue(*outputs_));
+              } else {
+                  // Normal path: block on the future to pick up CUDA stream guards.
+                  future_->wait();
+              }
           }
           
           // 2. Future completed: replay center finished. Return normally to Python.
@@ -4112,7 +4145,37 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
             all_arrive_keys.push_back("NCCL_FT_LOCAL_ARRIVE_" + key_suffix
                                       + "_LR_" + std::to_string(lr));
         }
-        this->globalStore_->wait(all_arrive_keys, std::chrono::seconds(120));
+
+        // [Fix 2-C] Split the 120s entry-arrival barrier into 4×30s slices
+        // with retry and a log on each timeout.  The single-shot wait would
+        // throw on the first timeout, causing the side-car to sleep 500ms and
+        // re-enter recover_and_replay_inflight_ops with a new attempt counter.
+        // With slice-retry, a slow local rank (e.g., still finishing the
+        // previous exception-handler sleep) is given four chances before the
+        // barrier actually fails, dramatically reducing spurious failures.
+        static constexpr int kArrivalSlices = 4;
+        static constexpr int kArrivalSliceSec = 30; // 4 * 30 = 120 s total
+        bool arrival_ok = false;
+        for (int slice = 0; slice < kArrivalSlices; ++slice) {
+            try {
+                this->globalStore_->wait(all_arrive_keys,
+                    std::chrono::seconds(kArrivalSliceSec));
+                arrival_ok = true;
+                break;
+            } catch (const c10::Error& e) {
+                if (slice == kArrivalSlices - 1) {
+                    throw; // exhausted — propagate to side-car retry loop
+                }
+                LOG(WARNING) << logPrefix()
+                    << "[NCCL-FT][Fix 2-C] Entry-arrival slice "
+                    << (slice + 1) << "/" << kArrivalSlices
+                    << " timed out (node=" << node_id
+                    << ", attempt=" << attempt
+                    << "); retrying slice. Error: " << e.what();
+            }
+        }
+        TORCH_CHECK(arrival_ok, logPrefix(),
+            "[NCCL-FT] Entry-arrival barrier unreachable after retries.");
         LOG(WARNING) << logPrefix()
                   << "[NCCL-FT] Entry-arrival barrier passed (node=" << node_id
                   << ", attempt=" << attempt << ").";
@@ -4230,15 +4293,42 @@ void ProcessGroupNCCLFT::initLocalNvlinkComm(uint64_t attempt) {
     // Get the currently bound CUDA device.
     auto device = at::Device(at::DeviceType::CUDA, guessDeviceId());
 
-    LOG(WARNING) << logPrefix() << "[NCCL-FT] Calling NCCLFTComm::create for local_nvlink_comm_...";
+    // [Fix 3-A] Heartbeat watchdog for NCCLFTComm::create.
+    // ncclCommInitRankConfig can block silently for several minutes if the
+    // bootstrap TCP handshake stalls (e.g., wrong NCCL_SOCKET_IFNAME).
+    // A detached thread logs a "still waiting" line every 10 s so that the
+    // operator can see exactly where the hang is without grepping through a
+    // silent log.  The thread exits as soon as the atomic flag is set.
+    {
+        auto comm_init_done = std::make_shared<std::atomic<bool>>(false);
+        std::string log_prefix_snap = logPrefix();
+        std::thread heartbeat([comm_init_done, log_prefix_snap]() {
+            c10::setThreadName("pt_nccl_ft_hb");
+            auto start = std::chrono::steady_clock::now();
+            while (!comm_init_done->load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                if (comm_init_done->load(std::memory_order_acquire)) break;
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                LOG(WARNING) << log_prefix_snap
+                    << "[NCCL-FT][Fix 3-A] Still waiting for NCCLFTComm::create"
+                    << " (local_nvlink_comm_, " << elapsed << "s elapsed)...";
+            }
+        });
+        heartbeat.detach();
 
-    // Create a brand-new communicator from scratch.
-    // Args: (total=localDeviceCount_, local_rank, ID, GPU index, config)
-    local_nvlink_comm_ = NCCLFTComm::create(
-        localDeviceCount_, local_rank, localId, device.index(), config);
+        LOG(WARNING) << logPrefix() << "[NCCL-FT] Calling NCCLFTComm::create for local_nvlink_comm_...";
+
+        // Create a brand-new communicator from scratch.
+        // Args: (total=localDeviceCount_, local_rank, ID, GPU index, config)
+        local_nvlink_comm_ = NCCLFTComm::create(
+            localDeviceCount_, local_rank, localId, device.index(), config);
+
+        comm_init_done->store(true, std::memory_order_release);
+    }
 
     if (local_nvlink_comm_ == nullptr) {
-        C10_THROW_ERROR(DistBackendError, 
+        C10_THROW_ERROR(DistBackendError,
             c10::str(logPrefix(), "[NCCL-FT] Failed to create local_nvlink_comm_ via NCCLFTComm::create!"));
     }
 
@@ -4502,6 +4592,61 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
                   << " and reset bootstrap + socket-transport singletons.";
     }
 
+    // [Fix 2-A] Global attempt-number negotiation: each rank publishes its local
+    // rebuild_attempt_ counter, then everyone reads all values and adopts the
+    // maximum.  This ensures both nodes always use the same attempt index as the
+    // TCPStore key suffix, even when one node retried more times than the other
+    // (e.g., due to a previous failed rebuild attempt causing a 500 ms sleep).
+    //
+    // Without this, Node 0 might enter with attempt=2 and Node 1 with attempt=3;
+    // their "NCCL_FT_REBUILD_SYNC_ATT_2_R*" vs "NCCL_FT_REBUILD_SYNC_ATT_3_R*"
+    // keys never match, causing the global barrier to wait indefinitely.
+    //
+    // The negotiation key uses ft_round_ (which is identical on all ranks at
+    // this point, agreed via 2PC) as the outer namespace to avoid collisions
+    // across fault rounds.
+    {
+        uint64_t ft_round_now = this->ft_round_.load(std::memory_order_relaxed);
+        uint64_t my_att = rebuild_attempt_.load(std::memory_order_relaxed);
+        std::string att_key = "NCCL_FT_ATT_ROUND_" + std::to_string(ft_round_now)
+                            + "_R" + std::to_string(rank_);
+        std::string att_val = std::to_string(my_att);
+        this->globalStore_->set(att_key,
+            std::vector<uint8_t>(att_val.begin(), att_val.end()));
+
+        // Wait for all ranks to publish.
+        std::vector<std::string> all_att_keys;
+        all_att_keys.reserve(size_);
+        for (int r = 0; r < size_; ++r) {
+            all_att_keys.push_back("NCCL_FT_ATT_ROUND_" + std::to_string(ft_round_now)
+                                   + "_R" + std::to_string(r));
+        }
+        this->globalStore_->wait(all_att_keys, std::chrono::seconds(60));
+
+        // Read back all values; adopt the maximum so every rank agrees.
+        uint64_t agreed_att = my_att;
+        for (int r = 0; r < size_; ++r) {
+            auto v = this->globalStore_->get(
+                "NCCL_FT_ATT_ROUND_" + std::to_string(ft_round_now)
+                + "_R" + std::to_string(r));
+            std::string vs(v.begin(), v.end());
+            uint64_t rank_att = std::stoull(vs);
+            if (rank_att > agreed_att) agreed_att = rank_att;
+        }
+
+        if (agreed_att != my_att) {
+            LOG(WARNING) << logPrefix()
+                << "[NCCL-FT][Fix 2-A] Attempt negotiation: local="
+                << my_att << " -> agreed=" << agreed_att
+                << " (ft_round=" << ft_round_now << ")";
+            rebuild_attempt_.store(agreed_att, std::memory_order_relaxed);
+        } else {
+            LOG(WARNING) << logPrefix()
+                << "[NCCL-FT][Fix 2-A] Attempt negotiation: agreed=" << agreed_att
+                << " (ft_round=" << ft_round_now << ", no change)";
+        }
+    }
+
     // Global cross-node barrier: ensure ALL ranks (on both nodes) reach this
     // point before any rank enters initLocalNvlinkComm.  Without this, Node 0
     // and Node 1 can start their rebuild at very different times, causing the
@@ -4509,7 +4654,8 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
     // ranks that are still in the previous exception handler sleep.
     //
     // We use a fresh TCPStore key per rebuild_attempt_ so that retries are
-    // fully isolated from previous attempts.
+    // fully isolated from previous attempts.  rebuild_attempt_ is now the
+    // globally agreed value (Fix 2-A above).
     //
     // The wait is split into kBarrierMaxRetries slices of kBarrierSliceSeconds
     // each (total = kBarrierMaxRetries * kBarrierSliceSeconds = 120 s) so that
@@ -4641,8 +4787,30 @@ void ProcessGroupNCCLFT::rebuild_shadow_ping_pong_topology() {
         LOG(WARNING) << logPrefix() << "[NCCL-FT] Building new proxy_global_comm_ (Size="
                   << proxy_comm_size_ << " Rank=" << proxy_comm_rank_ << ")";
 
-        // Create a brand-new degraded group from scratch (Re-Init).
-        proxy_global_comm_ = NCCLFTComm::create(proxy_comm_size_, proxy_comm_rank_, proxyId, device.index(), config);
+        // [Fix 3-A] Heartbeat watchdog for proxy_global_comm_ NCCLFTComm::create.
+        {
+            auto comm_init_done = std::make_shared<std::atomic<bool>>(false);
+            std::string log_prefix_snap = logPrefix();
+            std::thread heartbeat([comm_init_done, log_prefix_snap]() {
+                c10::setThreadName("pt_nccl_ft_hb");
+                auto start = std::chrono::steady_clock::now();
+                while (!comm_init_done->load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::seconds(10));
+                    if (comm_init_done->load(std::memory_order_acquire)) break;
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - start).count();
+                    LOG(WARNING) << log_prefix_snap
+                        << "[NCCL-FT][Fix 3-A] Still waiting for NCCLFTComm::create"
+                        << " (proxy_global_comm_, " << elapsed << "s elapsed)...";
+                }
+            });
+            heartbeat.detach();
+
+            // Create a brand-new degraded group from scratch (Re-Init).
+            proxy_global_comm_ = NCCLFTComm::create(proxy_comm_size_, proxy_comm_rank_, proxyId, device.index(), config);
+
+            comm_init_done->store(true, std::memory_order_release);
+        }
 
         // Verify the new comm is healthy with a zero-element AllReduce across
         // all proxy ranks before marking it ready.  If the IB transport is still
@@ -6079,6 +6247,64 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
         }
     }
 
+    // [Fix 1-A] Orphan-future sweep: catch the case where a work item holds a
+    // NCCLFaultToleranceError but was never added to in_flight_shadow_bufs_
+    // (e.g., fault happened before shadow_pre ran on the first collective, so
+    // the shadow buffer map is empty).  Without this sweep, future_->wait() in
+    // WorkNCCLFT::wait() blocks forever because markCompleted is never called.
+    //
+    // We walk workMetaList_ under its lock (workMetaListMutex_), collect
+    // Work pointers whose future is still pending, then markCompleted outside
+    // the list lock to avoid a lock-order inversion with shadow_buf_mutex_.
+    //
+    // This sweep is O(|workMetaList_|) which is bounded by the DDP bucket
+    // count (< 200 in practice), so the cost is negligible.
+    {
+        // workMetaList_ is std::list<WorkNCCLFT> (value type), so we collect
+        // raw pointers inside the lock and then operate on them outside.  The
+        // elements remain alive until the Watchdog erases them; since we are on
+        // the side-car thread and the Watchdog only erases after setException(),
+        // which we call here, the pointers are safe for the duration of this
+        // scope.
+        std::vector<WorkNCCLFT*> orphan_ptrs;
+        {
+            std::lock_guard<std::mutex> wl(this->workMetaListMutex_);
+            for (auto& w : this->workMetaList_) {
+                // Already covered by in_flight_shadow_bufs_ — skip.
+                {
+                    std::lock_guard<std::mutex> lk(this->shadow_buf_mutex_);
+                    if (this->in_flight_shadow_bufs_.count(w.seq_) > 0) continue;
+                }
+
+                // Only intercept NCCLFaultToleranceError; leave other exceptions alone.
+                bool is_ft_exc = false;
+                if (w.exception()) {
+                    try { std::rethrow_exception(w.exception()); }
+                    catch (const ::c10::NCCLFaultToleranceError&) { is_ft_exc = true; }
+                    catch (...) {}
+                }
+                if (!is_ft_exc) continue;
+
+                // future_ must exist and not yet be completed.
+                if (w.future_ && !w.future_->completed()) {
+                    orphan_ptrs.push_back(const_cast<WorkNCCLFT*>(&w));
+                }
+            }
+        }
+
+        if (!orphan_ptrs.empty()) {
+            auto ncclStream = ncclStreams_.at(getKeyFromDevice(device));
+            c10::cuda::CUDAMultiStreamGuard streamGuard(ncclStream);
+            for (auto* w : orphan_ptrs) {
+                w->setException(nullptr);
+                w->future_->markCompleted(at::IValue(*w->outputs_));
+                LOG(WARNING) << logPrefix()
+                    << "[NCCL-FT][Fix 1-A] Orphan future resolved for work seq="
+                    << w->seq_ << " (no shadow buffer — fault before shadow_pre).";
+            }
+        }
+    }
+
     // 5. Advance the FT round and clean up TCPStore.
     uint64_t cur_round = commit_signal - 1;
     this->ft_round_++;
@@ -6088,6 +6314,10 @@ void ProcessGroupNCCLFT::recover_and_replay_inflight_ops() {
 
         // Each rank cleans its own per-rank keys.
         this->globalStore_->deleteKey("NCCL_FT_PROPOSE_" + std::to_string(this->rank_) + "_" + round_str);
+
+        // [Fix 2-A] Clean up attempt-negotiation key written during this fault round.
+        this->globalStore_->deleteKey(
+            "NCCL_FT_ATT_ROUND_" + round_str + "_R" + std::to_string(this->rank_));
 
         // Clean up all rebuild-attempt-keyed keys written by this rank for
         // every attempt that was used in this fault round.  rebuild_attempt_

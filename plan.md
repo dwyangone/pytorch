@@ -88,8 +88,9 @@
 | **`pending_shadow_seq_` 在 recover_and_replay 末尾重置為 UINT64_MAX** — 消除逐步故障的 stale checkpoint | recover_and_replay ~5565 | ✅ |
 | **移除所有 DEBUG-HANG / DEBUG-RUNAWAY log** — 清除暫時性調試輸出 | execute_shadow_allreduce, shadow_pre | ✅ |
 | **[P0 fix] HEALTHY rank 在 execute_shadow_allreduce 加入 stream sync + ncclCommGetAsyncError**，確保所有 rank 都能感知失敗並觸發 rebuild | execute_shadow_allreduce ~4771 | ✅ |
-| **[P1 方案二] ncclTopoGetLocalNetType 在 modulo 前過濾 banned NIC**，防止 channel 分配落在死亡 NIC | nccl/src/graph/topo.cc ~1809 | ✅ |
-| **[Revert 方案三] 移除 ncclConfig_t::bannedNicsMask**，採用純方案二（無 ABI 變更） | nccl.h.in, topo.h, topo.cc, init.cc, ProcessGroupNCCLFT.cpp | ✅ |
+| **[方案最終] NIC 排除完全在 PyTorch 端實作**：`rebuild_shadow_ping_pong_topology` 呼叫 `setenv("NCCL_IB_HCA", healthy_hcas)` + `nccl_ft_reset_ib_cache()` + `nccl_ft_reset_bootstrap_net()` + `nccl_ft_reset_net_socket()`；NCCL fork 側不做任何 ban mask 操作（ncclCommBanNic / ncclTopoPopulateNics 過濾 / ncclTopoGetLocalNetType 過濾均已移除） | rebuild ~4381-4503 | ✅ |
+| **非對稱故障 union_exclude_mask（Fix 2-A）**：`per_node_fault_map_` 跨節點 OR，確保 Server A 的 mlx5_N ban 也套用到 Server B，防止 ibv_modify_qp INIT→RTR 逾時 | rebuild ~4423 | ✅ |
+| **`current_hca_phys_indices_` vNic→物理 HCA 映射**：每次 rebuild 後更新，`trigger_fault_proposal` 用它將 NCCL 回報的 ibDevN 轉換回 mlx5_N 物理索引 | rebuild ~4448, trigger ~5027 | ✅ |
 
 ---
 
@@ -97,13 +98,14 @@
 
 ### P0：端對端測試（進行中）
 
-**問題 1：** `ncclCommBanNic(dev_idx)` 是 process-level global。
-- 已確認：`g_nccl_ft_banned_nics_mask` 是 process-level global，`ncclTopoPopulateNics` 讀取它在每次 `ncclCommInitRankConfig` 的 topo XML 建構時生效。
-- `rebuild_shadow_ping_pong_topology` 在所有 rank 呼叫 `ncclCommBanNic(d)` 後再建 comm，確保新 comm 的 topo discovery 跳過 banned NIC。
+**問題 1：** NIC 排除機制（PyTorch 端 setenv 方案）確認
+- 已確認：排除機制完全在 `rebuild_shadow_ping_pong_topology`（~4381-4503）中實作，不依賴任何 NCCL fork 的 ban API。
+- 流程：`union_exclude_mask` 集合所有節點的故障 NIC index → 建構 `healthy_hcas`（如 `"mlx5_1,mlx5_2,..."`）→ `setenv("NCCL_IB_HCA", healthy_hcas)` 覆寫環境變數 → `nccl_ft_reset_ib_cache()` 強制 NCCL 清除舊 IB 裝置掃描結果（`ncclNIbDevs=-1`）→ 下次 `NCCLFTComm::create` 內的 `ncclCommInitRankConfig` 重新掃描，只看健康 NIC。
+- 控制通道同步重置：`setenv("NCCL_SOCKET_IFNAME", <Ethernet>)` + `nccl_ft_reset_bootstrap_net()` + `nccl_ft_reset_net_socket()`，讓 bootstrap socket 遠離已死的 IB 介面。
+- **NCCL fork 側無任何 ban mask 邏輯**：`ncclCommBanNic`、`g_nccl_ft_banned_nics_mask`、`ncclTopoPopulateNics` 過濾、`ncclTopoGetLocalNetType` 過濾均已移除（或從未提交）。
 
 **問題 2：** `NCCLFTComm::create` 每次 reinit 都重新執行 topo discovery？
-- 已確認：每次 `ncclCommInitRankConfig` 都呼叫 `ncclTopoGetSystem`，重新從 XML 建構 topo graph。Global ban mask 在此時生效（`ncclTopoPopulateNics` 設 speed=0）。
-- 方案二額外保護：`ncclTopoGetLocalNetType` 的 modulo 選取也過濾 banned NIC，雙重防護。
+- 已確認：每次 `ncclCommInitRankConfig`（`create` 內部呼叫）都呼叫 `ncclTopoGetSystem`，重新從 XML 建構 topo graph。`NCCL_IB_HCA` 在此時被讀取，故障 NIC 因不在白名單而不會出現在新的 topo graph 中，無需 NCCL 端的額外過濾。
 
 **問題 3：** 側車在 recovery_mutex_ 上的執行緒競爭
 - 現行設計：只有側車呼叫 `recover_and_replay_inflight_ops()`，主執行緒的 `wait()` 只呼叫 `future_->wait()`，不再觸發 recover
@@ -141,7 +143,7 @@
 | 項目 | 說明 |
 |------|------|
 | AllGather / ReduceScatter 降級路徑 | FSDP / ZeRO2/3 場景；目前降級時非 AllReduce op 走 fallback fn()，可能崩潰 |
-| Per-Server NIC Pool 非對稱降級 | 不同節點不同 NIC 索引時（對稱降級假設目前固定） |
+| Per-Server NIC Pool 非對稱降級 | ✅ `union_exclude_mask`（Fix 2-A）已處理不同節點不同 NIC 索引的情境；proxy_comm 的 rank/size 計算仍用對稱 `faulty_devs` 快照，兩節點 comm slot 分配一致 |
 | Proxy 負載均衡 | ✅ 已由 round-robin `findProxy` 解決（faulty ≤ healthy 時每個 proxy 恰好 1 個 ward） |
 | Error type 精細分類 | 目前所有 ncclRemoteError 視為 NIC 硬體故障，應區分網路抖動 vs. 實際 NIC failure |
 | AllReduce AVG 正確性驗證 | proxy 用 ncclSum 再除以原始 size_，需驗證浮點精度是否與 ncclAvg 一致 |
@@ -200,16 +202,16 @@
 
 | 項目 | 狀態 |
 |------|------|
-| `ncclIbResiliencyHandleDeviceFailure`: `ncclSystemError → ncclRemoteError` | ✅ 已完成 |
-| `ncclIbResiliencyProbeHandleCompletionEvent`: `ncclSuccess → ncclRemoteError` | ✅ 已完成 |
-| `ncclTopoPopulateNics`：global ban mask 軟性遮蔽（speed=0, latency=999999） | ✅ 已完成 |
-| `ncclTopoGetLocalNetType`：modulo 前過濾 banned NIC（方案二） | ✅ 已完成 |
-| `init.cc`: 新增 `ncclCommBanNicReset()` | ✅ 已完成 |
-| `init.cc nccl_ft_trigger_fault`: 呼叫已註冊的 callback | ✅ 已完成 |
-| `ncclCommRegisterFaultCallback` API 可用 | ✅ 已確認（在 first collective 成功呼叫） |
-| `ncclCommBanNic` 作用域：**process-level global** | ✅ 已確認 |
-| `NCCLFTComm::create` 每次 reinit 重新 topo discovery | ✅ 已確認 |
-| **方案三 `ncclConfig_t::bannedNicsMask` ABI 變更** | ✅ 已 revert（採用方案二，無 ABI 影響） |
+| `ncclIbResiliencyHandleDeviceFailure`：FT 模式回傳 `ncclRemoteError`，呼叫 `nccl_ft_trigger_fault` | ✅ 已完成 |
+| `ncclIbResiliencyProbeHandleCompletionEvent`：FT 模式失敗 probe 回 `ncclRemoteError` | ✅ 已完成 |
+| `init.cc` `nccl_ft_trigger_fault`：遍歷所有已註冊的 callback 並呼叫 | ✅ 已完成 |
+| `ncclCommRegisterFaultCallback` / `ncclCommRegisterRecoveryCallback` API | ✅ 已完成 |
+| `nccl_ft_reset_ib_cache()`：延遲清理 IB ctx，reset `ncclNIbDevs=-1` 強制重掃 | ✅ 已完成 |
+| `nccl_ft_reset_bootstrap_net()`：reset `bootstrapNetInitDone`，下次 `ncclGetUniqueId` 重讀 `NCCL_SOCKET_IFNAME` | ✅ 已完成 |
+| `nccl_ft_reset_net_socket()`：reset `ncclNetIfs` / `netRefCount`，下次 socket transport 重讀 `NCCL_SOCKET_IFNAME` | ✅ 已完成 |
+| `nccl_ft_cleanup_stale_ib_contexts()`：deferred `ibv_close_device` 清理 | ✅ 宣告完成，PyTorch 端尚未呼叫 |
+| `NCCLFTComm::create` 每次 reinit 重新 topo discovery（讀取最新 `NCCL_IB_HCA`） | ✅ 已確認 |
+| **NIC ban API 完全移除**：`ncclCommBanNic`、`ncclCommBanNicReset`、`g_nccl_ft_banned_nics_mask`、`ncclTopoPopulateNics` 過濾、`ncclTopoGetLocalNetType` 過濾、`ncclConfig_t::bannedNicsMask` 均**不存在於 code**；排除邏輯改由 PyTorch 端 `setenv` + `nccl_ft_reset_ib_cache()` 實現 | ✅ 已確認 |
 
 ---
 
