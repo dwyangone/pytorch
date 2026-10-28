@@ -986,7 +986,7 @@ bool ProcessGroupNCCLFT::WorkNCCLFT::wait(std::chrono::milliseconds timeout) {
                       << "to unblock training (results may be incorrect).";
                   // Force-complete so DDP can proceed; data may be stale.
                   c10::cuda::CUDAMultiStreamGuard sg(
-                      pg_->ncclStreams_.at(pg_->getKeyFromDevice(device_)));
+                      pg_->ncclStreams_.at(getKeyFromDevice(device_)));
                   future_->markCompleted(at::IValue(*outputs_));
               } else {
                   // Normal path: block on the future to pick up CUDA stream guards.
